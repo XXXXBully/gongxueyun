@@ -1,0 +1,15 @@
+﻿fastapi
+uvicorn[standard]
+sqlmodel
+apscheduler
+python-multipart
+pymysql
+python-dotenv
+aes-pkcs5==1.0.3
+requests
+numpy
+onnxruntime
+opencv-python-headless
+pillow
+cryptography
+coloredlogs

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8147:8147"
+    volumes:
+      - ./data/images:/app/server/images
+    environment:
+      - TZ=Asia/Shanghai
+      - SCHEDULER_TIMEZONE=${SCHEDULER_TIMEZONE:-Asia/Shanghai}
+      - SCHEDULER_JITTER_SECONDS=${SCHEDULER_JITTER_SECONDS:-600}
+      - SCHEDULER_REPORT_JITTER_SECONDS=${SCHEDULER_REPORT_JITTER_SECONDS:-0}
+      - GEOCODE_PROVIDER=${GEOCODE_PROVIDER:-osm}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123456}
+      - DATABASE_URL=${DATABASE_URL}
+    restart: unless-stopped
