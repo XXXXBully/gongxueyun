@@ -26,6 +26,43 @@ from sqlmodel import Session
 logger = logging.getLogger("server.task_runner")
 
 
+def _parse_report_target(report_type: str, target_period: Optional[str]) -> Optional[datetime]:
+    if not target_period:
+        return None
+    raw = str(target_period).strip()
+    try:
+        if report_type == "month":
+            return datetime.strptime(raw[:7], "%Y-%m")
+        return datetime.strptime(raw[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _week_bounds(dt: datetime) -> tuple[str, str]:
+    start = dt - timedelta(days=dt.weekday())
+    end = start + timedelta(days=6)
+    return start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59")
+
+
+def _same_report_period(report: Dict[str, Any], report_type: str, current_time: datetime, weeks_label: str) -> bool:
+    try:
+        if report_type == "day":
+            ts = report.get("createTime") or report.get("reportTime")
+            if isinstance(ts, str):
+                return datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S").date() == current_time.date()
+        if report_type == "week":
+            start, end = _week_bounds(current_time)
+            return (
+                report.get("weeks") == weeks_label
+                or (str(report.get("startTime") or "")[:10] == start[:10] and str(report.get("endTime") or "")[:10] == end[:10])
+            )
+        if report_type == "month":
+            return str(report.get("yearmonth") or "")[:7] == current_time.strftime("%Y-%m")
+    except Exception:
+        return False
+    return False
+
+
 def _load_global_smtp_settings() -> Dict[str, Any]:
     with Session(engine) as session:
         row = session.get(SystemSetting, "notifications")
@@ -184,6 +221,8 @@ def _submit_report_common(
     image_count_key: str,
     task_name: str,
     form_type: int,
+    force_report: bool = False,
+    target_period: Optional[str] = None,
 ) -> Dict[str, Any]:
     """通用日报/周报/月报提交逻辑"""
 
@@ -204,10 +243,11 @@ def _submit_report_common(
             },
         }
 
-    current_time = datetime.now()
+    target_time = _parse_report_target(report_type, target_period)
+    current_time = target_time or datetime.now()
 
     # 检查提交时间
-    if not check_time_func(current_time):
+    if not force_report and not check_time_func(current_time):
         logger.info(f"未到{task_name}提交时间")
         return {
             "status": "skip",
@@ -226,26 +266,14 @@ def _submit_report_common(
 
         count = submitted_reports_info.get("flag", 0) + 1
         title = title_func(count)
+        weeks_label = f"第{count}周"
 
         if submitted_reports:
-            last_report = submitted_reports[0]
             should_skip = False
-
-            if report_type == "day":
-                last_time = datetime.strptime(
-                    last_report["createTime"], "%Y-%m-%d %H:%M:%S"
-                )
-                if last_time.date() == current_time.date():
+            for report in submitted_reports:
+                if _same_report_period(report, report_type, current_time, weeks_label):
                     should_skip = True
-            elif report_type == "week":
-                current_week_info = api_client.get_weeks_date()[0]
-                current_week_str = f"第{count}周"
-                if last_report.get("weeks") == current_week_str:
-                    should_skip = True
-            elif report_type == "month":
-                current_yearmonth = current_time.strftime("%Y-%m")
-                if last_report.get("yearmonth") == current_yearmonth:
-                    should_skip = True
+                    break
 
             if should_skip:
                 logger.info(f"本周期已经提交过{task_name}，跳过")
@@ -290,10 +318,10 @@ def _submit_report_common(
         # 特定类型的额外字段
         extra_details = {}
         if report_type == "week":
-            current_week_info = api_client.get_weeks_date()[0]
-            report_info["startTime"] = current_week_info.get("startTime")
-            report_info["endTime"] = current_week_info.get("endTime")
-            report_info["weeks"] = f"第{count}周"
+            start_date, end_date = _week_bounds(current_time)
+            report_info["startTime"] = start_date
+            report_info["endTime"] = end_date
+            report_info["weeks"] = weeks_label
             extra_details = {
                 "开始时间": report_info["startTime"],
                 "结束时间": report_info["endTime"],
@@ -328,7 +356,12 @@ def _submit_report_common(
         }
 
 
-def submit_daily_report(api_client: ApiClient, config: ConfigManager) -> Dict[str, Any]:
+def submit_daily_report(
+    api_client: ApiClient,
+    config: ConfigManager,
+    force_report: bool = False,
+    target_period: Optional[str] = None,
+) -> Dict[str, Any]:
     """提交日报"""
     submit_days = config.get_value("config.reportSettings.daily.submitDays")
     submit_time = config.get_value("config.reportSettings.daily.submitTime")
@@ -365,11 +398,16 @@ def submit_daily_report(api_client: ApiClient, config: ConfigManager) -> Dict[st
         image_count_key="config.reportSettings.daily.imageCount",
         task_name="日报提交",
         form_type=7,
+        force_report=force_report,
+        target_period=target_period,
     )
 
 
 def submit_weekly_report(
-    config: ConfigManager, api_client: ApiClient
+    config: ConfigManager,
+    api_client: ApiClient,
+    force_report: bool = False,
+    target_period: Optional[str] = None,
 ) -> Dict[str, Any]:
     """提交周报"""
     submit_day = config.get_value("config.reportSettings.weekly.submitTime")
@@ -401,11 +439,16 @@ def submit_weekly_report(
         image_count_key="config.reportSettings.weekly.imageCount",
         task_name="周报提交",
         form_type=8,
+        force_report=force_report,
+        target_period=target_period,
     )
 
 
 def submit_monthly_report(
-    config: ConfigManager, api_client: ApiClient
+    config: ConfigManager,
+    api_client: ApiClient,
+    force_report: bool = False,
+    target_period: Optional[str] = None,
 ) -> Dict[str, Any]:
     """提交月报"""
     submit_day = config.get_value("config.reportSettings.monthly.submitTime")
@@ -443,6 +486,8 @@ def submit_monthly_report(
         image_count_key="config.reportSettings.monthly.imageCount",
         task_name="月报提交",
         form_type=9,
+        force_report=force_report,
+        target_period=target_period,
     )
 
 
@@ -450,6 +495,8 @@ def run_task_by_config(
     config_data: Dict[str, Any],
     forced_checkin_type: Optional[str] = None,
     specific_task_type: Optional[str] = None,
+    force_report: bool = False,
+    target_period: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """根据配置字典执行任务"""
     config = ConfigManager(config=config_data)
@@ -490,9 +537,9 @@ def run_task_by_config(
 
         all_tasks = [
             ("clock_in", lambda: perform_clock_in(api_client, config, forced_checkin_type)),
-            ("daily_report", lambda: submit_daily_report(api_client, config)),
-            ("weekly_report", lambda: submit_weekly_report(config, api_client)),
-            ("monthly_report", lambda: submit_monthly_report(config, api_client)),
+            ("daily_report", lambda: submit_daily_report(api_client, config, force_report=force_report, target_period=target_period)),
+            ("weekly_report", lambda: submit_weekly_report(config, api_client, force_report=force_report, target_period=target_period)),
+            ("monthly_report", lambda: submit_monthly_report(config, api_client, force_report=force_report, target_period=target_period)),
         ]
 
         results = []

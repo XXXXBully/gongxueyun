@@ -209,6 +209,7 @@ class AppLoginRequest(BaseModel):
 
 class AppReportSubmitRequest(BaseModel):
     content: str
+    target_period: Optional[str] = None
 
 class AppMeResponse(BaseModel):
     app_phone: str
@@ -217,6 +218,326 @@ class AppMeResponse(BaseModel):
 
 class AppRunRequest(BaseModel):
     task_type: Optional[str] = None
+    force_report: Optional[bool] = None
+    target_period: Optional[str] = None
+
+
+REPORT_META = {
+    "daily": {
+        "report_type": "day",
+        "task_type": "daily_report",
+        "task_name": "日报",
+        "paper_num_key": "planInfo.planPaper.dayPaperNum",
+        "form_type": 7,
+    },
+    "weekly": {
+        "report_type": "week",
+        "task_type": "weekly_report",
+        "task_name": "周报",
+        "paper_num_key": "planInfo.planPaper.weekPaperNum",
+        "form_type": 8,
+    },
+    "monthly": {
+        "report_type": "month",
+        "task_type": "monthly_report",
+        "task_name": "月报",
+        "paper_num_key": "planInfo.planPaper.monthPaperNum",
+        "form_type": 9,
+    },
+}
+
+
+def _get_report_meta(report_key: str) -> Dict[str, Any]:
+    meta = REPORT_META.get(str(report_key or "").strip().lower())
+    if not meta:
+        raise HTTPException(status_code=404, detail="报告类型不存在")
+    return meta
+
+
+def _parse_report_target_for_api(report_type: str, target_period: Optional[str]) -> datetime.datetime:
+    raw = str(target_period or "").strip()
+    try:
+        if report_type == "month" and raw:
+            return datetime.datetime.strptime(raw[:7], "%Y-%m")
+        if raw:
+            return datetime.datetime.strptime(raw[:10], "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="补交周期格式错误")
+    return datetime.datetime.now()
+
+
+def _api_week_bounds(dt: datetime.datetime) -> tuple[str, str]:
+    start = dt - datetime.timedelta(days=dt.weekday())
+    end = start + datetime.timedelta(days=6)
+    return start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59")
+
+
+def _api_period_date(dt: datetime.datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def _api_period_month(dt: datetime.datetime) -> str:
+    return dt.strftime("%Y-%m")
+
+
+def _api_month_add(dt: datetime.datetime, months: int) -> datetime.datetime:
+    month_index = dt.year * 12 + dt.month - 1 + months
+    year = month_index // 12
+    month = month_index % 12 + 1
+    return dt.replace(year=year, month=month, day=1)
+
+
+def _api_report_period_key(report: Dict[str, Any], report_type: str) -> str:
+    try:
+        if report_type == "day":
+            ts = report.get("createTime") or report.get("reportTime")
+            return str(ts or "")[:10]
+        if report_type == "week":
+            start = str(report.get("startTime") or "")[:10]
+            if start:
+                return start
+            ts = str(report.get("reportTime") or "")[:10]
+            if ts:
+                dt = datetime.datetime.strptime(ts, "%Y-%m-%d")
+                return _api_period_date(dt - datetime.timedelta(days=dt.weekday()))
+        if report_type == "month":
+            yearmonth = str(report.get("yearmonth") or "")[:7]
+            if yearmonth:
+                return yearmonth
+            return str(report.get("reportTime") or "")[:7]
+    except Exception:
+        return ""
+    return ""
+
+
+def _api_parse_date_value(value: Any) -> Optional[datetime.datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("/", "-")
+    if raw.isdigit() and len(raw) >= 13:
+        try:
+            return datetime.datetime.fromtimestamp(int(raw[:13]) / 1000)
+        except Exception:
+            return None
+    for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10), ("%Y-%m", 7), ("%Y%m%d", 8)):
+        try:
+            return datetime.datetime.strptime(raw[:size], fmt)
+        except Exception:
+            continue
+    match = re.search(r"20\d{2}-\d{1,2}-\d{1,2}", raw)
+    if match:
+        try:
+            return datetime.datetime.strptime(match.group(0), "%Y-%m-%d")
+        except Exception:
+            return None
+    return None
+
+
+def _api_find_date_by_keys(data: Any, key_hints: List[str]) -> Optional[datetime.datetime]:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key_lower = str(key or "").lower()
+            if any(hint.lower() in key_lower for hint in key_hints):
+                parsed = _api_parse_date_value(value)
+                if parsed:
+                    return parsed
+        for value in data.values():
+            parsed = _api_find_date_by_keys(value, key_hints)
+            if parsed:
+                return parsed
+    elif isinstance(data, list):
+        for value in data:
+            parsed = _api_find_date_by_keys(value, key_hints)
+            if parsed:
+                return parsed
+    return None
+
+
+def _api_report_period_range(config_data: Dict[str, Any], submitted_keys: set[str], report_type: str) -> tuple[datetime.datetime, datetime.datetime]:
+    now = datetime.datetime.now()
+    start = _api_find_date_by_keys(
+        config_data.get("planInfo"),
+        ["start", "begin", "practiceStart", "practicebegin", "sxks", "kssj", "开始"],
+    )
+    end = _api_find_date_by_keys(
+        config_data.get("planInfo"),
+        ["end", "finish", "practiceEnd", "practicefinish", "sxjs", "jssj", "结束"],
+    )
+    schedule = ((config_data.get("config") or {}).get("clockIn") or {}).get("schedule") or {}
+    if not start:
+        start = _api_parse_date_value(schedule.get("startDate"))
+    if not end and start:
+        try:
+            total_days = int(schedule.get("totalDays") or 0)
+        except Exception:
+            total_days = 0
+        if total_days > 0:
+            end = start + datetime.timedelta(days=total_days - 1)
+    if not start and submitted_keys:
+        first_key = sorted(submitted_keys)[0]
+        start = _api_parse_date_value(first_key)
+    if not start:
+        start = now
+    if not end or end > now:
+        end = now
+    if start > end:
+        start = end
+    if report_type == "week":
+        start = start - datetime.timedelta(days=start.weekday())
+    elif report_type == "month":
+        start = start.replace(day=1)
+        end = end.replace(day=1)
+    return start, end
+
+
+def _api_period_options(report_type: str, start_time: datetime.datetime, end_time: datetime.datetime) -> List[Dict[str, str]]:
+    options: List[Dict[str, str]] = []
+    if report_type == "day":
+        dt = end_time
+        while dt.date() >= start_time.date():
+            value = _api_period_date(dt)
+            label = f"{value}（今天）" if dt.date() == datetime.date.today() else value
+            options.append({"value": value, "label": label})
+            dt -= datetime.timedelta(days=1)
+    elif report_type == "week":
+        start_monday = start_time - datetime.timedelta(days=start_time.weekday())
+        dt = end_time - datetime.timedelta(days=end_time.weekday())
+        while dt.date() >= start_monday.date():
+            start_dt = dt
+            end_dt = start_dt + datetime.timedelta(days=6)
+            value = _api_period_date(start_dt)
+            label = f"{value} 至 {_api_period_date(end_dt)}"
+            options.append({"value": value, "label": label})
+            dt -= datetime.timedelta(days=7)
+    elif report_type == "month":
+        dt = end_time.replace(day=1)
+        start_month = start_time.replace(day=1)
+        while dt >= start_month:
+            value = _api_period_month(dt)
+            label = f"{value} 月"
+            options.append({"value": value, "label": label})
+            dt = _api_month_add(dt, -1)
+    return options
+
+
+def _get_missing_report_periods_for_user(user: User, report_key: str) -> Dict[str, Any]:
+    if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
+        raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法获取已提交报告")
+    meta = _get_report_meta(report_key)
+    config_data = user_to_config(user)
+    config = ConfigManager(config=config_data)
+    api_client = ApiClient(config)
+    _ensure_remote_runtime(api_client, config)
+    report_type = meta["report_type"]
+    submitted = api_client.get_all_submitted_reports_info(report_type) or {}
+    submitted_reports = submitted.get("data", []) if isinstance(submitted, dict) else []
+    submitted_keys = {
+        key
+        for key in (_api_report_period_key(report, report_type) for report in submitted_reports)
+        if key
+    }
+    start_time, end_time = _api_report_period_range(config_data, submitted_keys, report_type)
+    options = [
+        item
+        for item in _api_period_options(report_type, start_time, end_time)
+        if item["value"] not in submitted_keys
+    ]
+    return {
+        "ok": True,
+        "report_key": report_key,
+        "report_type": report_type,
+        "options": options,
+        "submitted_count": len(submitted_keys),
+    }
+
+
+def _same_api_report_period(report: Dict[str, Any], report_type: str, current_time: datetime.datetime, weeks_label: str) -> bool:
+    try:
+        if report_type == "day":
+            ts = report.get("createTime") or report.get("reportTime")
+            if isinstance(ts, str):
+                return datetime.datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S").date() == current_time.date()
+        if report_type == "week":
+            start, end = _api_week_bounds(current_time)
+            return (
+                report.get("weeks") == weeks_label
+                or (str(report.get("startTime") or "")[:10] == start[:10] and str(report.get("endTime") or "")[:10] == end[:10])
+            )
+        if report_type == "month":
+            return str(report.get("yearmonth") or "")[:7] == current_time.strftime("%Y-%m")
+    except Exception:
+        return False
+    return False
+
+
+def _build_report_info(
+    *,
+    api_client: ApiClient,
+    config: ConfigManager,
+    meta: Dict[str, Any],
+    content: str,
+    target_period: Optional[str],
+) -> Dict[str, Any]:
+    report_type = meta["report_type"]
+    current_time = _parse_report_target_for_api(report_type, target_period)
+    submitted = api_client.get_submitted_reports_info(report_type) or {}
+    submitted_reports = submitted.get("data", []) if isinstance(submitted, dict) else []
+    count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
+    title = f"第{count}天日报" if report_type == "day" else (f"第{count}周周报" if report_type == "week" else f"第{count}月月报")
+    weeks_label = f"第{count}周"
+    if isinstance(submitted_reports, list):
+        for report in submitted_reports:
+            if _same_api_report_period(report, report_type, current_time, weeks_label):
+                raise HTTPException(status_code=400, detail=f"该{meta['task_name']}周期已经提交过")
+    job_info = api_client.get_job_info()
+    report_info = {
+        "title": title,
+        "content": content,
+        "attachments": "",
+        "reportType": report_type,
+        "jobId": job_info.get("jobId", None),
+        "reportTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "formFieldDtoList": api_client.get_from_info(int(meta["form_type"])),
+    }
+    if report_type == "week":
+        start, end = _api_week_bounds(current_time)
+        report_info["startTime"] = start
+        report_info["endTime"] = end
+        report_info["weeks"] = weeks_label
+    elif report_type == "month":
+        report_info["yearmonth"] = current_time.strftime("%Y-%m")
+    return report_info
+
+
+def _generate_report_content_for_user(user: User, report_key: str, target_period: Optional[str], generate_content: bool = True) -> Dict[str, Any]:
+    if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
+        raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法生成报告")
+    meta = _get_report_meta(report_key)
+    config_data = user_to_config(user)
+    config = ConfigManager(config=config_data)
+    api_client = ApiClient(config)
+    _ensure_remote_runtime(api_client, config)
+    report_type = meta["report_type"]
+    submitted = api_client.get_submitted_reports_info(report_type) or {}
+    count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
+    title = f"第{count}天日报" if report_type == "day" else (f"第{count}周周报" if report_type == "week" else f"第{count}月月报")
+    job_info = api_client.get_job_info()
+    content = ""
+    if generate_content:
+        ai_cfg = config.get_value("config.ai")
+        if not isinstance(ai_cfg, dict):
+            raise HTTPException(status_code=400, detail="未配置 AI 参数")
+        if not (str(ai_cfg.get("apikey") or "").strip()) or not (str(ai_cfg.get("apiUrl") or "").strip()) or not (str(ai_cfg.get("model") or "").strip()):
+            raise HTTPException(status_code=400, detail="请先在 AI 设置中填写 API URL、API Key 和 Model")
+        content = generate_article(
+            config,
+            title,
+            job_info,
+            config.get_value(meta["paper_num_key"]),
+            (submitted.get("data", []) if isinstance(submitted, dict) else [])[:4],
+        )
+    return {"config_data": config_data, "title": title, "content": content, "api_client": api_client, "config": config, "meta": meta}
 
 @router.post("/app/auth/register")
 def app_register(request: Request, req: AppRegisterRequest):
@@ -516,7 +837,12 @@ def app_run(
     config_data = user_to_config(user)
     
     specific_task_type = req.task_type if req else None
-    results = run_task_by_config(config_data, specific_task_type=specific_task_type)
+    results = run_task_by_config(
+        config_data,
+        specific_task_type=specific_task_type,
+        force_report=bool(req.force_report) if req else False,
+        target_period=req.target_period if req else None,
+    )
     status = apply_execution_results_to_user(user, results, config_data)
     session.add(AuditLog(actor=str(payload.get("sub")), action="app.user.run", target_user_id=user.id, detail={"status": status}))
     session.add(user)
@@ -528,6 +854,78 @@ def app_execution(*, session: Session = Depends(get_session), payload: dict = De
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
     return {"results": user.last_execution_result or []}
+
+
+@router.get("/app/reports/{report_key}/missing-periods")
+def app_report_missing_periods(
+    *,
+    report_key: str,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    try:
+        return _get_missing_report_periods_for_user(user, report_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "获取未提交周期失败")
+
+
+@router.post("/app/reports/{report_key}/generate")
+def app_generate_report(
+    *,
+    report_key: str,
+    target_period: Optional[str] = None,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    try:
+        generated = _generate_report_content_for_user(user, report_key, target_period)
+        sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(user)
+        session.commit()
+        return {"ok": True, "title": generated["title"], "content": generated["content"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "生成报告失败")
+
+
+@router.post("/app/reports/{report_key}/submit")
+def app_submit_report(
+    *,
+    report_key: str,
+    req: AppReportSubmitRequest,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="报告内容不能为空")
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    try:
+        generated = _generate_report_content_for_user(user, report_key, req.target_period, generate_content=False)
+        report_info = _build_report_info(
+            api_client=generated["api_client"],
+            config=generated["config"],
+            meta=generated["meta"],
+            content=content,
+            target_period=req.target_period,
+        )
+        generated["api_client"].submit_report(report_info)
+        sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(user)
+        session.commit()
+        return {"ok": True, "title": report_info["title"], "submitted_at": report_info["reportTime"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "提交报告失败")
 
 @router.post("/app/reports/daily/generate")
 def app_generate_daily_report(
@@ -720,6 +1118,7 @@ class AiTestRequest(BaseModel):
 
 class ReportSubmitRequest(BaseModel):
     content: str
+    target_period: Optional[str] = None
 
 _RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 _GEOCODE_CACHE: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
@@ -1273,7 +1672,14 @@ def delete_user(*, session: Session = Depends(get_session), user_id: int, admin:
     return {"ok": True}
 
 @router.post("/users/{user_id}/run")
-def run_user_task(*, request: Request, session: Session = Depends(get_session), user_id: int, operator: dict = Depends(get_operator)):
+def run_user_task(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    req: Optional[AppRunRequest] = None,
+    operator: dict = Depends(get_operator),
+):
     client_ip = get_client_ip(request)
     _rate_limit(f"run:{client_ip}:{user_id}", limit=2, per_seconds=60)
     user = session.get(User, user_id)
@@ -1281,7 +1687,13 @@ def run_user_task(*, request: Request, session: Session = Depends(get_session), 
         raise HTTPException(status_code=404, detail="User not found")
 
     config_data = user_to_config(user)
-    results = run_task_by_config(config_data)
+    specific_task_type = req.task_type if req else None
+    results = run_task_by_config(
+        config_data,
+        specific_task_type=specific_task_type,
+        force_report=bool(req.force_report) if req else False,
+        target_period=req.target_period if req else None,
+    )
     status = apply_execution_results_to_user(user, results, config_data)
 
     session.add(AuditLog(actor=operator.get("sub"), action="user.run", target_user_id=user_id, detail={"status": status}))
@@ -1426,6 +1838,93 @@ def ai_test(request: Request, req: AiTestRequest, operator: dict = Depends(get_o
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI 接口请求失败: {str(e)}")
+
+
+@router.post("/users/{user_id}/reports/{report_key}/generate")
+def generate_report(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    report_key: str,
+    target_period: Optional[str] = None,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"report_gen:{client_ip}:{user_id}:{report_key}", limit=3, per_seconds=60)
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        generated = _generate_report_content_for_user(user, report_key, target_period)
+        sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(user)
+        session.commit()
+        return {"ok": True, "title": generated["title"], "content": generated["content"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "生成报告失败")
+
+
+@router.get("/users/{user_id}/reports/{report_key}/missing-periods")
+def report_missing_periods(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    report_key: str,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"report_missing:{client_ip}:{user_id}:{report_key}", limit=10, per_seconds=60)
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        return _get_missing_report_periods_for_user(user, report_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "获取未提交周期失败")
+
+
+@router.post("/users/{user_id}/reports/{report_key}/submit")
+def submit_report_manual(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    report_key: str,
+    req: ReportSubmitRequest,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"report_submit:{client_ip}:{user_id}:{report_key}", limit=3, per_seconds=60)
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="报告内容不能为空")
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        generated = _generate_report_content_for_user(user, report_key, req.target_period, generate_content=False)
+        report_info = _build_report_info(
+            api_client=generated["api_client"],
+            config=generated["config"],
+            meta=generated["meta"],
+            content=content,
+            target_period=req.target_period,
+        )
+        generated["api_client"].submit_report(report_info)
+        sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(user)
+        session.commit()
+        return {"ok": True, "title": report_info["title"], "submitted_at": report_info["reportTime"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "提交报告失败")
 
 
 @router.post("/users/{user_id}/reports/daily/generate")

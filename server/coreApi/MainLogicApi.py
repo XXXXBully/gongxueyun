@@ -242,12 +242,12 @@ class ApiClient:
         data = rsp.get("data", {})
         return {} if data is None else data
 
-    def get_submitted_reports_info(self, report_type: str) -> Dict[str, Any]:
+    def get_submitted_reports_info(self, report_type: str, page_size: int = 10, curr_page: int = 1) -> Dict[str, Any]:
         """获取已经提交的日报、周报或月报的数量"""
         url = "practice/paper/v2/listByStu"
         data = {
-            "currPage": 1,
-            "pageSize": 10,
+            "currPage": curr_page,
+            "pageSize": page_size,
             "reportType": report_type,
             "planId": self.config.get_value("planInfo.planId"),
             "t": aes_encrypt(str(int(time.time() * 1000))),
@@ -259,6 +259,28 @@ class ApiClient:
         ])
         rsp = self._post_request(url, headers, data)
         return rsp
+
+    def get_all_submitted_reports_info(self, report_type: str) -> Dict[str, Any]:
+        """分页获取已经提交的全部日报、周报或月报。"""
+        page_size = 100
+        curr_page = 1
+        merged: Dict[str, Any] = {}
+        rows: List[Dict[str, Any]] = []
+        while True:
+            rsp = self.get_submitted_reports_info(report_type, page_size=page_size, curr_page=curr_page)
+            if not merged:
+                merged = dict(rsp or {})
+            data = rsp.get("data", []) if isinstance(rsp, dict) else []
+            if not isinstance(data, list) or not data:
+                break
+            rows.extend(data)
+            if len(data) < page_size:
+                break
+            curr_page += 1
+            if curr_page > 100:
+                break
+        merged["data"] = rows
+        return merged
 
     def submit_report(self, report_info: Dict[str, Any]) -> None:
         """提交报告"""

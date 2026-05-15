@@ -109,22 +109,36 @@
               <el-checkbox v-for="d in weekdayOptions" :key="d.value" :value="d.value">{{ d.label }}</el-checkbox>
             </el-checkbox-group>
           </el-form-item>
+          <el-form-item v-if="form.reportSettings.daily.enabled" label="补交日期">
+            <el-select v-model="reportTargets.daily" :loading="reportPeriodLoading.daily" filterable placeholder="选择未提交日报日期">
+              <el-option v-for="item in reportPeriodOptions.daily" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
           <el-form-item v-if="form.reportSettings.daily.enabled" label="日报预览">
             <div class="report-preview">
               <div class="report-preview-meta">
                 <div>字数：{{ dailyCount }} / 1000</div>
                 <div class="report-preview-actions">
-                  <el-button size="small" :disabled="!isEdit" :loading="aiDailyLoading" @click="generateDailyReport">
+                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !reportTargets.daily" :loading="reportActionLoading === 'daily_generate'" @click="generateReport('daily')">
                     AI生成日报
                   </el-button>
                   <el-button
                     size="small"
                     type="primary"
-                    :disabled="!isEdit || !String(reportPreview.daily || '').trim()"
-                    :loading="submitDailyLoading"
-                    @click="submitDailyReport"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.daily || !String(reportPreview.daily || '').trim()"
+                    :loading="reportActionLoading === 'daily_submit'"
+                    @click="submitReport('daily')"
                   >
                     提交日报
+                  </el-button>
+                  <el-button
+                    size="small"
+                    type="success"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.daily || aiDailyLoading || submitDailyLoading"
+                    :loading="reportRunLoading === 'daily_report'"
+                    @click="runReportNow('daily_report')"
+                  >
+                    立即生成并提交
                   </el-button>
                 </div>
               </div>
@@ -148,10 +162,40 @@
           <el-form-item v-if="form.reportSettings.weekly.enabled" label="提交时刻">
             <el-time-select v-model="form.reportSettings.weekly.submitAt" start="00:00" step="00:01" end="23:59" />
           </el-form-item>
+          <el-form-item v-if="form.reportSettings.weekly.enabled" label="补交周">
+            <el-select v-model="reportTargets.weekly" :loading="reportPeriodLoading.weekly" filterable placeholder="选择未提交周报周期">
+              <el-option v-for="item in reportPeriodOptions.weekly" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
           <el-form-item v-if="form.reportSettings.weekly.enabled" label="周报预览">
             <div class="report-preview">
-              <div class="report-preview-meta">字数：{{ weeklyCount }} / 1000</div>
-              <el-input v-model="reportPreview.weekly" type="textarea" :rows="6" readonly resize="none" />
+              <div class="report-preview-meta">
+                <div>字数：{{ weeklyCount }} / 1000</div>
+                <div class="report-preview-actions">
+                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !reportTargets.weekly" :loading="reportActionLoading === 'weekly_generate'" @click="generateReport('weekly')">
+                    AI生成周报
+                  </el-button>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.weekly || !String(reportPreview.weekly || '').trim()"
+                    :loading="reportActionLoading === 'weekly_submit'"
+                    @click="submitReport('weekly')"
+                  >
+                    提交周报
+                  </el-button>
+                  <el-button
+                    size="small"
+                    type="success"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.weekly"
+                    :loading="reportRunLoading === 'weekly_report'"
+                    @click="runReportNow('weekly_report')"
+                  >
+                    立即执行周报
+                  </el-button>
+                </div>
+              </div>
+              <el-input v-model="reportPreview.weekly" type="textarea" :rows="6" resize="none" placeholder="点击 AI生成周报 或手动填写后提交" />
             </div>
           </el-form-item>
 
@@ -165,10 +209,40 @@
           <el-form-item v-if="form.reportSettings.monthly.enabled" label="提交时刻">
             <el-time-select v-model="form.reportSettings.monthly.submitAt" start="00:00" step="00:01" end="23:59" />
           </el-form-item>
+          <el-form-item v-if="form.reportSettings.monthly.enabled" label="补交月份">
+            <el-select v-model="reportTargets.monthly" :loading="reportPeriodLoading.monthly" filterable placeholder="选择未提交月报月份">
+              <el-option v-for="item in reportPeriodOptions.monthly" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
           <el-form-item v-if="form.reportSettings.monthly.enabled" label="月报预览">
             <div class="report-preview">
-              <div class="report-preview-meta">字数：{{ monthlyCount }} / 1000</div>
-              <el-input v-model="reportPreview.monthly" type="textarea" :rows="6" readonly resize="none" />
+              <div class="report-preview-meta">
+                <div>字数：{{ monthlyCount }} / 1000</div>
+                <div class="report-preview-actions">
+                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !reportTargets.monthly" :loading="reportActionLoading === 'monthly_generate'" @click="generateReport('monthly')">
+                    AI生成月报
+                  </el-button>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.monthly || !String(reportPreview.monthly || '').trim()"
+                    :loading="reportActionLoading === 'monthly_submit'"
+                    @click="submitReport('monthly')"
+                  >
+                    提交月报
+                  </el-button>
+                  <el-button
+                    size="small"
+                    type="success"
+                    :disabled="!isEdit || !!reportRunLoading || !reportTargets.monthly"
+                    :loading="reportRunLoading === 'monthly_report'"
+                    @click="runReportNow('monthly_report')"
+                  >
+                    立即执行月报
+                  </el-button>
+                </div>
+              </div>
+              <el-input v-model="reportPreview.monthly" type="textarea" :rows="6" resize="none" placeholder="点击 AI生成月报 或手动填写后提交" />
             </div>
           </el-form-item>
         </el-tab-pane>
@@ -260,7 +334,16 @@ const aiTestLatencyMs = ref(null)
 const addrFillLoading = ref(false)
 const aiDailyLoading = ref(false)
 const submitDailyLoading = ref(false)
+const reportRunLoading = ref('')
+const reportActionLoading = ref('')
 const reportPreview = reactive({ daily: '', weekly: '', monthly: '' })
+const reportPeriodLoading = reactive({ daily: false, weekly: false, monthly: false })
+const reportPeriodOptions = reactive({ daily: [], weekly: [], monthly: [] })
+const _today = new Date()
+const _pad2 = (n) => String(n).padStart(2, '0')
+const _todayDate = `${_today.getFullYear()}-${_pad2(_today.getMonth() + 1)}-${_pad2(_today.getDate())}`
+const _todayMonth = `${_today.getFullYear()}-${_pad2(_today.getMonth() + 1)}`
+const reportTargets = reactive({ daily: _todayDate, weekly: _todayDate, monthly: _todayMonth })
 let geocodeSearchAbort = null
 let geocodeReverseAbort = null
 
@@ -614,6 +697,7 @@ const fetchUser = async () => {
       if (!form.reportSettings.monthly.submitAt) form.reportSettings.monthly.submitAt = '12:00'
     }
     form.pushNotifications = normalizePushNotifications(form.pushNotifications)
+    await loadAllReportPeriodOptions()
   } catch (error) {
     notifyError('加载失败')
   } finally {
@@ -745,6 +829,139 @@ const submitDailyReport = async () => {
     notifyError(resolveErrorMessage(e, '提交失败'))
   } finally {
     submitDailyLoading.value = false
+  }
+}
+
+const reportLabelMap = { daily: '日报', weekly: '周报', monthly: '月报' }
+const reportTaskMap = { daily: 'daily_report', weekly: 'weekly_report', monthly: 'monthly_report' }
+const getReportTarget = (key) => String(reportTargets[key] || '').trim() || undefined
+const hasReportTarget = (key) => !!getReportTarget(key)
+const syncReportTargetFromOptions = (key) => {
+  const options = Array.isArray(reportPeriodOptions[key]) ? reportPeriodOptions[key] : []
+  if (!options.length) {
+    reportTargets[key] = ''
+    return
+  }
+  if (!options.some((item) => item.value === reportTargets[key])) {
+    reportTargets[key] = options[0].value
+  }
+}
+
+const loadReportPeriodOptions = async (key) => {
+  if (!isEdit.value) return
+  reportPeriodLoading[key] = true
+  try {
+    const res = await http.get(`/users/${route.params.id}/reports/${key}/missing-periods`)
+    reportPeriodOptions[key] = Array.isArray(res.data?.options) ? res.data.options : []
+    syncReportTargetFromOptions(key)
+  } catch (e) {
+    reportPeriodOptions[key] = []
+    reportTargets[key] = ''
+    notifyWarning(resolveErrorMessage(e, `获取${reportLabelMap[key] || '报告'}未提交周期失败`))
+  } finally {
+    reportPeriodLoading[key] = false
+  }
+}
+
+const loadAllReportPeriodOptions = async () => {
+  if (!isEdit.value) return
+  await Promise.all(['daily', 'weekly', 'monthly'].map((key) => loadReportPeriodOptions(key)))
+}
+
+const generateReport = async (key) => {
+  if (!isEdit.value) return
+  const label = reportLabelMap[key] || '报告'
+  if (!hasReportTarget(key)) {
+    notifyWarning(`暂无可补交的${label}周期`)
+    return
+  }
+  reportActionLoading.value = `${key}_generate`
+  try {
+    notifyInfo(`正在生成${label}`)
+    await flushUiMessage()
+    const res = await http.post(`/users/${route.params.id}/reports/${key}/generate`, null, {
+      params: { target_period: getReportTarget(key) },
+    })
+    reportPreview[key] = String(res.data?.content || '')
+    notifySuccess(`${label}已生成`)
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, `${label}生成失败`))
+  } finally {
+    reportActionLoading.value = ''
+  }
+}
+
+const submitReport = async (key) => {
+  if (!isEdit.value) return
+  const label = reportLabelMap[key] || '报告'
+  if (!hasReportTarget(key)) {
+    notifyWarning(`暂无可补交的${label}周期`)
+    return
+  }
+  const content = String(reportPreview[key] || '').trim()
+  if (!content) {
+    notifyWarning(`请先生成或填写${label}内容`)
+    return
+  }
+  reportActionLoading.value = `${key}_submit`
+  try {
+    notifyInfo(`正在提交${label}`)
+    await flushUiMessage()
+    const res = await http.post(`/users/${route.params.id}/reports/${key}/submit`, {
+      content,
+      target_period: getReportTarget(key),
+    })
+    notifySuccess(`提交成功：${res.data?.title || label}`)
+    await loadReportPeriodOptions(key)
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, `${label}提交失败`))
+  } finally {
+    reportActionLoading.value = ''
+  }
+}
+
+const runReportNow = async (taskType) => {
+  if (!isEdit.value) return
+  const labelMap = {
+    daily_report: '日报',
+    weekly_report: '周报',
+    monthly_report: '月报',
+  }
+  const label = labelMap[taskType] || '报告'
+  const key = Object.keys(reportTaskMap).find((item) => reportTaskMap[item] === taskType)
+  if (!hasReportTarget(key)) {
+    notifyWarning(`暂无可补交的${label}周期`)
+    return
+  }
+  reportRunLoading.value = taskType
+  try {
+    notifyInfo(`正在立即执行${label}`)
+    await flushUiMessage()
+    const res = await http.post(`/users/${route.params.id}/run`, {
+      task_type: taskType,
+      force_report: true,
+      target_period: getReportTarget(key),
+    })
+    const results = Array.isArray(res.data?.results) ? res.data.results : []
+    const first = results[0] || {}
+    if (first.report_content) {
+      if (taskType === 'daily_report') reportPreview.daily = first.report_content
+      if (taskType === 'weekly_report') reportPreview.weekly = first.report_content
+      if (taskType === 'monthly_report') reportPreview.monthly = first.report_content
+    }
+    if (first.status === 'success') {
+      notifySuccess(first.message || `${label}已提交`)
+    } else if (first.status === 'skip') {
+      notifyWarning(first.message || `${label}已跳过`)
+    } else {
+      notifyError(first.message || `${label}执行失败`)
+    }
+    await fetchUser()
+    if (key) await loadReportPeriodOptions(key)
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, `${label}执行失败`))
+  } finally {
+    reportRunLoading.value = ''
   }
 }
 
