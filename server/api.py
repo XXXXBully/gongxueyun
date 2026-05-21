@@ -4,7 +4,8 @@ from sqlalchemy import func
 from server.database import get_session, engine
 from server.models import User, UserCreate, UserRead, UserUpdate, UserListRead, AuditLog, BatchJob, BatchJobItem, AdminUser, AppUser, SystemSetting
 from server.scheduler import add_user_job, remove_user_job, user_to_config
-from server.task_runner import run_task_by_config
+from server.task_runner import perform_clock_in_makeup, perform_clock_in_makeup_many, run_task_by_config
+from server.clockin_backfill import build_missing_clockin_day_options, normalize_clockin_records, parse_clockin_date
 from server.util.Config import ConfigManager
 from server.coreApi.MainLogicApi import ApiClient
 from server.coreApi.AiServiceClient import generate_article
@@ -221,6 +222,11 @@ class AppRunRequest(BaseModel):
     force_report: Optional[bool] = None
     target_period: Optional[str] = None
 
+class ClockInMakeupRequest(BaseModel):
+    target_date: Optional[str] = None
+    target_dates: Optional[List[str]] = None
+    target_type: Optional[str] = None
+
 
 REPORT_META = {
     "daily": {
@@ -419,6 +425,153 @@ def _api_period_options(report_type: str, start_time: datetime.datetime, end_tim
             options.append({"value": value, "label": label})
             dt = _api_month_add(dt, -1)
     return options
+
+
+def _clockin_schedule_weekdays(config_data: Dict[str, Any]) -> List[int]:
+    clock_in = ((config_data.get("config") or {}).get("clockIn") or {})
+    if not isinstance(clock_in, dict):
+        return [1, 2, 3, 4, 5, 6, 7]
+    schedule = clock_in.get("schedule") if isinstance(clock_in.get("schedule"), dict) else {}
+    weekdays = schedule.get("weekdays")
+    if weekdays is None:
+        weekdays = clock_in.get("customDays")
+    if not isinstance(weekdays, list):
+        return [1, 2, 3, 4, 5, 6, 7]
+    out: List[int] = []
+    for item in weekdays:
+        try:
+            day = int(item)
+        except Exception:
+            continue
+        if 1 <= day <= 7 and day not in out:
+            out.append(day)
+    return out
+
+
+def _clockin_period_range(config_data: Dict[str, Any], normalized_records: List[Dict[str, Any]]) -> tuple[datetime.date, datetime.date]:
+    now = datetime.datetime.now()
+    start = _api_find_date_by_keys(
+        config_data.get("planInfo"),
+        ["start", "begin", "practiceStart", "practicebegin", "sxks", "kssj", "开始"],
+    )
+    end = _api_find_date_by_keys(
+        config_data.get("planInfo"),
+        ["end", "finish", "practiceEnd", "practicefinish", "sxjs", "jssj", "结束"],
+    )
+    schedule = (((config_data.get("config") or {}).get("clockIn") or {}).get("schedule") or {})
+    if not isinstance(schedule, dict):
+        schedule = {}
+    if not start:
+        start = _api_parse_date_value(schedule.get("startDate"))
+    if not end and start:
+        try:
+            total_days = int(schedule.get("totalDays") or 0)
+        except Exception:
+            total_days = 0
+        if total_days > 0:
+            end = start + datetime.timedelta(days=total_days - 1)
+    if not start and normalized_records:
+        first_date = sorted({item["date"] for item in normalized_records if item.get("date")})[0]
+        start = _api_parse_date_value(first_date)
+    if not start:
+        start = now.replace(day=1)
+    if not end or end > now:
+        end = now
+    if start > end:
+        start = end
+    return start.date(), end.date()
+
+
+def _get_missing_clockin_days_for_user(user: User) -> Dict[str, Any]:
+    if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
+        raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法获取打卡记录")
+    config_data = user_to_config(user)
+    config = ConfigManager(config=config_data)
+    api_client = ApiClient(config)
+    _ensure_remote_runtime(api_client, config)
+    start_date, end_date = _clockin_period_range(config_data, [])
+    records = api_client.get_checkin_records(start_date, end_date)
+    normalized_records = normalize_clockin_records(records)
+    start_date, end_date = _clockin_period_range(config_data, normalized_records)
+    options = build_missing_clockin_day_options(
+        records,
+        start_date,
+        end_date,
+        scheduled_weekdays=_clockin_schedule_weekdays(config_data),
+    )
+    return {
+        "ok": True,
+        "options": options,
+        "records": normalized_records[:100],
+        "record_count": len(normalized_records),
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+    }
+
+
+def _clockin_makeup_dates_from_request(req: ClockInMakeupRequest) -> List[str]:
+    raw_dates: List[Any] = []
+    if req.target_date:
+        raw_dates.append(req.target_date)
+    if req.target_dates:
+        raw_dates.extend(req.target_dates)
+
+    dates: List[str] = []
+    seen = set()
+    for item in raw_dates:
+        target = parse_clockin_date(item)
+        if not target:
+            raise HTTPException(status_code=400, detail="补卡日期格式错误")
+        value = target.strftime("%Y-%m-%d")
+        if value not in seen:
+            seen.add(value)
+            dates.append(value)
+    if not dates:
+        raise HTTPException(status_code=400, detail="请选择补卡日期")
+    return dates
+
+
+def _clockin_makeup_type_from_request(req: ClockInMakeupRequest) -> str:
+    target_type = str(req.target_type or "START").strip().upper()
+    if target_type not in ("START", "END"):
+        raise HTTPException(status_code=400, detail="补卡类型错误")
+    return target_type
+
+
+def _makeup_clockin_for_user(user: User, target_dates: List[str], target_type: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    config_data = user_to_config(user)
+    config = ConfigManager(config=config_data)
+    api_client = ApiClient(config)
+    _ensure_remote_runtime(api_client, config)
+    if len(target_dates) == 1:
+        result = perform_clock_in_makeup(api_client, config, target_dates[0], target_type=target_type)
+    else:
+        result = perform_clock_in_makeup_many(api_client, config, target_dates, target_type=target_type)
+    apply_execution_results_to_user(user, [result], config_data)
+    return result, config_data
+
+
+def _makeup_all_missing_clockin_for_user(user: User, target_type: str) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    missing = _get_missing_clockin_days_for_user(user)
+    target_dates = [
+        item.get("value")
+        for item in missing.get("options", [])
+        if item.get("value") and target_type in (item.get("missing_types") or [])
+    ]
+    if not target_dates:
+        config_data = user_to_config(user)
+        type_label = {"START": "上班", "END": "下班"}.get(target_type, target_type)
+        result = {
+            "status": "skip",
+            "message": f"暂无待补{type_label}日期",
+            "task_type": "补卡",
+            "details": {"补卡天数": 0, "补卡类型": type_label},
+            "items": [],
+        }
+        apply_execution_results_to_user(user, [result], config_data)
+        return result, config_data, []
+    result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
+    return result, config_data, target_dates
 
 
 def _get_missing_report_periods_for_user(user: User, report_key: str) -> Dict[str, Any]:
@@ -854,6 +1007,80 @@ def app_execution(*, session: Session = Depends(get_session), payload: dict = De
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
     return {"results": user.last_execution_result or []}
+
+
+@router.get("/app/clock-in/missing-days")
+def app_clockin_missing_days(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    client_ip = get_client_ip(request)
+    _rate_limit(f"app_clockin_missing:{client_ip}:{user.id}", limit=10, per_seconds=60)
+    try:
+        return _get_missing_clockin_days_for_user(user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "获取缺卡日期失败")
+
+
+@router.post("/app/clock-in/makeup")
+def app_clockin_makeup(
+    *,
+    request: Request,
+    req: ClockInMakeupRequest,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    client_ip = get_client_ip(request)
+    _rate_limit(f"app_clockin_makeup:{client_ip}:{user.id}", limit=3, per_seconds=60)
+    try:
+        target_dates = _clockin_makeup_dates_from_request(req)
+        target_type = _clockin_makeup_type_from_request(req)
+        result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
+        sync_runtime_fields_to_user(user, config_data)
+        session.add(AuditLog(actor=str(payload.get("sub")), action="app.clockin.makeup", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(user)
+        session.commit()
+        return {"ok": result.get("status") != "fail", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "补卡失败")
+
+
+@router.post("/app/clock-in/makeup-all")
+def app_clockin_makeup_all(
+    *,
+    request: Request,
+    req: Optional[ClockInMakeupRequest] = None,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(get_user),
+):
+    app_user = _get_authed_app_user(session=session, payload=payload)
+    user = _get_bound_task_user(session=session, app_user=app_user)
+    client_ip = get_client_ip(request)
+    _rate_limit(f"app_clockin_makeup_all:{client_ip}:{user.id}", limit=2, per_seconds=60)
+    try:
+        target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
+        result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
+        sync_runtime_fields_to_user(user, config_data)
+        session.add(AuditLog(actor=str(payload.get("sub")), action="app.clockin.makeup_all", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(user)
+        session.commit()
+        return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "全部补卡失败")
 
 
 @router.get("/app/reports/{report_key}/missing-periods")
@@ -1620,6 +1847,86 @@ def read_user_account_address(
         "checkinTime": checkin.get("attendenceTime"),
         "type": checkin.get("type"),
     }
+
+
+@router.get("/users/{user_id}/clock-in/missing-days")
+def read_user_clockin_missing_days(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"clockin_missing:{client_ip}:{user_id}", limit=10, per_seconds=60)
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        return _get_missing_clockin_days_for_user(user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e) or "获取缺卡日期失败")
+
+
+@router.post("/users/{user_id}/clock-in/makeup")
+def makeup_user_clockin(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    req: ClockInMakeupRequest,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"clockin_makeup:{client_ip}:{user_id}", limit=3, per_seconds=60)
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        target_dates = _clockin_makeup_dates_from_request(req)
+        target_type = _clockin_makeup_type_from_request(req)
+        result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
+        sync_runtime_fields_to_user(user, config_data)
+        session.add(AuditLog(actor=operator.get("sub"), action="user.clockin.makeup", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(user)
+        session.commit()
+        return {"ok": result.get("status") != "fail", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "补卡失败")
+
+
+@router.post("/users/{user_id}/clock-in/makeup-all")
+def makeup_all_user_clockin(
+    *,
+    request: Request,
+    session: Session = Depends(get_session),
+    user_id: int,
+    req: Optional[ClockInMakeupRequest] = None,
+    operator: dict = Depends(get_operator),
+):
+    client_ip = get_client_ip(request)
+    _rate_limit(f"clockin_makeup_all:{client_ip}:{user_id}", limit=2, per_seconds=60)
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
+        result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
+        sync_runtime_fields_to_user(user, config_data)
+        session.add(AuditLog(actor=operator.get("sub"), action="user.clockin.makeup_all", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(user)
+        session.commit()
+        return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "全部补卡失败")
 
 @router.patch("/users/{user_id}", response_model=UserRead)
 def update_user(*, session: Session = Depends(get_session), user_id: int, user_update: UserUpdate, operator: dict = Depends(get_operator)):

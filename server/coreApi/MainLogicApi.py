@@ -5,6 +5,7 @@ import time
 import uuid
 import random
 import threading
+import datetime
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -358,54 +359,92 @@ class ApiClient:
             
         return formFieldDtoList
 
-    def get_checkin_info(self) -> Dict[str, Any]:
-        """获取用户的打卡信息"""
+    @staticmethod
+    def _coerce_clockin_range_time(value: Any, *, end: bool = False) -> str:
+        if isinstance(value, datetime.datetime):
+            dt = value
+        elif isinstance(value, datetime.date):
+            dt = datetime.datetime.combine(value, datetime.time())
+        else:
+            raw = str(value or "").strip().replace("/", "-")
+            parsed = None
+            for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+                try:
+                    parsed = datetime.datetime.strptime(raw[:size], fmt)
+                    break
+                except Exception:
+                    continue
+            dt = parsed or datetime.datetime.now()
+        if end:
+            return dt.strftime("%Y-%m-%d 00:00:00Z")
+        return dt.strftime("%Y-%m-%d 00:00:00")
+
+    def get_checkin_records(
+        self,
+        start_time: Optional[Any] = None,
+        end_time: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取指定时间范围内的打卡记录。未传范围时默认获取当前月。"""
         url = "attendence/clock/v2/listSynchro"
         if self.config.get_value("userInfo.userType") == "teacher":
             url = "attendence/clock/teacher/v1/listSynchro"
             
         headers = self._get_authenticated_headers()
-        data = {
-            **get_current_month_info(),
-            "t": aes_encrypt(str(int(time.time() * 1000))),
-        }
+        data = get_current_month_info()
+        if start_time is not None and end_time is not None:
+            data = {
+                "startTime": self._coerce_clockin_range_time(start_time),
+                "endTime": self._coerce_clockin_range_time(end_time, end=True),
+            }
+        data["t"] = aes_encrypt(str(int(time.time() * 1000)))
         rsp = self._post_request(url, headers, data)
-        return rsp.get("data", [{}])[0] if rsp.get("data") else {}
+        rows = rsp.get("data", []) if isinstance(rsp, dict) else []
+        return rows if isinstance(rows, list) else []
 
-    def submit_clock_in(self, checkin_info: Dict[str, Any]) -> None:
-        """提交打卡信息"""
+    def get_checkin_info(self) -> Dict[str, Any]:
+        """获取用户最近一条打卡信息"""
+        rows = self.get_checkin_records()
+        return rows[0] if rows else {}
+
+    def _clock_in_sign_data(self, checkin_info: Dict[str, Any], plan_id: Any) -> Optional[List[str]]:
+        if self.config.get_value("userInfo.userType") == "teacher":
+            return None
+
+        device = self.config.get_value("config.device")
+        user_id = self.config.get_value("userInfo.userId")
+        location = self.config.get_value("config.clockIn.location") or {}
+        if not isinstance(location, dict):
+            location = {}
+        address = self.config.get_value("config.clockIn.location.address") or location.get("address")
+        missing = []
+        if not device:
+            missing.append("device")
+        if not checkin_info.get("type"):
+            missing.append("type")
+        if not plan_id:
+            missing.append("planId")
+        if not user_id:
+            missing.append("userId")
+        if not address:
+            missing.append("clockIn.location.address")
+        if missing:
+            raise ValueError("打卡签名必填字段缺失: " + ", ".join(missing))
+        return [
+            device,
+            str(checkin_info.get("type")),
+            plan_id,
+            user_id,
+            str(address),
+        ]
+
+    def _submit_clock_in_payload(self, checkin_info: Dict[str, Any], *, replace: bool = False) -> None:
+        """提交普通打卡或补卡请求。"""
         url = "attendence/clock/teacher/v2/save"
-        sign_data = None
         planId = self.config.get_value("planInfo.planId")
+        sign_data = self._clock_in_sign_data(checkin_info, planId)
 
         if self.config.get_value("userInfo.userType") != "teacher":
-            url = "attendence/clock/v5/save"
-            device = self.config.get_value("config.device")
-            user_id = self.config.get_value("userInfo.userId")
-            location = self.config.get_value("config.clockIn.location") or {}
-            if not isinstance(location, dict):
-                location = {}
-            address = self.config.get_value("config.clockIn.location.address") or location.get("address")
-            missing = []
-            if not device:
-                missing.append("device")
-            if not checkin_info.get("type"):
-                missing.append("type")
-            if not planId:
-                missing.append("planId")
-            if not user_id:
-                missing.append("userId")
-            if not address:
-                missing.append("clockIn.location.address")
-            if missing:
-                raise ValueError("打卡签名必填字段缺失: " + ", ".join(missing))
-            sign_data = [
-                device,
-                str(checkin_info.get("type")),
-                planId,
-                user_id,
-                str(address),
-            ]
+            url = "attendence/attendanceReplace/v4/save" if replace else "attendence/clock/v5/save"
 
         logger.info(f'打卡类型：{checkin_info.get("type")}')
         
@@ -422,17 +461,26 @@ class ApiClient:
         ]
         data = dict.fromkeys(keys, None)
 
+        clockin_time = (
+            checkin_info.get("createTime")
+            or checkin_info.get("attendenceTime")
+            or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        )
+
         data.update({
             "country": "中国",
-            "createTime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "createTime": clockin_time,
             "description": checkin_info.get("description", None),
             "device": self.config.get_value("config.device"),
+            "isReplace": None if replace else checkin_info.get("isReplace", None),
             "state": "NORMAL",
             "type": checkin_info.get("type"),
             "planId": planId,
+            "attendanceType": "REPLACE" if replace else checkin_info.get("attendanceType", None),
             "attachments": checkin_info.get("attachments", None),
             "userId": self.config.get_value("userInfo.userId"),
             "lastDetailAddress": checkin_info.get("lastDetailAddress"),
+            "attendenceTime": None if replace else clockin_time,
             "t": aes_encrypt(str(int(time.time() * 1000))),
         })
 
@@ -442,12 +490,23 @@ class ApiClient:
         data.update(location2)
 
         headers = self._get_authenticated_headers(sign_data)
+        if replace and self.config.get_value("userInfo.userType") != "teacher":
+            headers["user-agent"] = "Dart/3.7 (dart:io)"
+            headers["content-type"] = "application/json"
 
         response = self._post_request(url, headers, data)
         if response.get("msg") == "302":
             logger.info("检测到行为验证码，正在通过···")
             data["captcha"] = self.solve_click_word_captcha()
             self._post_request(url, headers, data)
+
+    def submit_clock_in(self, checkin_info: Dict[str, Any]) -> None:
+        """提交打卡信息"""
+        self._submit_clock_in_payload(checkin_info, replace=False)
+
+    def submit_clock_in_replace(self, checkin_info: Dict[str, Any]) -> None:
+        """提交补卡信息"""
+        self._submit_clock_in_payload(checkin_info, replace=True)
 
     def get_upload_token(self) -> str:
         """获取上传文件的认证令牌"""

@@ -57,6 +57,25 @@
           <el-form-item label="下班打卡">
             <el-time-select v-model="form.clockIn.schedule.endTime" start="00:00" step="00:01" end="23:59" />
           </el-form-item>
+          <el-form-item v-if="isEdit" label="补卡日期">
+            <div class="clockin-backfill">
+              <div class="clockin-backfill-row">
+                <el-select v-model="clockInMakeupType" class="clockin-type-select" placeholder="补卡类型" @change="syncClockInTargetFromOptions">
+                  <el-option label="上班" value="START" />
+                  <el-option label="下班" value="END" />
+                </el-select>
+                <el-select v-model="clockInTargetDates" :loading="clockInPeriodLoading" multiple collapse-tags collapse-tags-tooltip filterable placeholder="选择待补日期">
+                  <el-option v-for="item in filteredClockInPeriodOptions" :key="item.value" :label="item.label" :value="item.value" />
+                </el-select>
+                <el-button :loading="clockInPeriodLoading" @click="loadClockInMissingDays">刷新缺卡</el-button>
+                <el-button type="warning" :loading="clockInMakeupLoading" :disabled="!clockInTargetDates.length" @click="makeupClockIn">补选中</el-button>
+                <el-button type="danger" :loading="clockInMakeupAllLoading" :disabled="!filteredClockInPeriodOptions.length" @click="makeupAllClockIn">全部待补</el-button>
+              </div>
+              <div class="clockin-backfill-hint">
+                已获取 {{ clockInRecordCount }} 条打卡记录，{{ clockInMakeupTypeLabel }}待补 {{ filteredClockInPeriodOptions.length }} 天，已选 {{ clockInTargetDates.length }} 天
+              </div>
+            </div>
+          </el-form-item>
           <el-form-item label="打卡周期">
             <el-checkbox-group v-model="form.clockIn.schedule.weekdays" class="week-group">
               <el-checkbox v-for="d in weekdayOptions" :key="d.value" :value="d.value">{{ d.label }}</el-checkbox>
@@ -334,6 +353,13 @@ const aiTestLatencyMs = ref(null)
 const addrFillLoading = ref(false)
 const aiDailyLoading = ref(false)
 const submitDailyLoading = ref(false)
+const clockInPeriodLoading = ref(false)
+const clockInMakeupLoading = ref(false)
+const clockInMakeupAllLoading = ref(false)
+const clockInMakeupType = ref('START')
+const clockInPeriodOptions = ref([])
+const clockInTargetDates = ref([])
+const clockInRecordCount = ref(0)
 const reportRunLoading = ref('')
 const reportActionLoading = ref('')
 const reportPreview = reactive({ daily: '', weekly: '', monthly: '' })
@@ -697,7 +723,7 @@ const fetchUser = async () => {
       if (!form.reportSettings.monthly.submitAt) form.reportSettings.monthly.submitAt = '12:00'
     }
     form.pushNotifications = normalizePushNotifications(form.pushNotifications)
-    await loadAllReportPeriodOptions()
+    await Promise.all([loadClockInMissingDays(), loadAllReportPeriodOptions()])
   } catch (error) {
     notifyError('加载失败')
   } finally {
@@ -834,6 +860,105 @@ const submitDailyReport = async () => {
 
 const reportLabelMap = { daily: '日报', weekly: '周报', monthly: '月报' }
 const reportTaskMap = { daily: 'daily_report', weekly: 'weekly_report', monthly: 'monthly_report' }
+const clockInMakeupTypeLabel = computed(() => (clockInMakeupType.value === 'END' ? '下班' : '上班'))
+const filteredClockInPeriodOptions = computed(() => {
+  const options = Array.isArray(clockInPeriodOptions.value) ? clockInPeriodOptions.value : []
+  return options
+    .filter((item) => Array.isArray(item.missing_types) && item.missing_types.includes(clockInMakeupType.value))
+    .map((item) => ({ ...item, label: `${item.value}（缺${clockInMakeupTypeLabel.value}）` }))
+})
+const syncClockInTargetFromOptions = () => {
+  const options = filteredClockInPeriodOptions.value
+  if (!options.length) {
+    clockInTargetDates.value = []
+    return
+  }
+  const validValues = new Set(options.map((item) => item.value))
+  const selected = Array.isArray(clockInTargetDates.value) ? clockInTargetDates.value : []
+  clockInTargetDates.value = selected.filter((item) => validValues.has(item))
+  if (!clockInTargetDates.value.length) {
+    clockInTargetDates.value = [options[0].value]
+  }
+}
+
+const loadClockInMissingDays = async () => {
+  if (!isEdit.value) return
+  clockInPeriodLoading.value = true
+  try {
+    const res = await http.get(`/users/${route.params.id}/clock-in/missing-days`)
+    clockInPeriodOptions.value = Array.isArray(res.data?.options) ? res.data.options : []
+    clockInRecordCount.value = Number(res.data?.record_count || 0)
+    syncClockInTargetFromOptions()
+  } catch (e) {
+    clockInPeriodOptions.value = []
+    clockInRecordCount.value = 0
+    clockInTargetDates.value = []
+    notifyWarning(resolveErrorMessage(e, '获取缺卡日期失败'))
+  } finally {
+    clockInPeriodLoading.value = false
+  }
+}
+
+const makeupClockIn = async () => {
+  if (!isEdit.value) return
+  const targetDates = Array.isArray(clockInTargetDates.value) ? clockInTargetDates.value : []
+  if (!targetDates.length) {
+    notifyWarning('暂无可补卡日期')
+    return
+  }
+  clockInMakeupLoading.value = true
+  try {
+    notifyInfo('正在补卡')
+    await flushUiMessage()
+    const res = await http.post(`/users/${route.params.id}/clock-in/makeup`, {
+      target_dates: targetDates,
+      target_type: clockInMakeupType.value,
+    })
+    const result = res.data?.result || {}
+    if (result.status === 'success') {
+      notifySuccess(result.message || '补卡完成')
+    } else if (result.status === 'skip') {
+      notifyWarning(result.message || '已跳过补卡')
+    } else {
+      notifyError(result.message || '补卡失败')
+    }
+    await loadClockInMissingDays()
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, '补卡失败'))
+  } finally {
+    clockInMakeupLoading.value = false
+  }
+}
+
+const makeupAllClockIn = async () => {
+  if (!isEdit.value) return
+  if (!filteredClockInPeriodOptions.value.length) {
+    notifyWarning('暂无待补卡日期')
+    return
+  }
+  clockInMakeupAllLoading.value = true
+  try {
+    notifyInfo('正在补全部待补日期')
+    await flushUiMessage()
+    const res = await http.post(`/users/${route.params.id}/clock-in/makeup-all`, {
+      target_type: clockInMakeupType.value,
+    })
+    const result = res.data?.result || {}
+    if (result.status === 'success') {
+      notifySuccess(result.message || '全部补卡完成')
+    } else if (result.status === 'skip') {
+      notifyWarning(result.message || '已跳过补卡')
+    } else {
+      notifyError(result.message || '全部补卡失败')
+    }
+    await loadClockInMissingDays()
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, '全部补卡失败'))
+  } finally {
+    clockInMakeupAllLoading.value = false
+  }
+}
+
 const getReportTarget = (key) => String(reportTargets[key] || '').trim() || undefined
 const hasReportTarget = (key) => !!getReportTarget(key)
 const syncReportTargetFromOptions = (key) => {
@@ -1118,6 +1243,26 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+.clockin-backfill {
+  width: 100%;
+}
+.clockin-backfill-row {
+  width: 100%;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.clockin-backfill-row :deep(.el-select) {
+  flex: 1 1 240px;
+}
+.clockin-backfill-row :deep(.clockin-type-select) {
+  flex: 0 0 120px;
+}
+.clockin-backfill-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 .form-actions {
   display: flex;

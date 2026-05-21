@@ -3,11 +3,17 @@ import os
 import json
 import random
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from typing import Dict, List, Optional, Any, Callable
 
 from server.coreApi.MainLogicApi import ApiClient
 from server.coreApi.AiServiceClient import generate_article
+from server.clockin_backfill import (
+    CLOCKIN_TYPE_LABELS,
+    combine_date_time,
+    normalize_clockin_records,
+    parse_clockin_date,
+)
 from server.database import engine
 from server.models import SystemSetting
 from server.util.Config import ConfigManager
@@ -24,6 +30,13 @@ from server.util.LoggerContext import _log_ctx
 from sqlmodel import Session
 
 logger = logging.getLogger("server.task_runner")
+
+
+def _month_bounds(dt: datetime) -> tuple[datetime, datetime]:
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    end = next_month - timedelta(days=1)
+    return start, end
 
 
 def _parse_report_target(report_type: str, target_period: Optional[str]) -> Optional[datetime]:
@@ -70,25 +83,28 @@ def _load_global_smtp_settings() -> Dict[str, Any]:
     return normalize_smtp_settings((value or {}).get("smtp"))
 
 def perform_clock_in(
-    api_client: ApiClient, config: ConfigManager, forced_checkin_type: Optional[str] = None
+    api_client: ApiClient,
+    config: ConfigManager,
+    forced_checkin_type: Optional[str] = None,
+    target_time: Optional[datetime] = None,
+    replace: bool = False,
 ) -> Dict[str, Any]:
     """执行打卡操作"""
     try:
-        current_time = datetime.now()
+        current_time = target_time or datetime.now()
         current_hour = current_time.hour
         address = config.get_value("config.clockIn.location.address")
 
         # 确定打卡类型
         if forced_checkin_type in ("START", "END"):
             checkin_type = forced_checkin_type
-            display_type = "上班" if checkin_type == "START" else "下班"
+            display_type = CLOCKIN_TYPE_LABELS.get(checkin_type, checkin_type)
         else:
             if current_hour < 12:
                 checkin_type = "START"
-                display_type = "上班"
             else:
                 checkin_type = "END"
-                display_type = "下班"
+            display_type = CLOCKIN_TYPE_LABELS.get(checkin_type, checkin_type)
 
         # 检查配置：是否跳过节假日/自定义日期
         clock_in_mode = config.get_value("config.clockIn.mode")
@@ -128,27 +144,25 @@ def perform_clock_in(
                 },
             }
 
-        last_checkin_info = api_client.get_checkin_info()
+        start_time, end_time = _month_bounds(current_time)
+        checkin_records = api_client.get_checkin_records(start_time, end_time)
+        last_checkin_info = checkin_records[0] if checkin_records else {}
 
         # 检查是否已经打过卡
-        if last_checkin_info and last_checkin_info.get("type") == checkin_type:
-            create_time_str = last_checkin_info.get("createTime")
-            if create_time_str:
-                last_checkin_time = datetime.strptime(
-                    create_time_str, "%Y-%m-%d %H:%M:%S"
-                )
-                if last_checkin_time.date() == current_time.date():
-                    logger.info(f"今日 {display_type} 卡已打，无需重复打卡")
-                    return {
-                        "status": "skip",
-                        "message": f"今日 {display_type} 卡已打，无需重复打卡",
-                        "task_type": "打卡",
-                        "details": {
-                            "打卡类型": display_type,
-                            "上次打卡时间": create_time_str,
-                            "打卡地点": address,
-                        },
-                    }
+        record_date = current_time.strftime("%Y-%m-%d")
+        for item in normalize_clockin_records(checkin_records):
+            if item["date"] == record_date and item["type"] == checkin_type:
+                logger.info(f"{record_date} {display_type} 卡已打，无需重复打卡")
+                return {
+                    "status": "skip",
+                    "message": f"{record_date} {display_type} 卡已打，无需重复打卡",
+                    "task_type": "打卡",
+                    "details": {
+                        "打卡类型": display_type,
+                        "上次打卡时间": item.get("time") or "",
+                        "打卡地点": address,
+                    },
+                }
 
         user_name = desensitize_name(config.get_value("userInfo.nikeName"))
         logger.info(f"用户 {user_name} 开始 {display_type} 打卡")
@@ -174,9 +188,15 @@ def perform_clock_in(
             "lastDetailAddress": last_checkin_info.get("address"),
             "attachments": attachments or None,
             "description": description,
+            "createTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "attendenceTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "isReplace": 1 if replace else None,
         }
 
-        api_client.submit_clock_in(checkin_info)
+        if replace:
+            api_client.submit_clock_in_replace(checkin_info)
+        else:
+            api_client.submit_clock_in(checkin_info)
         logger.info(f"用户 {user_name} {display_type} 打卡成功")
 
         return {
@@ -188,6 +208,7 @@ def perform_clock_in(
                 "打卡类型": display_type,
                 "打卡时间": current_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "打卡地点": address,
+                "补卡": "是" if replace else "否",
             },
         }
     except Exception as e:
@@ -208,6 +229,130 @@ def perform_clock_in(
         if tips:
             details["建议"] = "；".join(tips)
         return {"status": "fail", "message": f"打卡失败: {err}", "task_type": "打卡", "details": details}
+
+
+def perform_clock_in_makeup(
+    api_client: ApiClient,
+    config: ConfigManager,
+    target_date: Optional[str],
+    target_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    day = parse_clockin_date(target_date)
+    if not day:
+        return {"status": "fail", "message": "补卡日期格式错误", "task_type": "补卡"}
+    selected_type = str(target_type or "START").strip().upper()
+    if selected_type and selected_type not in ("START", "END"):
+        return {"status": "fail", "message": "补卡类型错误", "task_type": "补卡"}
+
+    month_start, month_end = _month_bounds(datetime.combine(day, datetime_time()))
+    records = api_client.get_checkin_records(month_start, month_end)
+    existing_types = {item["type"] for item in normalize_clockin_records(records) if item["date"] == day.strftime("%Y-%m-%d")}
+    missing_types = [item for item in ("START", "END") if item not in existing_types]
+    target_types = [selected_type] if selected_type else missing_types
+    target_types = [item for item in target_types if item in missing_types]
+    if not target_types:
+        label = CLOCKIN_TYPE_LABELS.get(selected_type, selected_type) if selected_type else "上班和下班"
+        return {
+            "status": "skip",
+            "message": f"{day.strftime('%Y-%m-%d')} 已完成{label}打卡，无需补卡",
+            "task_type": "补卡",
+            "details": {
+                "补卡日期": day.strftime("%Y-%m-%d"),
+                "补卡类型": label,
+            },
+        }
+
+    schedule = config.get_value("config.clockIn.schedule") or {}
+    if not isinstance(schedule, dict):
+        schedule = {}
+    results: List[Dict[str, Any]] = []
+    for checkin_type in target_types:
+        hhmm = schedule.get("startTime") if checkin_type == "START" else schedule.get("endTime")
+        default_hhmm = "07:30" if checkin_type == "START" else "18:00"
+        target_time = combine_date_time(day, hhmm, default_hhmm)
+        results.append(
+            perform_clock_in(
+                api_client,
+                config,
+                forced_checkin_type=checkin_type,
+                target_time=target_time,
+                replace=True,
+            )
+        )
+
+    failed = [item for item in results if item.get("status") == "fail"]
+    succeeded = [item for item in results if item.get("status") == "success"]
+    labels = [CLOCKIN_TYPE_LABELS.get(item, item) for item in target_types]
+    if failed:
+        status = "fail"
+        message = f"{day.strftime('%Y-%m-%d')} 补卡未全部完成"
+    elif succeeded:
+        status = "success"
+        message = f"{day.strftime('%Y-%m-%d')} {'、'.join(labels)}补卡完成"
+    else:
+        status = "skip"
+        message = f"{day.strftime('%Y-%m-%d')} 补卡已跳过"
+    return {
+        "status": status,
+        "message": message,
+        "task_type": "补卡",
+        "details": {
+            "补卡日期": day.strftime("%Y-%m-%d"),
+            "补卡类型": "、".join(labels),
+        },
+        "items": results,
+    }
+
+
+def _normalize_makeup_dates(target_dates: Optional[List[Any]]) -> List[str]:
+    dates: List[str] = []
+    seen = set()
+    for item in target_dates or []:
+        day = parse_clockin_date(item)
+        if not day:
+            return []
+        value = day.strftime("%Y-%m-%d")
+        if value not in seen:
+            seen.add(value)
+            dates.append(value)
+    return dates
+
+
+def perform_clock_in_makeup_many(
+    api_client: ApiClient,
+    config: ConfigManager,
+    target_dates: Optional[List[Any]],
+    target_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    dates = _normalize_makeup_dates(target_dates)
+    if not dates:
+        return {"status": "fail", "message": "请选择有效的补卡日期", "task_type": "补卡"}
+
+    results = [perform_clock_in_makeup(api_client, config, item, target_type=target_type) for item in dates]
+    failed = [item for item in results if item.get("status") == "fail"]
+    succeeded = [item for item in results if item.get("status") == "success"]
+    skipped = [item for item in results if item.get("status") == "skip"]
+    if failed:
+        status = "fail"
+        message = f"{len(dates)} 天补卡未全部完成"
+    elif succeeded:
+        status = "success"
+        message = f"{len(dates)} 天补卡完成"
+    else:
+        status = "skip"
+        message = f"{len(dates)} 天补卡已跳过"
+    return {
+        "status": status,
+        "message": message,
+        "task_type": "补卡",
+        "details": {
+            "补卡天数": len(dates),
+            "成功": len(succeeded),
+            "失败": len(failed),
+            "跳过": len(skipped),
+        },
+        "items": results,
+    }
 
 
 def _submit_report_common(
@@ -537,6 +682,7 @@ def run_task_by_config(
 
         all_tasks = [
             ("clock_in", lambda: perform_clock_in(api_client, config, forced_checkin_type)),
+            ("clock_in_makeup", lambda: perform_clock_in_makeup(api_client, config, target_period)),
             ("daily_report", lambda: submit_daily_report(api_client, config, force_report=force_report, target_period=target_period)),
             ("weekly_report", lambda: submit_weekly_report(config, api_client, force_report=force_report, target_period=target_period)),
             ("monthly_report", lambda: submit_monthly_report(config, api_client, force_report=force_report, target_period=target_period)),
