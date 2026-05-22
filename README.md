@@ -270,7 +270,7 @@ npm run preview
 
 ## Docker 部署
 
-项目支持通过 Docker Compose 一体化启动：
+项目支持通过 Docker Compose 一体化启动。默认 `docker-compose.yml` 用于本地构建：
 
 ```bash
 docker compose up -d --build
@@ -288,6 +288,22 @@ docker compose up -d --build
 - 应用首页：`http://localhost:8147`
 - API 文档：`http://localhost:8147/docs`
 
+如果要使用 GitHub Actions 已发布的远端镜像，请使用 `docker-compose.image.yml`。这种方式会从镜像仓库拉取新镜像，而不是用服务器本地源码重新构建。建议在 `.env` 中指定镜像和数据库配置：
+
+```env
+APP_IMAGE=ghcr.io/<owner>/<repo>:20260522
+DATABASE_URL=mysql+pymysql://user:password@mysql-host:3306/automoguding?charset=utf8mb4
+APP_SECRET=replace-with-a-long-random-secret
+```
+
+启动或更新：
+
+```bash
+docker compose -f docker-compose.image.yml up -d
+```
+
+`docker-compose.image.yml` 已配置 `pull_policy: always`，使用 `20260522` 这类日期标签时，重新执行 `up -d` 会主动检查并拉取远端同标签的新镜像。也可以把 `APP_IMAGE` 指定为 `20260522-123` 或 `sha-abcdef0` 来锁定某一次构建。
+
 ### GitHub 自动构建镜像
 
 仓库已提供 `.github/workflows/docker-publish.yml`，用于在 GitHub Actions 中自动构建并发布镜像到 GHCR，也可以同步推送到 Docker Hub。
@@ -296,6 +312,8 @@ docker compose up -d --build
 
 - 推送到 `main` 或 `master` 分支：构建并推送分支镜像，同时默认分支会更新 `latest` 标签。
 - 推送 `v*` 标签：构建并推送对应版本镜像，例如 `v1.0.0`。
+- 每次非 PR 构建都会额外推送日期标签，例如 `20260522` 和 `20260522-123`，便于在镜像仓库页面直接看到更新时间和新增版本。
+- 每次构建都会推送 `sha-<commit>` 标签，便于精确回滚到某次提交。
 - Pull Request：只执行构建验证，不推送镜像。
 - 手动触发：可在 GitHub Actions 页面运行 `Docker Publish` 工作流。
 
@@ -303,7 +321,12 @@ docker compose up -d --build
 
 ```text
 ghcr.io/<owner>/<repo>:latest
+ghcr.io/<owner>/<repo>:20260522
+ghcr.io/<owner>/<repo>:20260522-123
+ghcr.io/<owner>/<repo>:sha-abcdef0
 ```
+
+注意：`latest`、分支标签和纯日期标签会被后续构建覆盖，已运行的容器不会自动更新。服务器需要重新执行 `docker compose -f docker-compose.image.yml up -d`，或者直接指定新的 `YYYYMMDD-<run_number>` / `sha-*` 标签。
 
 Docker Hub 同步发布需要在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中配置以下 Secrets：
 
