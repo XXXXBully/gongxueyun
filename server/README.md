@@ -1,4 +1,4 @@
-# AutoMoGuDing SaaS 后端
+﻿# AutoMoGuDing SaaS 后端
 
 `server/` 是 AutoMoGuDing SaaS 的 FastAPI 后端，负责管理端 API、用户端 API、工学云接口调用、定时调度、批量任务队列、补卡、报告提交和运行时数据回写。
 
@@ -44,6 +44,15 @@ ADMIN_PASSWORD=admin123456
 SCHEDULER_TIMEZONE=Asia/Shanghai
 SCHEDULER_JITTER_SECONDS=600
 SCHEDULER_REPORT_JITTER_SECONDS=0
+CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS=2
+CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES=3
+CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS=10
+CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS=60
+MOGUDING_PROXY_API_URL=
+MOGUDING_PROXY_TTL_SECONDS=55
+MOGUDING_PROXY_API_TIMEOUT_SECONDS=10
+MOGUDING_PROXY_URLS=
+REPORT_MAKEUP_BATCH_DELAY_SECONDS=2
 GEOCODE_PROVIDER=osm
 AMAP_KEY=your-amap-key
 ```
@@ -53,6 +62,16 @@ AMAP_KEY=your-amap-key
 - `DATABASE_URL` 必须使用 MySQL，且必须以 `mysql+pymysql://` 开头。
 - 生产环境必须显式配置 `APP_SECRET`。
 - `GEOCODE_PROVIDER=amap` 时需要提供 `AMAP_KEY`。
+- `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 控制一键补卡每个日期之间的默认间隔。
+- `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES` 控制补卡遇到频繁请求时的最大重试次数。
+- `CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制补卡频繁请求重试的初始等待秒数，后续会递增退避。
+- `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS` 控制触发 IP 频繁后的批量冷却间隔。当前日期重试成功后，后续日期会按该间隔降速；如果当前日期重试耗尽仍然频繁，会停止剩余日期。
+- `MOGUDING_PROXY_API_URL` 控制动态代理获取接口。接口响应需要包含 `ip:端口`，后端会从接口 URL 查询参数读取 `accessName` 和 `accessPassword`，并拼接成 `http://accessName:accessPassword@ip:端口`。
+- `MOGUDING_PROXY_TTL_SECONDS` 控制动态代理缓存时长，默认 `55` 秒。
+- `MOGUDING_PROXY_API_TIMEOUT_SECONDS` 控制动态代理接口请求超时。
+- `MOGUDING_PROXY_URLS` 控制静态工学云补卡代理池，多个代理用逗号、分号或换行分隔。如果同时配置动态代理接口，会优先使用动态代理接口。代理只在手动补卡执行阶段启用；正常登录、定时打卡、报告提交和缺卡查询不会使用该代理。
+- 补卡代理也可以在管理端 Web 的「系统设置」中保存为全局配置。环境变量中的代理配置优先级高于 Web 全局配置。
+- `REPORT_MAKEUP_BATCH_DELAY_SECONDS` 控制日报 / 周报 / 月报一键补交的批量间隔，未配置时会回退到补卡间隔。
 - Docker 容器内的 `127.0.0.1` 指向容器自身。容器连接宿主机 MySQL 时，请使用宿主机 IP 或 `host.docker.internal`。
 
 ## 启动流程
@@ -124,7 +143,7 @@ POST /users/{user_id}/clock-in/makeup-all
 - 手动执行任务
 - 查看执行记录
 - 缺卡查询和补卡
-- 日报、周报、月报生成和提交
+- 日报、周报、月报生成和提交，以及当前类型下一键补全部待补周期
 
 补卡相关接口：
 
@@ -132,6 +151,15 @@ POST /users/{user_id}/clock-in/makeup-all
 GET /app/clock-in/missing-days
 POST /app/clock-in/makeup
 POST /app/clock-in/makeup-all
+```
+
+报告补交接口：
+
+```http
+GET /app/reports/{report_key}/missing-periods
+POST /app/reports/{report_key}/generate
+POST /app/reports/{report_key}/submit
+POST /app/reports/{report_key}/makeup-all
 ```
 
 ## 补卡执行链路
@@ -149,6 +177,28 @@ POST /app/clock-in/makeup-all
 - `target_type=END`：只补下班。
 
 即使某一天同时缺上班和下班，选择 `START` 时也只补上班；选择 `END` 时只补下班。
+
+批量补卡默认按 `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 间隔逐个日期执行。如果远端返回“请求过于频繁”、`429` 或 `rate limit`，后端会等待后重试当前日期，而不是直接进入下一个日期。重试次数和初始等待时间由 `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES`、`CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制。
+
+触发 IP 频繁后，批量任务会进入冷却策略：
+
+- 当前日期按指数退避重试。
+- 当前日期重试成功后，后续日期之间的间隔提升到 `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS`。
+- 当前日期重试耗尽仍然频繁时，后续日期会被标记为跳过并停止继续请求，避免扩大远端限流。
+
+只有手动补卡会启用工学云代理。正常登录、缺卡查询、定时打卡和报告提交会继续直连工学云，不会使用这里配置的代理。
+
+如果配置了 `MOGUDING_PROXY_API_URL`，补卡请求会在提交前获取动态代理。动态代理默认缓存 `MOGUDING_PROXY_TTL_SECONDS` 秒；遇到 IP 频繁或代理连接失败时，会重新调用代理接口获取新 IP 后继续重试。补卡批量结果会记录 `代理切换次数`。
+
+动态代理接口示例：
+
+```env
+MOGUDING_PROXY_API_URL=http://capi.51daili.com/traffic/getip?linePoolIndex=1&packid=12&time=2&qty=1&port=1&format=txt&dt=2&ct=1&dtc=5&usertype=17&uid=54638&accessName=your-name&accessPassword=your-pass
+```
+
+接口返回 `1.2.3.4:8080` 时，实际使用的代理会变成 `http://your-name:your-pass@1.2.3.4:8080`。也可以使用 `MOGUDING_PROXY_URLS` 配置静态代理池。
+
+管理端 Web 提供「系统设置」→「工学云代理」入口，可配置补卡代理的启用状态、动态代理接口、缓存秒数、接口超时秒数和静态代理列表。
 
 学生补卡使用工学云接口：
 
@@ -182,6 +232,8 @@ attendence/attendanceReplace/v4/save
 - `submit_daily_report`：日报提交。
 - `submit_weekly_report`：周报提交。
 - `submit_monthly_report`：月报提交。
+
+其中补卡只属于手动任务，不会被普通定时打卡任务自动触发。定时打卡只执行 `perform_clock_in`，报告定时任务只执行对应的日报、周报或月报提交。
 
 执行结果会通过 `server/user_runtime.py` 回写到用户记录，包括最近运行时间、状态、日志、登录态和计划信息。
 

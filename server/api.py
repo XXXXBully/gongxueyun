@@ -25,6 +25,12 @@ from server.auth import get_admin, get_operator, get_viewer, get_user, issue_tok
 from server.secret_store import decrypt_secret, encrypt_secret
 from server.user_runtime import apply_execution_results_to_user, normalize_push_notifications, normalize_smtp_settings, runtime_login_valid, runtime_plan_required, sync_runtime_fields_to_user
 from server.util.MessagePush import send_test_smtp_message
+from server.proxy_settings import (
+    PROXY_SETTINGS_KEY,
+    encode_proxy_settings,
+    load_global_proxy_settings,
+    normalize_proxy_settings,
+)
 
 router = APIRouter()
 
@@ -88,6 +94,18 @@ def _save_notification_settings(session: Session, smtp_payload: Dict[str, Any]) 
     row.value = {"smtp": stored_smtp}
     session.add(row)
     return {"smtp": smtp}
+
+
+def _save_proxy_settings(session: Session, proxy_payload: Dict[str, Any]) -> Dict[str, Any]:
+    proxy = normalize_proxy_settings(proxy_payload)
+    if proxy.get("enabled") and not str(proxy.get("apiUrl") or "").strip() and not str(proxy.get("proxyUrls") or "").strip():
+        raise HTTPException(status_code=400, detail="启用代理时请填写动态代理接口或静态代理列表")
+    row = session.get(SystemSetting, PROXY_SETTINGS_KEY)
+    if not row:
+        row = SystemSetting(key=PROXY_SETTINGS_KEY, value={})
+    row.value = encode_proxy_settings(proxy)
+    session.add(row)
+    return proxy
 
 def _is_private_or_special_ip(ip: str) -> bool:
     try:
@@ -234,6 +252,15 @@ class AppRunRequest(BaseModel):
     task_type: Optional[str] = None
     force_report: Optional[bool] = None
     target_period: Optional[str] = None
+
+
+REPORT_RUN_TASK_TYPES = {"report", "daily_report", "weekly_report", "monthly_report"}
+
+
+def _should_rate_limit_run_request(req: Optional[AppRunRequest]) -> bool:
+    task_type = str(getattr(req, "task_type", "") or "").strip()
+    return task_type not in REPORT_RUN_TASK_TYPES
+
 
 class ClockInMakeupRequest(BaseModel):
     target_date: Optional[str] = None
@@ -557,6 +584,8 @@ def _makeup_clockin_for_user(user: User, target_dates: List[str], target_type: s
     config = ConfigManager(config=config_data)
     api_client = ApiClient(config)
     _ensure_remote_runtime(api_client, config)
+    if hasattr(api_client, "enable_proxy"):
+        api_client.enable_proxy()
     if len(target_dates) == 1:
         result = perform_clock_in_makeup(api_client, config, target_dates[0], target_type=target_type)
     else:
@@ -588,15 +617,31 @@ def _makeup_all_missing_clockin_for_user(user: User, target_type: str) -> tuple[
     return result, config_data, target_dates
 
 
+def _is_report_enabled_for_user(user: User, report_key: str) -> bool:
+    settings = user.reportSettings if isinstance(user.reportSettings, dict) else {}
+    report_settings = settings.get(report_key) if isinstance(settings.get(report_key), dict) else {}
+    return bool(report_settings.get("enabled"))
+
+
 def _get_missing_report_periods_for_user(user: User, report_key: str) -> Dict[str, Any]:
+    meta = _get_report_meta(report_key)
+    report_type = meta["report_type"]
+    if not _is_report_enabled_for_user(user, report_key):
+        return {
+            "ok": True,
+            "report_key": report_key,
+            "report_type": report_type,
+            "options": [],
+            "submitted_count": 0,
+            "disabled": True,
+            "message": f"未开启{meta['task_name']}，无需获取未提交周期",
+        }
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法获取已提交报告")
-    meta = _get_report_meta(report_key)
     config_data = user_to_config(user)
     config = ConfigManager(config=config_data)
     api_client = ApiClient(config)
     _ensure_remote_runtime(api_client, config)
-    report_type = meta["report_type"]
     submitted = api_client.get_all_submitted_reports_info(report_type) or {}
     submitted_reports = submitted.get("data", []) if isinstance(submitted, dict) else []
     submitted_keys = {
@@ -1078,7 +1123,8 @@ def app_run(
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
     client_ip = get_client_ip(request)
-    _rate_limit(f"app_run:{client_ip}:{user.id}", limit=3, per_seconds=60)
+    if _should_rate_limit_run_request(req):
+        _rate_limit(f"app_run:{client_ip}:{user.id}", limit=3, per_seconds=60)
     config_data = user_to_config(user)
     
     specific_task_type = req.task_type if req else None
@@ -1525,6 +1571,10 @@ class NotificationSettingsUpdateRequest(BaseModel):
 class NotificationSettingsTestRequest(BaseModel):
     smtp: Dict[str, Any]
 
+
+class ProxySettingsUpdateRequest(BaseModel):
+    proxy: Dict[str, Any]
+
 @router.post("/auth/login")
 def admin_login(request: Request, req: LoginRequest):
     client_ip = get_client_ip(request)
@@ -1624,6 +1674,34 @@ def test_notification_smtp(
         raise HTTPException(status_code=400, detail="请填写发件人名称")
     to = send_test_smtp_message(smtp)
     return {"ok": True, "to": to}
+
+
+@router.get("/settings/proxy")
+def get_proxy_settings(
+    *,
+    admin: dict = Depends(get_admin),
+):
+    return {"proxy": load_global_proxy_settings()}
+
+
+@router.patch("/settings/proxy")
+def update_proxy_settings(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(get_admin),
+    req: ProxySettingsUpdateRequest,
+):
+    proxy = _save_proxy_settings(session, req.proxy)
+    session.add(
+        AuditLog(
+            actor=admin.get("sub"),
+            action="settings.proxy.update",
+            target_user_id=None,
+            detail={"enabled": bool(proxy.get("enabled"))},
+        )
+    )
+    session.commit()
+    return {"proxy": proxy}
 
 class AdminUserCreateRequest(BaseModel):
     username: str
@@ -2097,7 +2175,8 @@ def run_user_task(
     operator: dict = Depends(get_operator),
 ):
     client_ip = get_client_ip(request)
-    _rate_limit(f"run:{client_ip}:{user_id}", limit=2, per_seconds=60)
+    if _should_rate_limit_run_request(req):
+        _rate_limit(f"run:{client_ip}:{user_id}", limit=2, per_seconds=60)
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

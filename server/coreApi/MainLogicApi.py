@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -7,6 +8,7 @@ import random
 import threading
 import datetime
 from typing import Dict, Any, List, Optional
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 
 import requests
 
@@ -15,8 +17,113 @@ from server.util.CryptoUtils import create_sign, aes_encrypt, aes_decrypt
 from server.util.CaptchaUtils import recognize_blockPuzzle_captcha, recognize_clickWord_captcha
 from server.util.HelperFunctions import get_current_month_info
 from server.util.LoggerContext import _log_ctx
+from server.proxy_settings import load_global_proxy_settings
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MOGUDING_PROXY_API_TIMEOUT_SECONDS = 10.0
+DEFAULT_MOGUDING_PROXY_TTL_SECONDS = 55.0
+MAX_MOGUDING_PROXY_API_TIMEOUT_SECONDS = 30.0
+MAX_MOGUDING_PROXY_TTL_SECONDS = 600.0
+
+
+def _split_proxy_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items: List[str] = []
+        for item in value:
+            items.extend(_split_proxy_values(item))
+        return items
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in re.split(r"[\s,;]+", text) if item.strip()]
+
+
+def _normalize_proxy_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"http://{text}"
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return text
+
+
+def _parse_float_env(name: str, default: float, max_value: float) -> float:
+    try:
+        value = float(str(os.getenv(name, str(default))).strip())
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return 0.0
+    return min(value, max_value)
+
+
+def _extract_proxy_host_port(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for line in text.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        match = re.search(r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+):(?P<port>\d{1,5})", item)
+        if not match:
+            continue
+        try:
+            port = int(match.group("port"))
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            return f"{match.group('host')}:{port}"
+    return ""
+
+
+def _proxy_auth_from_fetch_url(fetch_url: str) -> tuple[str, str]:
+    try:
+        params = parse_qs(urlparse(fetch_url).query, keep_blank_values=True)
+        username = str((params.get("accessName") or [""])[0] or "").strip()
+        password = str((params.get("accessPassword") or [""])[0] or "").strip()
+        return username, password
+    except Exception:
+        return "", ""
+
+
+def _apply_proxy_auth_from_fetch_url(proxy_url: str, fetch_url: str) -> str:
+    username, password = _proxy_auth_from_fetch_url(fetch_url)
+    if not username and not password:
+        return proxy_url
+    parsed = urlparse(proxy_url)
+    host = parsed.hostname or ""
+    if not host:
+        return proxy_url
+    port = f":{parsed.port}" if parsed.port else ""
+    auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+    return urlunparse(parsed._replace(netloc=f"{auth}{host}{port}"))
+
+
+def _mask_proxy_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+        if parsed.password:
+            user = parsed.username or ""
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = f"{user}:***@{host}{port}" if user else f"***@{host}{port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        pass
+    return value
+
+
+def _is_rate_limited_text(value: Any) -> bool:
+    text = str(value or "").lower()
+    patterns = ("请求过于频繁", "操作过于频繁", "ip请求过于频繁", "429", "too many requests", "rate limit")
+    return any(item.lower() in text for item in patterns)
 
 
 class ApiClient:
@@ -49,6 +156,193 @@ class ApiClient:
         self.max_retries = 5  # 控制重新尝试的次数
         self.session = requests.Session()
         self.session.headers.update(self.DEFAULT_HEADERS)
+        self._global_proxy_settings = self._load_global_proxy_settings()
+        self._proxy_fetch_url = self._load_proxy_fetch_url()
+        self._dynamic_proxy_url: Optional[str] = None
+        self._dynamic_proxy_fetched_at = 0.0
+        self._proxy_urls = self._load_proxy_urls()
+        self._proxy_index = 0
+        self._proxy_enabled = False
+        if self._proxy_fetch_url:
+            logger.info("已加载工学云动态补卡代理获取接口")
+        if self._proxy_urls:
+            logger.info("已加载工学云补卡代理池，共 %s 个代理", len(self._proxy_urls))
+
+    def _load_global_proxy_settings(self) -> Dict[str, Any]:
+        if any(
+            str(os.getenv(name) or "").strip()
+            for name in [
+                "MOGUDING_PROXY_API_URL",
+                "MOGUDING_PROXY_FETCH_URL",
+                "MOGUDING_PROXY_URLS",
+                "MOGUDING_PROXY_URL",
+                "MOGUDING_PROXY",
+            ]
+        ):
+            return {}
+        settings = load_global_proxy_settings()
+        return settings if settings.get("enabled") else {}
+
+    def _load_proxy_fetch_url(self) -> str:
+        raw_values: List[Any] = [
+            os.getenv("MOGUDING_PROXY_API_URL"),
+            os.getenv("MOGUDING_PROXY_FETCH_URL"),
+        ]
+        try:
+            root = self.config.config if isinstance(self.config.config, dict) else {}
+            app_config = root.get("config") if isinstance(root.get("config"), dict) else {}
+            network_config = app_config.get("network") if isinstance(app_config.get("network"), dict) else {}
+            proxy_config = app_config.get("proxy") if isinstance(app_config.get("proxy"), dict) else {}
+            raw_values.extend(
+                [
+                    network_config.get("proxyApiUrl"),
+                    network_config.get("proxyFetchUrl"),
+                    proxy_config.get("apiUrl"),
+                    proxy_config.get("fetchUrl"),
+                    app_config.get("proxyApiUrl"),
+                    app_config.get("proxyFetchUrl"),
+                ]
+            )
+        except Exception:
+            pass
+
+        raw_values.append(self._global_proxy_settings.get("apiUrl"))
+        for raw in raw_values:
+            value = str(raw or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _proxy_fetch_timeout_seconds(self) -> float:
+        if self._global_proxy_settings.get("apiTimeoutSeconds") not in [None, ""]:
+            return float(self._global_proxy_settings.get("apiTimeoutSeconds"))
+        return _parse_float_env(
+            "MOGUDING_PROXY_API_TIMEOUT_SECONDS",
+            DEFAULT_MOGUDING_PROXY_API_TIMEOUT_SECONDS,
+            MAX_MOGUDING_PROXY_API_TIMEOUT_SECONDS,
+        )
+
+    def _proxy_ttl_seconds(self) -> float:
+        if self._global_proxy_settings.get("ttlSeconds") not in [None, ""]:
+            return float(self._global_proxy_settings.get("ttlSeconds"))
+        return _parse_float_env(
+            "MOGUDING_PROXY_TTL_SECONDS",
+            DEFAULT_MOGUDING_PROXY_TTL_SECONDS,
+            MAX_MOGUDING_PROXY_TTL_SECONDS,
+        )
+
+    def _dynamic_proxy_expired(self) -> bool:
+        if not self._dynamic_proxy_url:
+            return True
+        ttl = self._proxy_ttl_seconds()
+        if ttl <= 0:
+            return False
+        return (time.time() - self._dynamic_proxy_fetched_at) >= ttl
+
+    def _refresh_dynamic_proxy(self, reason: Optional[str] = None) -> bool:
+        if not self._proxy_fetch_url:
+            return False
+        try:
+            response = requests.get(self._proxy_fetch_url, timeout=self._proxy_fetch_timeout_seconds())
+            response.raise_for_status()
+            host_port = _extract_proxy_host_port(response.text)
+            if not host_port:
+                raise ValueError("代理接口未返回有效 ip:端口")
+            proxy_url = _normalize_proxy_url(host_port)
+            proxy_url = _apply_proxy_auth_from_fetch_url(proxy_url, self._proxy_fetch_url)
+            old_proxy = self._dynamic_proxy_url
+            self._dynamic_proxy_url = proxy_url
+            self._dynamic_proxy_fetched_at = time.time()
+            logger.warning(
+                "已获取新的工学云动态代理: %s -> %s%s",
+                _mask_proxy_url(old_proxy or ""),
+                _mask_proxy_url(proxy_url),
+                f"，原因: {reason}" if reason else "",
+            )
+            return True
+        except Exception as exc:
+            logger.warning("获取工学云动态代理失败: %s", exc)
+            return False
+
+    def _load_proxy_urls(self) -> List[str]:
+        raw_values: List[Any] = [
+            os.getenv("MOGUDING_PROXY_URLS"),
+            os.getenv("MOGUDING_PROXY_URL"),
+            os.getenv("MOGUDING_PROXY"),
+        ]
+        try:
+            root = self.config.config if isinstance(self.config.config, dict) else {}
+            app_config = root.get("config") if isinstance(root.get("config"), dict) else {}
+            network_config = app_config.get("network") if isinstance(app_config.get("network"), dict) else {}
+            proxy_config = app_config.get("proxy") if isinstance(app_config.get("proxy"), dict) else {}
+            raw_values.extend(
+                [
+                    network_config.get("proxyUrls"),
+                    network_config.get("proxyUrl"),
+                    proxy_config.get("urls"),
+                    proxy_config.get("url"),
+                    app_config.get("proxyUrls"),
+                    app_config.get("proxyUrl"),
+                ]
+            )
+        except Exception:
+            pass
+        raw_values.append(self._global_proxy_settings.get("proxyUrls"))
+
+        urls: List[str] = []
+        seen = set()
+        for raw in raw_values:
+            for item in _split_proxy_values(raw):
+                proxy_url = _normalize_proxy_url(item)
+                if proxy_url and proxy_url not in seen:
+                    seen.add(proxy_url)
+                    urls.append(proxy_url)
+        return urls
+
+    def enable_proxy(self) -> None:
+        if not self._proxy_enabled:
+            logger.info("已为本次手动补卡启用工学云代理")
+        self._proxy_enabled = True
+
+    def current_proxy_url(self) -> Optional[str]:
+        if not self._proxy_enabled:
+            return None
+        if self._proxy_fetch_url:
+            if self._dynamic_proxy_expired():
+                self._refresh_dynamic_proxy(reason="初始化或代理过期")
+            if self._dynamic_proxy_url:
+                return self._dynamic_proxy_url
+        if not self._proxy_urls:
+            return None
+        return self._proxy_urls[self._proxy_index % len(self._proxy_urls)]
+
+    def _proxy_request_kwargs(self) -> Dict[str, Any]:
+        proxy_url = self.current_proxy_url()
+        if not proxy_url:
+            return {}
+        return {"proxies": {"http": proxy_url, "https": proxy_url}}
+
+    def rotate_proxy(self, reason: Optional[str] = None) -> bool:
+        if not self._proxy_enabled:
+            return False
+        if self._proxy_fetch_url:
+            old_proxy = self._dynamic_proxy_url or ""
+            if self._refresh_dynamic_proxy(reason=reason):
+                new_proxy = self._dynamic_proxy_url or ""
+                return bool(new_proxy) and new_proxy != old_proxy or bool(new_proxy)
+
+        if len(self._proxy_urls) < 2:
+            return False
+        old_proxy = self.current_proxy_url()
+        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_urls)
+        new_proxy = self.current_proxy_url()
+        logger.warning(
+            "工学云代理已切换: %s -> %s%s",
+            _mask_proxy_url(old_proxy or ""),
+            _mask_proxy_url(new_proxy or ""),
+            f"，原因: {reason}" if reason else "",
+        )
+        return old_proxy != new_proxy
 
     def _post_request(
         self,
@@ -68,7 +362,8 @@ class ApiClient:
                     full_url,
                     headers=headers,
                     json=data,
-                    timeout=10
+                    timeout=10,
+                    **self._proxy_request_kwargs(),
                 )
                 response.raise_for_status()
                 rsp = response.json()
@@ -99,6 +394,12 @@ class ApiClient:
                     else:
                         raise ValueError(msg)
                 
+                if _is_rate_limited_text(msg) and attempt < self.max_retries - 1 and self.rotate_proxy(reason=msg):
+                    wait_time = 1 * (2 ** attempt)
+                    logger.warning("请求触发频繁限制，已切换代理，等待 %.2f 秒后重试", wait_time)
+                    time.sleep(wait_time)
+                    continue
+
                 raise ValueError(msg)
 
             except (requests.RequestException, ValueError) as e:
@@ -112,6 +413,11 @@ class ApiClient:
                 
                 if is_last_attempt:
                     raise ValueError(error_str)
+
+                if isinstance(e, requests.RequestException):
+                    self.rotate_proxy(reason=error_str)
+                elif _is_rate_limited_text(error_str):
+                    self.rotate_proxy(reason=error_str)
 
                 wait_time = 1 * (2 ** attempt)
                 logger.warning(f"请求失败: {e}，重试 {attempt + 1}/{self.max_retries}，等待 {wait_time:.2f} 秒")

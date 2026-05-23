@@ -140,8 +140,8 @@
                 <el-select v-model="reportTargets.daily" :loading="reportPeriodLoading.daily" filterable placeholder="选择未提交日报日期">
                   <el-option v-for="item in reportPeriodOptions.daily" :key="item.value" :label="item.label" :value="item.value" />
                 </el-select>
-                <el-button :loading="reportPeriodLoading.daily" :disabled="!isEdit || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('daily')">刷新待补</el-button>
-                <el-button type="danger" :loading="reportMakeupAllLoading === 'daily'" :disabled="!isEdit || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'daily') || !reportPendingCount('daily')" @click="makeupAllReports('daily')">补全部日报</el-button>
+                <el-button :loading="reportPeriodLoading.daily" :disabled="!isEdit || !isReportEnabled('daily') || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('daily')">刷新待补</el-button>
+                <el-button type="danger" :loading="reportMakeupAllLoading === 'daily'" :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'daily') || !reportPendingCount('daily')" @click="makeupAllReports('daily')">补全部日报</el-button>
               </div>
               <el-progress
                 v-if="reportMakeupAllInProgress('daily')"
@@ -149,7 +149,7 @@
                 :percentage="reportMakeupAllPercent"
                 :status="reportMakeupAllPercent >= 100 ? 'success' : undefined"
               />
-              <div class="report-backfill-hint">日报待补 {{ reportPendingCount('daily') }} 个周期</div>
+              <div class="report-backfill-hint">{{ isReportEnabled('daily') ? `日报待补 ${reportPendingCount('daily')} 个周期` : '日报未开启，不获取待补周期' }}</div>
             </div>
           </el-form-item>
           <el-form-item label="日报预览">
@@ -157,13 +157,13 @@
               <div class="report-preview-meta">
                 <div>字数：{{ dailyCount }} / 1000</div>
                 <div class="report-preview-actions">
-                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily" :loading="reportActionLoading === 'daily_generate'" @click="generateReport('daily')">
+                  <el-button size="small" :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily" :loading="reportActionLoading === 'daily_generate'" @click="generateReport('daily')">
                     AI生成日报
                   </el-button>
                   <el-button
                     size="small"
                     type="primary"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily || !String(reportPreview.daily || '').trim()"
+                    :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily || !String(reportPreview.daily || '').trim()"
                     :loading="reportActionLoading === 'daily_submit'"
                     @click="submitReport('daily')"
                   >
@@ -172,7 +172,7 @@
                   <el-button
                     size="small"
                     type="success"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily || aiDailyLoading || submitDailyLoading"
+                    :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily || aiDailyLoading || submitDailyLoading"
                     :loading="reportRunLoading === 'daily_report'"
                     @click="runReportNow('daily_report')"
                   >
@@ -206,8 +206,8 @@
                 <el-select v-model="reportTargets.weekly" :loading="reportPeriodLoading.weekly" filterable placeholder="选择未提交周报周期">
                   <el-option v-for="item in reportPeriodOptions.weekly" :key="item.value" :label="item.label" :value="item.value" />
                 </el-select>
-                <el-button :loading="reportPeriodLoading.weekly" :disabled="!isEdit || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('weekly')">刷新待补</el-button>
-                <el-button type="danger" :loading="reportMakeupAllLoading === 'weekly'" :disabled="!isEdit || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'weekly') || !reportPendingCount('weekly')" @click="makeupAllReports('weekly')">补全部周报</el-button>
+                <el-button :loading="reportPeriodLoading.weekly" :disabled="!isEdit || !isReportEnabled('weekly') || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('weekly')">刷新待补</el-button>
+                <el-button type="danger" :loading="reportMakeupAllLoading === 'weekly'" :disabled="!isEdit || !isReportEnabled('weekly') || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'weekly') || !reportPendingCount('weekly')" @click="makeupAllReports('weekly')">补全部周报</el-button>
               </div>
               <el-progress
                 v-if="reportMakeupAllInProgress('weekly')"
@@ -215,7 +215,7 @@
                 :percentage="reportMakeupAllPercent"
                 :status="reportMakeupAllPercent >= 100 ? 'success' : undefined"
               />
-              <div class="report-backfill-hint">周报待补 {{ reportPendingCount('weekly') }} 个周期</div>
+              <div class="report-backfill-hint">{{ isReportEnabled('weekly') ? `周报待补 ${reportPendingCount('weekly')} 个周期` : '周报未开启，不获取待补周期' }}</div>
             </div>
           </el-form-item>
           <el-form-item label="周报预览">
@@ -223,13 +223,13 @@
               <div class="report-preview-meta">
                 <div>字数：{{ weeklyCount }} / 1000</div>
                 <div class="report-preview-actions">
-                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly" :loading="reportActionLoading === 'weekly_generate'" @click="generateReport('weekly')">
+                  <el-button size="small" :disabled="!isEdit || !isReportEnabled('weekly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly" :loading="reportActionLoading === 'weekly_generate'" @click="generateReport('weekly')">
                     AI生成周报
                   </el-button>
                   <el-button
                     size="small"
                     type="primary"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly || !String(reportPreview.weekly || '').trim()"
+                    :disabled="!isEdit || !isReportEnabled('weekly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly || !String(reportPreview.weekly || '').trim()"
                     :loading="reportActionLoading === 'weekly_submit'"
                     @click="submitReport('weekly')"
                   >
@@ -238,7 +238,7 @@
                   <el-button
                     size="small"
                     type="success"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly"
+                    :disabled="!isEdit || !isReportEnabled('weekly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.weekly"
                     :loading="reportRunLoading === 'weekly_report'"
                     @click="runReportNow('weekly_report')"
                   >
@@ -266,8 +266,8 @@
                 <el-select v-model="reportTargets.monthly" :loading="reportPeriodLoading.monthly" filterable placeholder="选择未提交月报月份">
                   <el-option v-for="item in reportPeriodOptions.monthly" :key="item.value" :label="item.label" :value="item.value" />
                 </el-select>
-                <el-button :loading="reportPeriodLoading.monthly" :disabled="!isEdit || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('monthly')">刷新待补</el-button>
-                <el-button type="danger" :loading="reportMakeupAllLoading === 'monthly'" :disabled="!isEdit || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'monthly') || !reportPendingCount('monthly')" @click="makeupAllReports('monthly')">补全部月报</el-button>
+                <el-button :loading="reportPeriodLoading.monthly" :disabled="!isEdit || !isReportEnabled('monthly') || !!reportMakeupAllLoading" @click="loadReportPeriodOptions('monthly')">刷新待补</el-button>
+                <el-button type="danger" :loading="reportMakeupAllLoading === 'monthly'" :disabled="!isEdit || !isReportEnabled('monthly') || !!reportRunLoading || !!reportActionLoading || (!!reportMakeupAllLoading && reportMakeupAllLoading !== 'monthly') || !reportPendingCount('monthly')" @click="makeupAllReports('monthly')">补全部月报</el-button>
               </div>
               <el-progress
                 v-if="reportMakeupAllInProgress('monthly')"
@@ -275,7 +275,7 @@
                 :percentage="reportMakeupAllPercent"
                 :status="reportMakeupAllPercent >= 100 ? 'success' : undefined"
               />
-              <div class="report-backfill-hint">月报待补 {{ reportPendingCount('monthly') }} 个周期</div>
+              <div class="report-backfill-hint">{{ isReportEnabled('monthly') ? `月报待补 ${reportPendingCount('monthly')} 个周期` : '月报未开启，不获取待补周期' }}</div>
             </div>
           </el-form-item>
           <el-form-item label="月报预览">
@@ -283,13 +283,13 @@
               <div class="report-preview-meta">
                 <div>字数：{{ monthlyCount }} / 1000</div>
                 <div class="report-preview-actions">
-                  <el-button size="small" :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly" :loading="reportActionLoading === 'monthly_generate'" @click="generateReport('monthly')">
+                  <el-button size="small" :disabled="!isEdit || !isReportEnabled('monthly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly" :loading="reportActionLoading === 'monthly_generate'" @click="generateReport('monthly')">
                     AI生成月报
                   </el-button>
                   <el-button
                     size="small"
                     type="primary"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly || !String(reportPreview.monthly || '').trim()"
+                    :disabled="!isEdit || !isReportEnabled('monthly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly || !String(reportPreview.monthly || '').trim()"
                     :loading="reportActionLoading === 'monthly_submit'"
                     @click="submitReport('monthly')"
                   >
@@ -298,7 +298,7 @@
                   <el-button
                     size="small"
                     type="success"
-                    :disabled="!isEdit || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly"
+                    :disabled="!isEdit || !isReportEnabled('monthly') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.monthly"
                     :loading="reportRunLoading === 'monthly_report'"
                     @click="runReportNow('monthly_report')"
                   >
@@ -977,9 +977,15 @@ const submitDailyReport = async () => {
 
 const reportLabelMap = { daily: '日报', weekly: '周报', monthly: '月报' }
 const reportTaskMap = { daily: 'daily_report', weekly: 'weekly_report', monthly: 'monthly_report' }
+const reportKeys = ['daily', 'weekly', 'monthly']
+const isReportEnabled = (key) => !!form.reportSettings?.[key]?.enabled
 const clockInMakeupTypeLabel = computed(() => (clockInMakeupType.value === 'END' ? '下班' : '上班'))
 const reportPendingCount = (key) => (Array.isArray(reportPeriodOptions[key]) ? reportPeriodOptions[key].length : 0)
 const reportMakeupAllInProgress = (key) => reportMakeupAllProgressKey.value === key && (reportMakeupAllLoading.value === key || reportMakeupAllPercent.value > 0)
+const clearReportPeriodOptions = (key) => {
+  reportPeriodOptions[key] = []
+  reportTargets[key] = ''
+}
 const filteredClockInPeriodOptions = computed(() => {
   const options = Array.isArray(clockInPeriodOptions.value) ? clockInPeriodOptions.value : []
   return options
@@ -1096,6 +1102,11 @@ const syncReportTargetFromOptions = (key) => {
 
 const loadReportPeriodOptions = async (key) => {
   if (!isEdit.value) return
+  if (!isReportEnabled(key)) {
+    clearReportPeriodOptions(key)
+    notifyWarning(`${reportLabelMap[key] || '报告'}未开启，不获取待补周期`)
+    return
+  }
   reportPeriodLoading[key] = true
   try {
     const res = await http.get(`/users/${route.params.id}/reports/${key}/missing-periods`)
@@ -1112,12 +1123,17 @@ const loadReportPeriodOptions = async (key) => {
 
 const loadAllReportPeriodOptions = async () => {
   if (!isEdit.value) return
-  await Promise.all(['daily', 'weekly', 'monthly'].map((key) => loadReportPeriodOptions(key)))
+  reportKeys.filter((key) => !isReportEnabled(key)).forEach(clearReportPeriodOptions)
+  await Promise.all(reportKeys.filter(isReportEnabled).map((key) => loadReportPeriodOptions(key)))
 }
 
 const generateReport = async (key) => {
   if (!isEdit.value) return
   const label = reportLabelMap[key] || '报告'
+  if (!isReportEnabled(key)) {
+    notifyWarning(`${label}未开启`)
+    return
+  }
   if (!hasReportTarget(key)) {
     notifyWarning(`暂无可补交的${label}周期`)
     return
@@ -1141,6 +1157,10 @@ const generateReport = async (key) => {
 const submitReport = async (key) => {
   if (!isEdit.value) return
   const label = reportLabelMap[key] || '报告'
+  if (!isReportEnabled(key)) {
+    notifyWarning(`${label}未开启`)
+    return
+  }
   if (!hasReportTarget(key)) {
     notifyWarning(`暂无可补交的${label}周期`)
     return
@@ -1170,6 +1190,11 @@ const submitReport = async (key) => {
 const makeupAllReports = async (key) => {
   if (!isEdit.value) return
   const label = reportLabelMap[key] || '报告'
+  if (!isReportEnabled(key)) {
+    clearReportPeriodOptions(key)
+    notifyWarning(`${label}未开启`)
+    return
+  }
   const total = reportPendingCount(key)
   if (!total) {
     notifyWarning(`暂无待补交${label}周期`)
@@ -1211,6 +1236,10 @@ const runReportNow = async (taskType) => {
   }
   const label = labelMap[taskType] || '报告'
   const key = Object.keys(reportTaskMap).find((item) => reportTaskMap[item] === taskType)
+  if (!isReportEnabled(key)) {
+    notifyWarning(`${label}未开启`)
+    return
+  }
   if (!hasReportTarget(key)) {
     notifyWarning(`暂无可补交的${label}周期`)
     return
@@ -1311,6 +1340,13 @@ watch(activeTab, (val) => {
         })
     }
 });
+
+watch(
+  () => reportKeys.map((key) => isReportEnabled(key)).join('|'),
+  () => {
+    reportKeys.filter((key) => !isReportEnabled(key)).forEach(clearReportPeriodOptions)
+  }
+)
 
 onMounted(async () => {
     await fetchUser();

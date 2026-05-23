@@ -24,6 +24,7 @@ const routes = [
   },
   { path: '/', component: () => import('../views/UserList.vue'), meta: { roles: ['admin', 'operator', 'viewer'] } },
   { path: '/audit', component: () => import('../views/AuditLogs.vue'), meta: { roles: ['admin'] } },
+  { path: '/settings', component: () => import('../views/NotificationSettings.vue'), meta: { roles: ['admin'] } },
   { path: '/settings/notifications', component: () => import('../views/NotificationSettings.vue'), meta: { roles: ['admin'] } },
   { path: '/create', component: () => import('../views/UserEdit.vue'), meta: { roles: ['admin', 'operator'] } },
   { path: '/edit/:id', component: () => import('../views/UserEdit.vue'), meta: { roles: ['admin', 'operator'] } },

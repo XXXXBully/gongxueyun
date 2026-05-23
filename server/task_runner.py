@@ -37,6 +37,8 @@ MAX_CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS = 30.0
 DEFAULT_CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES = 3
 DEFAULT_CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS = 10.0
 MAX_CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS = 120.0
+DEFAULT_CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS = 60.0
+MAX_CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS = 600.0
 
 
 def _clockin_makeup_batch_delay_seconds() -> float:
@@ -70,6 +72,17 @@ def _clockin_makeup_rate_limit_retry_seconds() -> float:
     return min(value, MAX_CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS)
 
 
+def _clockin_makeup_rate_limit_cooldown_seconds() -> float:
+    raw = os.getenv("CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS", str(DEFAULT_CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS))
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS
+    if value < 0:
+        return 0.0
+    return min(value, MAX_CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
 def _is_clockin_rate_limited(result: Dict[str, Any]) -> bool:
     if not isinstance(result, dict) or result.get("status") != "fail":
         return False
@@ -79,8 +92,36 @@ def _is_clockin_rate_limited(result: Dict[str, Any]) -> bool:
     return any(item.lower() in lower for item in patterns)
 
 
-def _with_makeup_retry_details(result: Dict[str, Any], retries: int, retry_wait_seconds: float) -> Dict[str, Any]:
-    if retries <= 0:
+def _safe_perform_clock_in_makeup(
+    api_client: ApiClient,
+    config: ConfigManager,
+    target_date: str,
+    target_type: Optional[str],
+) -> Dict[str, Any]:
+    try:
+        return perform_clock_in_makeup(api_client, config, target_date, target_type=target_type)
+    except Exception as exc:
+        logger.error("补卡 %s 执行异常: %s", target_date, exc)
+        return {
+            "status": "fail",
+            "message": f"补卡失败: {exc}",
+            "task_type": "补卡",
+            "details": {
+                "补卡日期": target_date,
+                "补卡类型": target_type or "START",
+            },
+        }
+
+
+def _with_makeup_retry_details(
+    result: Dict[str, Any],
+    retries: int,
+    retry_wait_seconds: float,
+    retry_wait_total_seconds: float,
+    rate_limited: bool,
+    proxy_rotations: int = 0,
+) -> Dict[str, Any]:
+    if not rate_limited and retries <= 0 and proxy_rotations <= 0:
         return result
     details = result.get("details")
     if not isinstance(details, dict):
@@ -89,8 +130,27 @@ def _with_makeup_retry_details(result: Dict[str, Any], retries: int, retry_wait_
         **details,
         "频繁重试次数": retries,
         "频繁重试等待秒": retry_wait_seconds,
+        "频繁重试总等待秒": retry_wait_total_seconds,
+        "代理切换次数": proxy_rotations,
     }
     return result
+
+
+def _rotate_clockin_proxy(api_client: ApiClient, reason: str) -> bool:
+    proxy_urls = getattr(api_client, "_proxy_urls", None)
+    proxy_fetch_url = getattr(api_client, "_proxy_fetch_url", None)
+    if not proxy_fetch_url and (not isinstance(proxy_urls, list) or len(proxy_urls) < 2):
+        return False
+    rotate = getattr(api_client, "rotate_proxy", None)
+    if not callable(rotate):
+        return False
+    try:
+        return bool(rotate(reason=reason))
+    except TypeError:
+        return bool(rotate())
+    except Exception as exc:
+        logger.warning("补卡代理切换失败: %s", exc)
+        return False
 
 
 def _perform_clock_in_makeup_with_rate_limit_retry(
@@ -100,15 +160,34 @@ def _perform_clock_in_makeup_with_rate_limit_retry(
     target_type: Optional[str],
     retry_count: int,
     retry_seconds: float,
-) -> tuple[Dict[str, Any], int]:
+) -> tuple[Dict[str, Any], int, bool, int]:
     retries_used = 0
+    retry_wait_total_seconds = 0.0
+    rate_limited = False
+    proxy_rotations = 0
     while True:
-        result = perform_clock_in_makeup(api_client, config, target_date, target_type=target_type)
+        result = _safe_perform_clock_in_makeup(api_client, config, target_date, target_type=target_type)
         if not _is_clockin_rate_limited(result) or retries_used >= retry_count:
-            return _with_makeup_retry_details(result, retries_used, retry_seconds), retries_used
+            return (
+                _with_makeup_retry_details(
+                    result,
+                    retries_used,
+                    retry_seconds,
+                    retry_wait_total_seconds,
+                    rate_limited,
+                    proxy_rotations,
+                ),
+                retries_used,
+                rate_limited,
+                proxy_rotations,
+            )
+        rate_limited = True
+        if _rotate_clockin_proxy(api_client, "补卡触发请求过于频繁"):
+            proxy_rotations += 1
         wait_seconds = min(retry_seconds * (2 ** retries_used), MAX_CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS)
         logger.warning("补卡触发频繁请求限制，等待 %.1f 秒后重试 %s", wait_seconds, target_date)
         time.sleep(wait_seconds)
+        retry_wait_total_seconds += wait_seconds
         retries_used += 1
 
 
@@ -406,6 +485,7 @@ def perform_clock_in_makeup_many(
     delay_seconds: Optional[float] = None,
     rate_limit_retries: Optional[int] = None,
     rate_limit_retry_seconds: Optional[float] = None,
+    rate_limit_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     dates = _normalize_makeup_dates(target_dates)
     if not dates:
@@ -414,12 +494,22 @@ def perform_clock_in_makeup_many(
     delay = _clockin_makeup_batch_delay_seconds() if delay_seconds is None else max(float(delay_seconds), 0.0)
     retry_count = _clockin_makeup_rate_limit_retries() if rate_limit_retries is None else max(int(rate_limit_retries), 0)
     retry_seconds = _clockin_makeup_rate_limit_retry_seconds() if rate_limit_retry_seconds is None else max(float(rate_limit_retry_seconds), 0.0)
+    cooldown_seconds = (
+        _clockin_makeup_rate_limit_cooldown_seconds()
+        if rate_limit_cooldown_seconds is None
+        else max(float(rate_limit_cooldown_seconds), 0.0)
+    )
     results = []
     rate_limit_retry_total = 0
+    rate_limit_cooldown_total = 0
+    proxy_rotation_total = 0
+    current_delay = delay
+    stopped_by_rate_limit = False
+    unexecuted_count = 0
     for index, item in enumerate(dates):
-        if index > 0 and delay > 0:
-            time.sleep(delay)
-        result, retries_used = _perform_clock_in_makeup_with_rate_limit_retry(
+        if index > 0 and current_delay > 0:
+            time.sleep(current_delay)
+        result, retries_used, rate_limited, proxy_rotations = _perform_clock_in_makeup_with_rate_limit_retry(
             api_client,
             config,
             item,
@@ -428,11 +518,37 @@ def perform_clock_in_makeup_many(
             retry_seconds=retry_seconds,
         )
         rate_limit_retry_total += retries_used
+        proxy_rotation_total += proxy_rotations
+        if rate_limited:
+            rate_limit_cooldown_total += 1
+            current_delay = max(current_delay, cooldown_seconds)
         results.append(result)
+        if rate_limited and _is_clockin_rate_limited(result):
+            stopped_by_rate_limit = True
+            remaining_dates = dates[index + 1 :]
+            unexecuted_count = len(remaining_dates)
+            type_label = CLOCKIN_TYPE_LABELS.get(str(target_type or "START").upper(), target_type or "START")
+            for remaining_date in remaining_dates:
+                results.append(
+                    {
+                        "status": "skip",
+                        "message": f"{remaining_date} 因请求过于频繁已暂停补卡，请稍后重试",
+                        "task_type": "补卡",
+                        "details": {
+                            "补卡日期": remaining_date,
+                            "补卡类型": type_label,
+                            "跳过原因": "请求过于频繁，已停止后续补卡",
+                        },
+                    }
+                )
+            break
     failed = [item for item in results if item.get("status") == "fail"]
     succeeded = [item for item in results if item.get("status") == "success"]
     skipped = [item for item in results if item.get("status") == "skip"]
-    if failed:
+    if stopped_by_rate_limit:
+        status = "fail"
+        message = f"{len(dates)} 天补卡未全部完成，已因请求过于频繁暂停剩余日期"
+    elif failed:
         status = "fail"
         message = f"{len(dates)} 天补卡未全部完成"
     elif succeeded:
@@ -451,9 +567,15 @@ def perform_clock_in_makeup_many(
             "失败": len(failed),
             "跳过": len(skipped),
             "请求间隔秒": delay,
+            "当前请求间隔秒": current_delay,
             "频繁重试次数": rate_limit_retry_total,
             "频繁重试最大次数": retry_count,
             "频繁重试初始等待秒": retry_seconds,
+            "代理切换次数": proxy_rotation_total,
+            "频繁冷却次数": rate_limit_cooldown_total,
+            "频繁冷却间隔秒": cooldown_seconds,
+            "因频繁请求提前停止": stopped_by_rate_limit,
+            "未执行": unexecuted_count,
         },
         "items": results,
     }
@@ -784,13 +906,22 @@ def run_task_by_config(
             f"开始执行：{desensitize_name(config.get_value('userInfo.nikeName'))}"
         )
 
-        all_tasks = [
+        default_tasks = [
             ("clock_in", lambda: perform_clock_in(api_client, config, forced_checkin_type)),
-            ("clock_in_makeup", lambda: perform_clock_in_makeup(api_client, config, target_period)),
             ("daily_report", lambda: submit_daily_report(api_client, config, force_report=force_report, target_period=target_period)),
             ("weekly_report", lambda: submit_weekly_report(config, api_client, force_report=force_report, target_period=target_period)),
             ("monthly_report", lambda: submit_monthly_report(config, api_client, force_report=force_report, target_period=target_period)),
         ]
+
+        def run_clock_in_makeup():
+            if hasattr(api_client, "enable_proxy"):
+                api_client.enable_proxy()
+            return perform_clock_in_makeup(api_client, config, target_period)
+
+        manual_only_tasks = [
+            ("clock_in_makeup", run_clock_in_makeup),
+        ]
+        all_tasks = default_tasks + (manual_only_tasks if specific_task_type else [])
 
         results = []
         for t_type, t_func in all_tasks:
