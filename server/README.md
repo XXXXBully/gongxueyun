@@ -48,6 +48,7 @@ CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS=2
 CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES=3
 CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS=10
 CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS=60
+MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS=600
 MOGUDING_PROXY_API_URL=
 MOGUDING_PROXY_TTL_SECONDS=55
 MOGUDING_PROXY_API_TIMEOUT_SECONDS=10
@@ -66,6 +67,7 @@ AMAP_KEY=your-amap-key
 - `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES` 控制补卡遇到频繁请求时的最大重试次数。
 - `CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制补卡频繁请求重试的初始等待秒数，后续会递增退避。
 - `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS` 控制触发 IP 频繁后的批量冷却间隔。当前日期重试成功后，后续日期会按该间隔降速；如果当前日期重试耗尽仍然频繁，会停止剩余日期。
+- `MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS` 控制普通网络被工学云返回“IP非法请求过多，已限制访问”后的非代理请求暂停时间，默认 `600` 秒。暂停期间不会继续向工学云发起普通网络请求；手动补卡启用代理后仍可获取/切换代理 IP 重试。
 - `MOGUDING_PROXY_API_URL` 控制动态代理获取接口。接口响应需要包含 `ip:端口`，后端会从接口 URL 查询参数读取 `accessName` 和 `accessPassword`，并拼接成 `http://accessName:accessPassword@ip:端口`。
 - `MOGUDING_PROXY_TTL_SECONDS` 控制动态代理缓存时长，默认 `55` 秒。
 - `MOGUDING_PROXY_API_TIMEOUT_SECONDS` 控制动态代理接口请求超时。
@@ -178,7 +180,7 @@ POST /app/reports/{report_key}/makeup-all
 
 即使某一天同时缺上班和下班，选择 `START` 时也只补上班；选择 `END` 时只补下班。
 
-批量补卡默认按 `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 间隔逐个日期执行。如果远端返回“请求过于频繁”、`429` 或 `rate limit`，后端会等待后重试当前日期，而不是直接进入下一个日期。重试次数和初始等待时间由 `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES`、`CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制。
+批量补卡默认按 `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 间隔逐个日期执行。如果远端返回“请求过于频繁”、`429`、`rate limit` 或“IP非法请求过多，已限制访问”，后端会等待后重试当前日期，而不是直接进入下一个日期。重试次数和初始等待时间由 `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES`、`CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制。
 
 触发 IP 频繁后，批量任务会进入冷却策略：
 
@@ -189,6 +191,8 @@ POST /app/reports/{report_key}/makeup-all
 只有手动补卡会启用工学云代理。正常登录、缺卡查询、定时打卡和报告提交会继续直连工学云，不会使用这里配置的代理。
 
 如果配置了 `MOGUDING_PROXY_API_URL`，补卡请求会在提交前获取动态代理。动态代理默认缓存 `MOGUDING_PROXY_TTL_SECONDS` 秒；遇到 IP 频繁或代理连接失败时，会重新调用代理接口获取新 IP 后继续重试。补卡批量结果会记录 `代理切换次数`。
+
+普通登录、定时打卡、报告提交、缺卡查询等非补卡请求如果命中“IP非法请求过多，已限制访问”，会进入普通网络熔断窗口并停止后续工学云请求，避免在已封 IP 的情况下继续扩大限制。
 
 动态代理接口示例：
 

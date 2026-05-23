@@ -25,6 +25,11 @@ DEFAULT_MOGUDING_PROXY_API_TIMEOUT_SECONDS = 10.0
 DEFAULT_MOGUDING_PROXY_TTL_SECONDS = 55.0
 MAX_MOGUDING_PROXY_API_TIMEOUT_SECONDS = 30.0
 MAX_MOGUDING_PROXY_TTL_SECONDS = 600.0
+DEFAULT_MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS = 600.0
+MAX_MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS = 3600.0
+_IP_RESTRICTION_LOCK = threading.Lock()
+_IP_RESTRICTION_UNTIL = 0.0
+_IP_RESTRICTION_REASON = ""
 
 
 def _split_proxy_values(value: Any) -> List[str]:
@@ -122,8 +127,59 @@ def _mask_proxy_url(value: str) -> str:
 
 def _is_rate_limited_text(value: Any) -> bool:
     text = str(value or "").lower()
-    patterns = ("请求过于频繁", "操作过于频繁", "ip请求过于频繁", "429", "too many requests", "rate limit")
+    patterns = (
+        "请求过于频繁",
+        "操作过于频繁",
+        "ip请求过于频繁",
+        "ip非法请求过多",
+        "非法请求过多",
+        "已限制访问",
+        "429",
+        "too many requests",
+        "rate limit",
+    )
     return any(item.lower() in text for item in patterns)
+
+
+def _is_ip_restricted_text(value: Any) -> bool:
+    text = str(value or "").lower()
+    patterns = ("ip非法请求过多", "非法请求过多", "已限制访问")
+    return any(item.lower() in text for item in patterns)
+
+
+def _ip_restrict_cooldown_seconds() -> float:
+    return _parse_float_env(
+        "MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS",
+        DEFAULT_MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS,
+        MAX_MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS,
+    )
+
+
+def _mark_ip_restricted(reason: Any) -> None:
+    global _IP_RESTRICTION_REASON, _IP_RESTRICTION_UNTIL
+    message = str(reason or "IP非法请求过多，已限制访问").strip()
+    cooldown = _ip_restrict_cooldown_seconds()
+    with _IP_RESTRICTION_LOCK:
+        _IP_RESTRICTION_REASON = message
+        _IP_RESTRICTION_UNTIL = time.time() + cooldown
+    logger.warning("工学云 IP 已受限，%.0f 秒内停止非代理请求: %s", cooldown, message)
+
+
+def _current_ip_restriction_reason() -> str:
+    global _IP_RESTRICTION_REASON, _IP_RESTRICTION_UNTIL
+    with _IP_RESTRICTION_LOCK:
+        if _IP_RESTRICTION_UNTIL <= time.time():
+            _IP_RESTRICTION_REASON = ""
+            _IP_RESTRICTION_UNTIL = 0.0
+            return ""
+        return _IP_RESTRICTION_REASON or "IP非法请求过多，已限制访问"
+
+
+def _clear_ip_restriction_state() -> None:
+    global _IP_RESTRICTION_REASON, _IP_RESTRICTION_UNTIL
+    with _IP_RESTRICTION_LOCK:
+        _IP_RESTRICTION_REASON = ""
+        _IP_RESTRICTION_UNTIL = 0.0
 
 
 class ApiClient:
@@ -141,8 +197,12 @@ class ApiClient:
     @staticmethod
     def _is_token_expired_response(code, msg: str) -> bool:
         text = str(msg or "")
-        if code in (401, 403, 7001, 7002):
+        if _is_ip_restricted_text(text):
+            return False
+        if code in (401, 7001, 7002):
             return True
+        if code == 403:
+            return text in {"token失效", "Token失效", "token已失效", "Token已失效", "登录已失效", "请重新登录"}
         return text in {"token失效", "Token失效", "token已失效", "Token已失效", "登录已失效", "请重新登录"}
 
     def __init__(self, config: ConfigManager):
@@ -358,15 +418,39 @@ class ApiClient:
         
         for attempt in range(self.max_retries):
             try:
+                proxy_kwargs = self._proxy_request_kwargs()
+                using_proxy = bool(proxy_kwargs.get("proxies"))
+                if not using_proxy:
+                    restricted_reason = _current_ip_restriction_reason()
+                    if restricted_reason:
+                        raise ValueError(f"{restricted_reason}，已暂停非代理工学云请求")
+
                 response = self.session.post(
                     full_url,
                     headers=headers,
                     json=data,
                     timeout=10,
-                    **self._proxy_request_kwargs(),
+                    **proxy_kwargs,
                 )
+                try:
+                    rsp = response.json()
+                except Exception:
+                    rsp = {}
+                status_code = getattr(response, "status_code", None)
+                response_text = getattr(response, "text", "")
+                msg_text = rsp.get("msg", response_text) if isinstance(rsp, dict) else response_text
+                if status_code == 403 and _is_ip_restricted_text(msg_text or response_text):
+                    if using_proxy:
+                        if attempt < self.max_retries - 1 and self.rotate_proxy(reason=msg_text):
+                            wait_time = 1 * (2 ** attempt)
+                            logger.warning("代理 IP 已被工学云限制，已切换代理，等待 %.2f 秒后重试", wait_time)
+                            time.sleep(wait_time)
+                            continue
+                    else:
+                        _mark_ip_restricted(msg_text or response_text)
+                    raise ValueError(msg_text or response_text)
+
                 response.raise_for_status()
-                rsp = response.json()
                 
                 code = rsp.get("code")
                 msg = rsp.get("msg", "未知错误")
@@ -379,6 +463,17 @@ class ApiClient:
                 
                 if code == 6111:
                     return rsp
+
+                if _is_ip_restricted_text(msg):
+                    if using_proxy:
+                        if attempt < self.max_retries - 1 and self.rotate_proxy(reason=msg):
+                            wait_time = 1 * (2 ** attempt)
+                            logger.warning("代理 IP 已被工学云限制，已切换代理，等待 %.2f 秒后重试", wait_time)
+                            time.sleep(wait_time)
+                            continue
+                    else:
+                        _mark_ip_restricted(msg)
+                    raise ValueError(msg)
 
                 # Token失效处理
                 if self._is_token_expired_response(code, msg):

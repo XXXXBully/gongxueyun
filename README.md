@@ -233,6 +233,7 @@ CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS=2
 CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES=3
 CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS=10
 CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS=60
+MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS=600
 MOGUDING_PROXY_API_URL=
 MOGUDING_PROXY_TTL_SECONDS=55
 MOGUDING_PROXY_API_TIMEOUT_SECONDS=10
@@ -249,6 +250,7 @@ AMAP_KEY=your-amap-key
 - `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 控制一键补卡的默认间隔。
 - `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES` 和 `CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制遇到频繁请求时的重试次数与初始等待时间。
 - `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS` 控制触发 IP 频繁后的批量冷却间隔。当前日期重试成功后，后续日期会按该间隔降速；如果当前日期重试耗尽仍然频繁，会停止剩余日期，避免继续触发远端风控。
+- `MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS` 控制普通网络被工学云返回“IP非法请求过多，已限制访问”后的非代理请求暂停时间，默认 `600` 秒。暂停期间不会继续向工学云发普通网络请求；手动补卡启用代理后仍可获取/切换代理 IP 重试。
 - `MOGUDING_PROXY_API_URL` 控制动态代理获取接口。接口返回内容需要包含 `ip:端口`，例如 `1.2.3.4:8080`。如果接口 URL 中包含 `accessName` 和 `accessPassword`，后端会自动拼成 `http://accessName:accessPassword@ip:端口` 使用。
 - `MOGUDING_PROXY_TTL_SECONDS` 控制动态代理缓存时长，默认 `55` 秒，适配常见 1 分钟代理有效期。
 - `MOGUDING_PROXY_API_TIMEOUT_SECONDS` 控制动态代理接口请求超时。
@@ -453,7 +455,7 @@ npm run build
 
 补卡只提交用户当前选择的类型。例如选择「上班」时，即使某天同时缺上班和下班，也只补上班，不会自动补下班。
 
-批量补卡在遇到远端“请求过于频繁”、`429` 或 `rate limit` 时，会等待后重试当前日期。当前日期重试成功后，后续日期会进入冷却间隔；如果当前日期重试耗尽仍然频繁，系统会停止剩余日期并把它们标记为跳过，避免继续触发远端风控。
+批量补卡在遇到远端“请求过于频繁”、`429`、`rate limit` 或“IP非法请求过多，已限制访问”时，会等待后重试当前日期。当前日期重试成功后，后续日期会进入冷却间隔；如果当前日期重试耗尽仍然频繁，系统会停止剩余日期并把它们标记为跳过，避免继续触发远端风控。
 
 手动补卡时，如果配置了 `MOGUDING_PROXY_API_URL`，补卡请求会先调用该接口获取代理。接口返回 `ip:端口` 后，后端会读取接口 URL 查询参数中的 `accessName` 和 `accessPassword`，并拼成 `http://accessName:accessPassword@ip:端口` 使用。例如：
 
@@ -462,7 +464,9 @@ MOGUDING_PROXY_API_URL=http://capi.51daili.com/traffic/getip?linePoolIndex=1&pac
 MOGUDING_PROXY_TTL_SECONDS=55
 ```
 
-动态代理默认缓存 `55` 秒。补卡请求遇到 IP 频繁或当前代理连接失败时，后端会重新调用代理接口获取新 IP 再重试；补卡结果会记录 `代理切换次数`，便于判断是否确实发生了代理切换。也可以继续使用 `MOGUDING_PROXY_URLS` 配置静态代理池。该代理不会用于正常定时打卡、报告提交、缺卡查询或登录。
+动态代理默认缓存 `55` 秒。补卡请求遇到 IP 频繁、IP 被限制访问或当前代理连接失败时，后端会重新调用代理接口获取新 IP 再重试；补卡结果会记录 `代理切换次数`，便于判断是否确实发生了代理切换。也可以继续使用 `MOGUDING_PROXY_URLS` 配置静态代理池。该代理不会用于正常定时打卡、报告提交、缺卡查询或登录。
+
+普通登录、定时打卡、报告提交、缺卡查询等非补卡请求如果命中“IP非法请求过多，已限制访问”，会进入普通网络熔断窗口并停止后续工学云请求，避免在已封 IP 的情况下继续扩大限制。
 
 管理员也可以在管理端进入「系统设置」→「工学云代理」保存全局补卡代理配置。环境变量里显式配置的代理优先于 Web 全局配置。
 

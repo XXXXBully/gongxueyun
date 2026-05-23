@@ -41,6 +41,9 @@ services:
       # 可选：补卡触发 IP 频繁后，后续日期之间的冷却间隔秒数，默认 60。
       # CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS: ${CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS:-60}
 
+      # 可选：普通网络被工学云限制访问后，暂停非代理工学云请求的秒数，默认 600。
+      # MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS: ${MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS:-600}
+
       # 可选：手动补卡专用动态代理获取接口。未开启或未配置时走正常网络。
       # MOGUDING_PROXY_API_URL: ${MOGUDING_PROXY_API_URL:-}
 

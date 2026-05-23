@@ -87,7 +87,17 @@ def _is_clockin_rate_limited(result: Dict[str, Any]) -> bool:
     if not isinstance(result, dict) or result.get("status") != "fail":
         return False
     text = f"{result.get('message') or ''} {json.dumps(result.get('details') or {}, ensure_ascii=False)}"
-    patterns = ("请求过于频繁", "操作过于频繁", "IP请求过于频繁", "429", "too many requests", "rate limit")
+    patterns = (
+        "请求过于频繁",
+        "操作过于频繁",
+        "IP请求过于频繁",
+        "IP非法请求过多",
+        "非法请求过多",
+        "已限制访问",
+        "429",
+        "too many requests",
+        "rate limit",
+    )
     lower = text.lower()
     return any(item.lower() in lower for item in patterns)
 
@@ -933,7 +943,11 @@ def run_task_by_config(
                 elif specific_task_type != t_type:
                     continue
             
-            results.append(t_func())
+            result = t_func()
+            results.append(result)
+            if specific_task_type != "clock_in_makeup" and _is_clockin_rate_limited(result):
+                logger.warning("检测到工学云 IP/频繁请求限制，停止本轮后续工学云任务")
+                break
 
     except Exception as e:
         error_message = f"执行任务时发生严重错误: {str(e)}"

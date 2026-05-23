@@ -1,13 +1,16 @@
 import datetime
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sqlmodel import Session, SQLModel, create_engine
 
 from server.batch_jobs import count_batch_job_items_by_status, get_batch_job_item_status_counts
 from server.clockin_backfill import build_missing_clockin_day_options
+from server.coreApi.MainLogicApi import ApiClient, _clear_ip_restriction_state
 from server.models import BatchJobItem
+from server import task_runner
 from server.task_runner import _submit_report_common
+from server.util.Config import ConfigManager
 from server.user_runtime import runtime_login_valid
 
 
@@ -81,6 +84,117 @@ class ModelDownloadConfigTest(unittest.TestCase):
         self.assertEqual(CaptchaUtils.MODEL_BASE_URL, base_url)
         self.assertEqual(CaptchaUtils.MODEL_URLS["ocr.onnx"], f"{base_url}/ocr.onnx")
         self.assertEqual(CaptchaUtils.MODEL_URLS["yolov5n.onnx"], f"{base_url}/yolov5n.onnx")
+
+
+class FakeMogudingResponse:
+    def __init__(self, payload, text="", status_code=200):
+        self._payload = payload
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class ApiClientIPRestrictionTest(unittest.TestCase):
+    def setUp(self):
+        _clear_ip_restriction_state()
+
+    def tearDown(self):
+        _clear_ip_restriction_state()
+
+    def test_ip_restricted_403_is_not_treated_as_token_expired(self):
+        msg = "IP非法请求过多，已限制访问:111.23.44.229"
+
+        self.assertFalse(ApiClient._is_token_expired_response(403, msg))
+
+    def test_ip_restricted_response_blocks_later_unproxied_requests(self):
+        msg = "IP非法请求过多，已限制访问:111.23.44.229"
+        with patch("server.coreApi.MainLogicApi.load_global_proxy_settings", return_value={}):
+            client = ApiClient(ConfigManager(config={}))
+        client.session.post = Mock(return_value=FakeMogudingResponse({"code": 403, "msg": msg}))
+
+        with self.assertRaises(ValueError) as ctx:
+            client._post_request("test/path", {}, {})
+        with self.assertRaises(ValueError):
+            client._post_request("test/path", {}, {})
+
+        self.assertIn("IP非法请求过多", str(ctx.exception))
+        self.assertEqual(client.session.post.call_count, 1)
+
+        with patch("server.coreApi.MainLogicApi.load_global_proxy_settings", return_value={}):
+            second_client = ApiClient(ConfigManager(config={}))
+        second_client.session.post = Mock()
+        with self.assertRaises(ValueError):
+            second_client._post_request("test/path", {}, {})
+        second_client.session.post.assert_not_called()
+
+    def test_ip_restricted_response_rotates_proxy_for_makeup_retry(self):
+        msg = "IP非法请求过多，已限制访问:111.23.44.229"
+        proxy_api = "http://proxy.example/get?accessName=u&accessPassword=p"
+        with patch.dict("os.environ", {"MOGUDING_PROXY_API_URL": proxy_api}, clear=False):
+            with patch(
+                "server.coreApi.MainLogicApi.requests.get",
+                side_effect=[
+                    FakeMogudingResponse({}, text="1.2.3.4:5678\n"),
+                    FakeMogudingResponse({}, text="5.6.7.8:9012\n"),
+                ],
+            ):
+                client = ApiClient(ConfigManager(config={}))
+                client.enable_proxy()
+                client.max_retries = 2
+                client.session.post = Mock(
+                    side_effect=[
+                        FakeMogudingResponse({"code": 403, "msg": msg}),
+                        FakeMogudingResponse({"code": 200, "msg": "ok"}),
+                    ]
+                )
+                with patch("server.coreApi.MainLogicApi.time.sleep"):
+                    result = client._post_request("test/path", {}, {})
+
+        self.assertEqual(result["code"], 200)
+        calls = client.session.post.call_args_list
+        self.assertEqual(calls[0].kwargs["proxies"]["https"], "http://u:p@1.2.3.4:5678")
+        self.assertEqual(calls[1].kwargs["proxies"]["https"], "http://u:p@5.6.7.8:9012")
+
+
+class TaskRunnerIPRestrictionTest(unittest.TestCase):
+    def test_run_task_stops_remaining_moguding_tasks_after_ip_restriction(self):
+        config_data = {
+            "config": {
+                "pushNotifications": [],
+                "clockIn": {"schedule": {"startTime": "07:30", "endTime": "18:00"}},
+                "reportSettings": {
+                    "daily": {"enabled": True},
+                    "weekly": {"enabled": True},
+                    "monthly": {"enabled": True},
+                },
+            },
+            "userInfo": {"token": "token", "expiredTime": "1893456000", "userType": "student", "nikeName": "tester"},
+            "planInfo": {"planId": "plan-1"},
+        }
+        limited = {"status": "fail", "message": "打卡失败: IP非法请求过多，已限制访问:111.23.44.229", "task_type": "打卡"}
+
+        with (
+            patch.object(task_runner, "ApiClient"),
+            patch.object(task_runner, "MessagePusher") as pusher_cls,
+            patch.object(task_runner, "_load_global_smtp_settings", return_value={}),
+            patch.object(task_runner, "perform_clock_in", return_value=limited) as clock_in,
+            patch.object(task_runner, "submit_daily_report") as daily,
+            patch.object(task_runner, "submit_weekly_report") as weekly,
+            patch.object(task_runner, "submit_monthly_report") as monthly,
+        ):
+            pusher_cls.return_value.push = Mock()
+            results = task_runner.run_task_by_config(config_data, forced_checkin_type="START")
+
+        self.assertEqual(results, [limited])
+        clock_in.assert_called_once()
+        daily.assert_not_called()
+        weekly.assert_not_called()
+        monthly.assert_not_called()
 
 
 if __name__ == "__main__":
