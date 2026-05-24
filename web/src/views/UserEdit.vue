@@ -1027,7 +1027,7 @@ const save = async () => {
     if (isEdit.value) {
       fetchUser()
     } else {
-      resetToDefaultForm()
+      await router.push('/')
     }
   } catch (error) {
     notifyError(`保存失败：${resolveErrorMessage(error, '请求失败')}`)
