@@ -1,14 +1,17 @@
 import datetime
+import json
 import unittest
 from unittest.mock import Mock, patch
 
-from sqlmodel import Session, SQLModel, create_engine
+from fastapi import HTTPException
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from server.batch_jobs import count_batch_job_items_by_status, get_batch_job_item_status_counts
 from server.clockin_backfill import build_missing_clockin_day_options
 from server.coreApi.MainLogicApi import ApiClient, _clear_ip_restriction_state
 from server.models import BatchJobItem
 from server import task_runner
+from server import api
 from server.task_runner import _submit_report_common
 from server.util.Config import ConfigManager
 from server.user_runtime import runtime_login_valid
@@ -97,6 +100,98 @@ class FakeMogudingResponse:
 
     def json(self):
         return self._payload
+
+
+class MapchaxunGeocodeProviderTest(unittest.TestCase):
+    def setUp(self):
+        with api._GEOCODE_LOCK:
+            api._GEOCODE_CACHE.clear()
+
+    def test_mapchaxun_geocode_search_uses_internal_api(self):
+        payload = {
+            "status": 10000,
+            "message": "Success",
+            "result": {
+                "title": "仙鹅村",
+                "location": {"lng": 111.990776, "lat": 27.130178},
+                "address_components": {
+                    "province": "湖南省",
+                    "city": "邵阳市",
+                    "district": "邵东市",
+                    "street": "",
+                    "street_number": "",
+                },
+            },
+            "adress": "仙鹅村",
+            "locationVal": "111.990776,27.130178",
+            "location": [111.990776, 27.130178],
+            "address_components": {
+                "province": "湖南省",
+                "city": "邵阳市",
+                "district": "邵东市",
+                "street": "",
+                "adcode": "430582",
+            },
+            "elevation": 194,
+        }
+        with (
+            patch.dict("os.environ", {"GEOCODE_SEARCH_PROVIDER": "mapchaxun"}, clear=False),
+            patch("server.api.requests.post", return_value=FakeMogudingResponse(payload)) as post,
+        ):
+            result = api.geocode_search(q="湖南省邵阳市邵东市水东江镇仙鹅村")
+
+        best = result["results"][0]
+        self.assertEqual(best["x"], 111.990776)
+        self.assertEqual(best["y"], 27.130178)
+        self.assertEqual(best["label"], "仙鹅村")
+        self.assertEqual(best["address"]["province"], "湖南省")
+        self.assertEqual(best["address"]["city"], "邵阳市")
+        self.assertEqual(best["address"]["district"], "邵东市")
+        self.assertEqual(best["address"]["adcode"], "430582")
+        call = post.call_args
+        self.assertEqual(call.args[0], "https://www.mapchaxun.cn/api/getSolidAdress")
+        self.assertEqual(call.kwargs["headers"]["content-type"], "application/json")
+        self.assertEqual(call.kwargs["data"], json.dumps({"address": "湖南省邵阳市邵东市水东江镇仙鹅村"}, separators=(",", ":")))
+
+    def test_mapchaxun_geocode_search_is_independent_from_global_provider(self):
+        payload = {
+            "status": 10000,
+            "message": "Success",
+            "result": {
+                "title": "仙鹅村",
+                "location": {"lng": 111.990776, "lat": 27.130178},
+            },
+            "adress": "仙鹅村",
+        }
+        with (
+            patch.dict("os.environ", {"GEOCODE_PROVIDER": "osm", "GEOCODE_SEARCH_PROVIDER": ""}, clear=False),
+            patch("server.api.requests.post", return_value=FakeMogudingResponse(payload)) as post,
+            patch("server.api.requests.get", side_effect=AssertionError("search should use mapchaxun post")),
+        ):
+            result = api.geocode_search(q="湖南省邵阳市邵东市水东江镇仙鹅村")
+
+        self.assertEqual(result["results"][0]["x"], 111.990776)
+        post.assert_called_once()
+
+
+class AuditLogMaintenanceTest(unittest.TestCase):
+    def test_admin_can_clear_all_audit_logs(self):
+        engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add_all(
+                [
+                    api.AuditLog(actor="admin", action="auth.login", target_user_id=None, detail={}),
+                    api.AuditLog(actor="admin", action="user.update", target_user_id=1, detail={"fields": ["remark"]}),
+                ]
+            )
+            session.commit()
+
+            result = api.clear_audit_logs(session=session, admin={"sub": "admin", "role": "admin"})
+            remaining = session.exec(select(api.AuditLog)).all()
+
+        self.assertEqual(result, {"ok": True, "deleted": 2})
+        self.assertEqual(remaining, [])
 
 
 class ApiClientIPRestrictionTest(unittest.TestCase):
@@ -195,6 +290,141 @@ class TaskRunnerIPRestrictionTest(unittest.TestCase):
         daily.assert_not_called()
         weekly.assert_not_called()
         monthly.assert_not_called()
+
+
+class BaiduGeocodeProviderTest(unittest.TestCase):
+    def setUp(self):
+        with api._GEOCODE_LOCK:
+            api._GEOCODE_CACHE.clear()
+
+    def test_baidu_geocode_search_uses_baidu_web_api(self):
+        payload = {
+            "status": 0,
+            "result": {
+                "location": {"lng": 104.0668, "lat": 30.5728},
+                "level": "地产小区",
+                "confidence": 80,
+                "comprehension": 100,
+            },
+        }
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GEOCODE_SEARCH_PROVIDER": "baidu",
+                    "BAIDU_MAP_AK": "ak-test",
+                    "BAIDU_MAP_COORD_TYPE": "gcj02ll",
+                    "BAIDU_MAP_INPUT_COORD_TYPE": "gcj02ll",
+                    "BAIDU_MAP_OUTPUT_COORD_TYPE": "gcj02ll",
+                },
+                clear=False,
+            ),
+            patch("server.api.requests.get", return_value=FakeMogudingResponse(payload)) as get,
+        ):
+            result = api.geocode_search(q="成都市高新区天府大道")
+
+        self.assertEqual(result["results"][0]["x"], 104.0668)
+        self.assertEqual(result["results"][0]["y"], 30.5728)
+        call = get.call_args
+        self.assertEqual(call.args[0], "https://api.map.baidu.com/geocoding/v3/")
+        self.assertEqual(call.kwargs["params"]["ak"], "ak-test")
+        self.assertEqual(call.kwargs["params"]["address"], "成都市高新区天府大道")
+        self.assertEqual(call.kwargs["params"]["ret_coordtype"], "gcj02ll")
+
+    def test_baidu_reverse_geocode_uses_baidu_web_api(self):
+        payload = {
+            "status": 0,
+            "result": {
+                "formatted_address": "四川省成都市武侯区天府大道",
+                "addressComponent": {
+                    "province": "四川省",
+                    "city": "成都市",
+                    "district": "武侯区",
+                    "town": "桂溪街道",
+                    "street": "天府大道",
+                    "street_number": "1号",
+                },
+            },
+        }
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GEOCODE_PROVIDER": "baidu",
+                    "BAIDU_MAP_AK": "ak-test",
+                    "BAIDU_MAP_COORD_TYPE": "gcj02ll",
+                    "BAIDU_MAP_INPUT_COORD_TYPE": "gcj02ll",
+                    "BAIDU_MAP_OUTPUT_COORD_TYPE": "bd09ll",
+                },
+                clear=False,
+            ),
+            patch("server.api.requests.get", return_value=FakeMogudingResponse(payload)) as get,
+        ):
+            result = api.geocode_reverse(lat=30.5728, lon=104.0668)
+
+        address = result["result"]["address"]
+        self.assertEqual(result["result"]["display_name"], "四川省成都市武侯区天府大道")
+        self.assertEqual(address["province"], "四川省")
+        self.assertEqual(address["city"], "成都市")
+        self.assertEqual(address["district"], "武侯区")
+        call = get.call_args
+        self.assertEqual(call.args[0], "https://api.map.baidu.com/reverse_geocoding/v3/")
+        self.assertEqual(call.kwargs["params"]["ak"], "ak-test")
+        self.assertEqual(call.kwargs["params"]["location"], "30.5728,104.0668")
+        self.assertEqual(call.kwargs["params"]["coordtype"], "gcj02ll")
+        self.assertEqual(call.kwargs["params"]["ret_coordtype"], "bd09ll")
+
+    def test_baidu_provider_without_key_returns_clear_error(self):
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GEOCODE_SEARCH_PROVIDER": "baidu",
+                    "BAIDU_MAP_AK": "",
+                    "BAIDU_MAP_KEY": "",
+                    "BAIDU_MAP_INPUT_COORD_TYPE": "",
+                    "BAIDU_MAP_OUTPUT_COORD_TYPE": "",
+                },
+                clear=False,
+            ),
+            patch("server.api.requests.get") as get,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                api.geocode_search(q="成都市高新区天府大道")
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("BAIDU_MAP_AK", str(ctx.exception.detail))
+        get.assert_not_called()
+
+    def test_baidu_geocode_cache_separates_output_coord_type(self):
+        payload_gcj = {"status": 0, "result": {"location": {"lng": 104.1, "lat": 30.1}}}
+        payload_bd = {"status": 0, "result": {"location": {"lng": 104.2, "lat": 30.2}}}
+
+        with patch("server.api.requests.get", side_effect=[FakeMogudingResponse(payload_gcj), FakeMogudingResponse(payload_bd)]) as get:
+            with patch.dict(
+                "os.environ",
+                {
+                    "GEOCODE_SEARCH_PROVIDER": "baidu",
+                    "BAIDU_MAP_AK": "ak-test",
+                    "BAIDU_MAP_OUTPUT_COORD_TYPE": "gcj02ll",
+                },
+                clear=False,
+            ):
+                first = api.geocode_search(q="成都市高新区天府大道")
+            with patch.dict(
+                "os.environ",
+                {
+                    "GEOCODE_SEARCH_PROVIDER": "baidu",
+                    "BAIDU_MAP_AK": "ak-test",
+                    "BAIDU_MAP_OUTPUT_COORD_TYPE": "bd09ll",
+                },
+                clear=False,
+            ):
+                second = api.geocode_search(q="成都市高新区天府大道")
+
+        self.assertEqual(first["results"][0]["x"], 104.1)
+        self.assertEqual(second["results"][0]["x"], 104.2)
+        self.assertEqual(get.call_count, 2)
 
 
 if __name__ == "__main__":

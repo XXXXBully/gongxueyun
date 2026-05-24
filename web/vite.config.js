@@ -27,7 +27,6 @@ export default defineConfig({
       output: {
         manualChunks: {
           vue: ['vue', 'vue-router'],
-          leaflet: ['leaflet', 'leaflet-geosearch'],
           axios: ['axios'],
         },
       },

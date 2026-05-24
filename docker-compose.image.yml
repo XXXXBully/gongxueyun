@@ -59,10 +59,25 @@ services:
       # 可选：日报 / 周报 / 月报一键补交的周期间隔秒数，默认 2。
       # REPORT_MAKEUP_BATCH_DELAY_SECONDS: ${REPORT_MAKEUP_BATCH_DELAY_SECONDS:-2}
 
-      # 可选：地理编码服务，默认 osm；如果使用高德，设置为 amap 并配置 AMAP_KEY。
+      # 可选：地址搜索服务，默认 mapchaxun；只影响搜索框，不影响地图点击逆地理解析。
+      # GEOCODE_SEARCH_PROVIDER: ${GEOCODE_SEARCH_PROVIDER:-mapchaxun}
+
+      # 可选：地图点击后的逆地理解析服务，默认 osm；也可切换 baidu / amap。
       # GEOCODE_PROVIDER: ${GEOCODE_PROVIDER:-osm}
 
-      # 可选：高德地图 Key，仅 GEOCODE_PROVIDER=amap 时需要。
+      # 可选：百度地图 Web 服务 AK，仅 GEOCODE_PROVIDER=baidu 或 GEOCODE_SEARCH_PROVIDER=baidu 时需要。
+      # BAIDU_MAP_AK: ${BAIDU_MAP_AK:-}
+
+      # 可选：百度坐标类型，默认 gcj02ll，适配工学云常用经纬度。
+      # BAIDU_MAP_COORD_TYPE: ${BAIDU_MAP_COORD_TYPE:-gcj02ll}
+
+      # 可选：百度逆地理输入坐标类型，默认跟随 BAIDU_MAP_COORD_TYPE。
+      # BAIDU_MAP_INPUT_COORD_TYPE: ${BAIDU_MAP_INPUT_COORD_TYPE:-}
+
+      # 可选：百度地理编码返回坐标类型，默认跟随 BAIDU_MAP_COORD_TYPE。
+      # BAIDU_MAP_OUTPUT_COORD_TYPE: ${BAIDU_MAP_OUTPUT_COORD_TYPE:-}
+
+      # 可选：高德地图 Key，仅 GEOCODE_PROVIDER=amap 或 GEOCODE_SEARCH_PROVIDER=amap 时需要。
       # AMAP_KEY: ${AMAP_KEY:-}
 
       # 可选但生产推荐：应用签名密钥。不设置时会随机生成，重启后登录态会失效。

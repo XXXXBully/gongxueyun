@@ -377,7 +377,7 @@
 import { ref, reactive, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { http } from '../api/http'
-import { parseCnDotAddress, formatCnDotAddress } from '../utils/cnAddress'
+import { parseCnDotAddress, formatCnDotAddress, formatNearbyAddressPlace } from '../utils/cnAddress'
 import { notifySuccess, notifyError, notifyWarning, notifyInfo, resolveErrorMessage } from '../utils/notify'
 
 const route = useRoute()
@@ -628,30 +628,149 @@ const applyAddressStruct = (rawAddress, opts = {}) => {
 
 const ensureLeaflet = async () => {
   if (L) return L
-  const mod = await import('leaflet')
-  await import('leaflet/dist/leaflet.css')
-  const icon = (await import('leaflet/dist/images/marker-icon.png')).default
-  const iconShadow = (await import('leaflet/dist/images/marker-shadow.png')).default
-  L = mod.default
-  const DefaultIcon = L.icon({
-    iconUrl: icon,
-    shadowUrl: iconShadow,
-    iconSize: [25, 41],
-    iconAnchor: [12, 41],
-  })
-  L.Marker.prototype.options.icon = DefaultIcon
+  try {
+    L = await loadLeafletFromGlobal()
+  } catch (err) {
+    console.warn('Leaflet 加载失败，使用基础地图降级模式', err)
+    L = createFallbackLeaflet()
+  }
   return L
 }
 
-const updateLocation = async (lat, lng, label = '') => {
-    const Leaflet = await ensureLeaflet()
-    lat = parseFloat(lat);
-    lng = parseFloat(lng);
+const loadAssetOnce = (id, tagName, attrs) => {
+  if (document.getElementById(id)) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const el = document.createElement(tagName)
+    el.id = id
+    Object.entries(attrs).forEach(([key, value]) => {
+      el.setAttribute(key, value)
+    })
+    el.onload = () => resolve()
+    el.onerror = () => reject(new Error(`加载资源失败: ${attrs.href || attrs.src}`))
+    document.head.appendChild(el)
+  })
+}
 
-    if (marker.value) {
-        marker.value.setLatLng([lat, lng]);
-    } else {
-        marker.value = Leaflet.marker([lat, lng]).addTo(mapInstance.value);
+const loadLeafletFromGlobal = async () => {
+  if (window.L) return window.L
+  const cssUrl = String(import.meta.env.VITE_LEAFLET_CSS_URL || 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css').trim()
+  const jsUrl = String(import.meta.env.VITE_LEAFLET_JS_URL || 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js').trim()
+  await loadAssetOnce('leaflet-css', 'link', { rel: 'stylesheet', href: cssUrl })
+  await loadAssetOnce('leaflet-js', 'script', { src: jsUrl })
+  if (!window.L) throw new Error('Leaflet 全局对象未初始化')
+  return window.L
+}
+
+const createFallbackLeaflet = () => {
+  const createMarker = (coords) => {
+    let mapRef = null
+    return {
+      addTo(map) {
+        mapRef = map
+        mapRef._setMarker(coords)
+        return this
+      },
+      setLatLng(nextCoords) {
+        coords = nextCoords
+        mapRef?._setMarker(coords)
+        return this
+      },
+    }
+  }
+
+  return {
+    icon: (opts) => opts,
+    Marker: { prototype: { options: {} } },
+    marker: (coords) => createMarker(coords),
+    tileLayer: () => ({ addTo: () => null }),
+    map: (id) => {
+      const el = typeof id === 'string' ? document.getElementById(id) : id
+      if (!el) throw new Error('地图容器不存在')
+      let center = [30.5728, 104.0668]
+      let clickHandler = null
+      let markerEl = null
+      el.classList.add('map-fallback')
+      el.innerHTML = '<div class="map-fallback-grid"></div><div class="map-fallback-hint">地图组件未加载，搜索仍可自动填充经纬度</div>'
+
+      const api = {
+        setView(nextCenter) {
+          if (Array.isArray(nextCenter) && nextCenter.length >= 2) center = nextCenter.map(Number)
+          return api
+        },
+        fitBounds(bounds) {
+          if (Array.isArray(bounds) && bounds.length >= 2) {
+            const a = bounds[0]
+            const b = bounds[1]
+            center = [(Number(a[0]) + Number(b[0])) / 2, (Number(a[1]) + Number(b[1])) / 2]
+          }
+          return api
+        },
+        on(type, handler) {
+          if (type !== 'click') return api
+          clickHandler = (event) => {
+            const rect = el.getBoundingClientRect()
+            const offsetX = (event.clientX - rect.left) / rect.width - 0.5
+            const offsetY = (event.clientY - rect.top) / rect.height - 0.5
+            handler({ latlng: { lat: center[0] - offsetY * 0.1, lng: center[1] + offsetX * 0.1 } })
+          }
+          el.addEventListener('click', clickHandler)
+          return api
+        },
+        off() {
+          if (clickHandler) el.removeEventListener('click', clickHandler)
+          clickHandler = null
+          return api
+        },
+        remove() {
+          api.off()
+          el.innerHTML = ''
+          el.classList.remove('map-fallback')
+        },
+        invalidateSize() {},
+        _setMarker(coords) {
+          if (!markerEl) {
+            markerEl = document.createElement('div')
+            markerEl.className = 'map-fallback-marker'
+            el.appendChild(markerEl)
+          }
+          center = coords.map(Number)
+        },
+      }
+      return api
+    },
+  }
+}
+
+const applyGeocodeAddress = (address, displayName = '', label = '') => {
+    const addr = address && typeof address === 'object' ? address : {}
+    const province = _pickFirst(addr.province, addr.state, addr.region, addr.state_district)
+    const city = _pickFirst(addr.city, addr.town, addr.municipality, addr.county, addr.state_district)
+    const area = _pickFirst(addr.city_district, addr.district, addr.county, addr.suburb, addr.borough, addr.village)
+
+    if (province) form.clockIn.location.province = province
+    if (city) form.clockIn.location.city = city
+    if (area) form.clockIn.location.area = area
+
+    const place = _pickFirst(label, addr.street_number, addr.street, displayName)
+    form.clockIn.location.address = _composeAddress([province, city, area, formatNearbyAddressPlace(place || displayName)])
+    applyAddressStruct(form.clockIn.location.address, { rewriteAddress: true })
+}
+
+const updateLocation = async (lat, lng, label = '', opts = {}) => {
+    lat = Number.parseFloat(lat)
+    lng = Number.parseFloat(lng)
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        notifyWarning('搜索结果经纬度无效，请换一个关键词')
+        return false
+    }
+    const Leaflet = await ensureLeaflet()
+
+    if (mapInstance.value) {
+        if (marker.value) {
+            marker.value.setLatLng([lat, lng])
+        } else {
+            marker.value = Leaflet.marker([lat, lng]).addTo(mapInstance.value)
+        }
     }
     
     form.clockIn.location.latitude = lat.toFixed(6);
@@ -660,6 +779,13 @@ const updateLocation = async (lat, lng, label = '') => {
     if (label) {
         form.clockIn.location.address = _composeAddress(String(label).split(/[·,，]/g));
         applyAddressStruct(form.clockIn.location.address, { rewriteAddress: true })
+    }
+
+    if (opts?.address) {
+        applyGeocodeAddress(opts.address, opts.displayName || '', label)
+        if (opts.skipReverse) return true
+    } else if (opts?.skipReverse) {
+        return true
     }
     
     try {
@@ -689,6 +815,7 @@ const updateLocation = async (lat, lng, label = '') => {
              notifyWarning(err.response?.data?.detail || '无法自动获取详细地址，请手动填写')
         }
     }
+    return true
 }
 
 const normalizeSearchQuery = (q) => {
@@ -709,10 +836,11 @@ const searchPlace = async () => {
         notifyWarning('请输入要搜索的地点')
         return
     }
-    if (!mapInstance.value) {
-        return
-    }
     try {
+        if (!mapInstance.value) {
+            await initMap()
+            await nextTick()
+        }
         if (geocodeSearchAbort) geocodeSearchAbort.abort()
         geocodeSearchAbort = new AbortController()
         const res = await http.get('/geocode/search', { params: { q }, signal: geocodeSearchAbort.signal })
@@ -724,13 +852,23 @@ const searchPlace = async () => {
         const best = results[0]
         const lat = Number(best.y)
         const lng = Number(best.x)
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            notifyWarning('搜索结果经纬度无效，请换一个关键词')
+            return
+        }
+        const address = best.address || best.raw?.address_components || best.raw?.result?.address_components
 
         if (best.bounds && Array.isArray(best.bounds)) {
-            mapInstance.value.fitBounds(best.bounds, { padding: [20, 20] })
+            mapInstance.value?.fitBounds(best.bounds, { padding: [20, 20] })
         } else {
-            mapInstance.value.setView([lat, lng], 16)
+            mapInstance.value?.setView([lat, lng], 16)
         }
-        updateLocation(lat, lng, best.label || q)
+        const updated = await updateLocation(lat, lng, best.label || q, {
+            address,
+            displayName: best.raw?.adress || best.raw?.result?.title || best.label || q,
+            skipReverse: !!address,
+        })
+        if (!updated) return
         notifySuccess('已定位到搜索结果')
     } catch (e) {
         if (e?.code === 'ERR_CANCELED') return
@@ -1414,6 +1552,42 @@ onUnmounted(() => {
   border-radius: 4px;
   border: 1px solid var(--el-border-color);
   z-index: 1;
+}
+.map-fallback {
+  position: relative;
+  overflow: hidden;
+  background: #eef3f8;
+}
+.map-fallback-grid {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(rgba(76, 111, 143, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(76, 111, 143, 0.12) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.map-fallback-hint {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #475569;
+  font-size: 13px;
+}
+.map-fallback-marker {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  border-radius: 50% 50% 50% 0;
+  background: #e11d48;
+  border: 2px solid #fff;
+  transform: translate(-50%, -100%) rotate(-45deg);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.3);
 }
 .place-row {
   display: flex;

@@ -193,3 +193,11 @@ export const formatCnDotAddress = (obj) => {
   const street = _trim(obj?.street)
   return [province, city, district, street].filter(Boolean).join(' · ')
 }
+
+export const formatNearbyAddressPlace = (value) => {
+  const raw = _trim(value)
+  if (!raw) return ''
+  const core = raw.replace(/^在\s*/u, '').replace(/\s*附近$/u, '').trim()
+  if (!core) return raw
+  return `在${core}附近`
+}

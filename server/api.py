@@ -12,6 +12,7 @@ from server.coreApi.MainLogicApi import ApiClient
 from server.coreApi.AiServiceClient import generate_article
 from typing import List, Any, Dict, Optional
 import datetime
+import json
 import requests
 from pydantic import BaseModel
 from urllib.parse import urljoin, urlparse
@@ -36,6 +37,7 @@ from server.proxy_settings import (
 router = APIRouter()
 
 NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org"
+MAPCHAXUN_GEOCODE_URL = "https://www.mapchaxun.cn/api/getSolidAdress"
 NOTIFICATION_SETTINGS_KEY = "notifications"
 DEFAULT_REPORT_MAKEUP_BATCH_DELAY_SECONDS = 2.0
 MAX_REPORT_MAKEUP_BATCH_DELAY_SECONDS = 30.0
@@ -1529,6 +1531,66 @@ def _geocode_cache_set(key: tuple, value: Any, ttl_seconds: int = 3600, maxsize:
         while len(_GEOCODE_CACHE) > int(maxsize):
             _GEOCODE_CACHE.popitem(last=False)
 
+def _geocode_service_config(provider_env: str, default_provider: str) -> tuple[str, str, str]:
+    provider = (os.getenv(provider_env) or "").strip().lower() or default_provider
+    amap_key = (os.getenv("AMAP_KEY") or "").strip()
+    baidu_key = (os.getenv("BAIDU_MAP_AK") or os.getenv("BAIDU_MAP_KEY") or "").strip()
+    if provider in {"mapchaxun", "mcx"}:
+        return "mapchaxun", amap_key, baidu_key
+    if provider in {"baidu", "bd"}:
+        if not baidu_key:
+            raise HTTPException(status_code=400, detail="已选择百度地理编码，请配置 BAIDU_MAP_AK")
+        return "baidu", amap_key, baidu_key
+    if provider in {"amap", "gaode"}:
+        if not amap_key:
+            raise HTTPException(status_code=400, detail="已选择高德地理编码，请配置 AMAP_KEY")
+        return "amap", amap_key, baidu_key
+    if provider in {"osm", "nominatim", "openstreetmap"}:
+        return "osm", amap_key, baidu_key
+    raise HTTPException(status_code=400, detail=f"不支持的地理编码服务: {provider}")
+
+def _geocode_search_provider_config() -> tuple[str, str, str]:
+    return _geocode_service_config("GEOCODE_SEARCH_PROVIDER", "mapchaxun")
+
+def _geocode_provider_config() -> tuple[str, str, str]:
+    amap_key = (os.getenv("AMAP_KEY") or "").strip()
+    baidu_key = (os.getenv("BAIDU_MAP_AK") or os.getenv("BAIDU_MAP_KEY") or "").strip()
+    default_provider = "baidu" if baidu_key else ("amap" if amap_key else "osm")
+    return _geocode_service_config("GEOCODE_PROVIDER", default_provider)
+
+def _baidu_coord_types() -> tuple[str, str]:
+    default = (os.getenv("BAIDU_MAP_COORD_TYPE") or "gcj02ll").strip() or "gcj02ll"
+    input_type = (os.getenv("BAIDU_MAP_INPUT_COORD_TYPE") or default).strip() or default
+    output_type = (
+        os.getenv("BAIDU_MAP_OUTPUT_COORD_TYPE")
+        or os.getenv("BAIDU_MAP_RETURN_COORD_TYPE")
+        or default
+    ).strip() or default
+    return input_type, output_type
+
+def _mapchaxun_location(data: Dict[str, Any]) -> tuple[float, float]:
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    loc = result.get("location") if isinstance(result.get("location"), dict) else {}
+    if loc:
+        return float(loc.get("lng")), float(loc.get("lat"))
+    loc_list = data.get("location")
+    if isinstance(loc_list, list) and len(loc_list) >= 2:
+        return float(loc_list[0]), float(loc_list[1])
+    loc_val = data.get("locationVal")
+    if isinstance(loc_val, str) and "," in loc_val:
+        lng_s, lat_s = loc_val.split(",", 1)
+        return float(lng_s), float(lat_s)
+    raise ValueError("mapchaxun 未返回有效经纬度")
+
+def _mapchaxun_address(data: Dict[str, Any]) -> Dict[str, Any]:
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    result_addr = result.get("address_components") if isinstance(result.get("address_components"), dict) else {}
+    top_addr = data.get("address_components") if isinstance(data.get("address_components"), dict) else {}
+    address = {**result_addr, **top_addr}
+    if "district" in address and "county" not in address:
+        address["county"] = address.get("district")
+    return address
+
 def _rate_limit(key: str, limit: int, per_seconds: int, detail: Optional[str] = None) -> None:
     now = time.time()
     bucket = _RATE_LIMIT_BUCKETS.get(key, [])
@@ -1629,6 +1691,20 @@ def read_audit_logs_page(
         for r in rows
     ]
     return {"items": items, "total": total, "page": page, "pageSize": pageSize}
+
+
+@router.delete("/audit-logs")
+def clear_audit_logs(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(get_admin),
+):
+    rows = session.exec(select(AuditLog)).all()
+    deleted = len(rows)
+    for row in rows:
+        session.delete(row)
+    session.commit()
+    return {"ok": True, "deleted": deleted}
 
 
 @router.get("/settings/notifications")
@@ -2562,17 +2638,77 @@ def submit_daily_report_manual(
 
 @router.get("/geocode/search")
 def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: dict = Depends(get_operator)):
-    provider = (os.getenv("GEOCODE_PROVIDER") or "").strip().lower()
-    amap_key = (os.getenv("AMAP_KEY") or "").strip()
-    if not provider:
-        provider = "amap" if amap_key else "osm"
+    provider, amap_key, baidu_key = _geocode_search_provider_config()
+    baidu_output_coord_type = ""
+    if provider == "baidu":
+        _, baidu_output_coord_type = _baidu_coord_types()
     q2 = (q or "").strip()
-    cache_key = ("search", provider, q2)
+    cache_key = ("search", provider, baidu_output_coord_type, q2) if provider == "baidu" else ("search", provider, q2)
     cached = _geocode_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    if provider == "amap" and amap_key:
+    if provider == "mapchaxun":
+        try:
+            resp = requests.post(
+                MAPCHAXUN_GEOCODE_URL,
+                headers={"content-type": "application/json"},
+                data=json.dumps({"address": q2}, separators=(",", ":")),
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+            if int(data.get("status", -1)) != 10000:
+                raise ValueError(data.get("message") or f"mapchaxun 地理编码错误: {data.get('status')}")
+            lon, lat = _mapchaxun_location(data)
+            result = data.get("result") if isinstance(data.get("result"), dict) else {}
+            address = _mapchaxun_address(data)
+            label = data.get("adress") or result.get("title") or q2
+            out = {
+                "results": [
+                    {
+                        "x": lon,
+                        "y": lat,
+                        "label": label,
+                        "bounds": None,
+                        "address": address,
+                        "raw": data,
+                    }
+                ]
+            }
+            _geocode_cache_set(cache_key, out, ttl_seconds=6 * 60 * 60, maxsize=800)
+            return out
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(e)}")
+
+    if provider == "baidu":
+        try:
+            resp = requests.get(
+                "https://api.map.baidu.com/geocoding/v3/",
+                params={
+                    "ak": baidu_key,
+                    "address": q2,
+                    "output": "json",
+                    "ret_coordtype": baidu_output_coord_type,
+                },
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+            if int(data.get("status", -1)) != 0:
+                raise ValueError(data.get("message") or data.get("msg") or f"百度地理编码错误: {data.get('status')}")
+            item = data.get("result") or {}
+            loc = item.get("location") or {}
+            lon = float(loc.get("lng"))
+            lat = float(loc.get("lat"))
+            label = item.get("formatted_address") or q2
+            out = {"results": [{"x": lon, "y": lat, "label": label, "bounds": None, "raw": item}]}
+            _geocode_cache_set(cache_key, out, ttl_seconds=6 * 60 * 60, maxsize=800)
+            return out
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(e)}")
+
+    if provider == "amap":
         try:
             resp = requests.get(
                 "https://restapi.amap.com/v3/geocode/geo",
@@ -2654,16 +2790,73 @@ def geocode_reverse(
     lon: float = Query(...),
     operator: dict = Depends(get_operator),
 ):
-    provider = (os.getenv("GEOCODE_PROVIDER") or "").strip().lower()
-    amap_key = (os.getenv("AMAP_KEY") or "").strip()
-    if not provider:
-        provider = "amap" if amap_key else "osm"
-    cache_key = ("reverse", provider, round(float(lat), 6), round(float(lon), 6))
+    provider, amap_key, baidu_key = _geocode_provider_config()
+    baidu_input_coord_type = ""
+    baidu_output_coord_type = ""
+    if provider == "baidu":
+        baidu_input_coord_type, baidu_output_coord_type = _baidu_coord_types()
+    cache_key = (
+        "reverse",
+        provider,
+        baidu_input_coord_type,
+        baidu_output_coord_type,
+        round(float(lat), 6),
+        round(float(lon), 6),
+    ) if provider == "baidu" else ("reverse", provider, round(float(lat), 6), round(float(lon), 6))
     cached = _geocode_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    if provider == "amap" and amap_key:
+    if provider == "baidu":
+        try:
+            resp = requests.get(
+                "https://api.map.baidu.com/reverse_geocoding/v3/",
+                params={
+                    "ak": baidu_key,
+                    "location": f"{lat},{lon}",
+                    "coordtype": baidu_input_coord_type,
+                    "ret_coordtype": baidu_output_coord_type,
+                    "extensions_poi": 0,
+                    "output": "json",
+                },
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+            if int(data.get("status", -1)) != 0:
+                raise ValueError(data.get("message") or data.get("msg") or f"百度逆地理编码错误: {data.get('status')}")
+            result = data.get("result") or {}
+            formatted = result.get("formatted_address") or ""
+            comp = result.get("addressComponent") or {}
+            province = comp.get("province") or ""
+            city = comp.get("city") or ""
+            district = comp.get("district") or ""
+            town = comp.get("town") or ""
+            street = comp.get("street") or ""
+            street_number = comp.get("street_number") or ""
+            name = street_number or street or town or district or city or province or ""
+            out = {
+                "display_name": formatted or name,
+                "name": name,
+                "address": {
+                    "province": province,
+                    "city": city,
+                    "county": district,
+                    "district": district,
+                    "town": town,
+                    "township": town,
+                    "road": street,
+                    "house_number": street_number,
+                },
+                "raw": data,
+            }
+            out2 = {"result": out}
+            _geocode_cache_set(cache_key, out2, ttl_seconds=6 * 60 * 60, maxsize=1200)
+            return out2
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"逆地理解析失败: {str(e)}")
+
+    if provider == "amap":
         try:
             resp = requests.get(
                 "https://restapi.amap.com/v3/geocode/regeo",

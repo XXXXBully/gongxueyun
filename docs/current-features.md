@@ -6,7 +6,7 @@
 
 AutoMoGuDing SaaS 当前包含两套 Web 界面：
 
-- **管理端：** 用户管理、批量任务、审计日志、通知配置、AI 测试、地理编码、缺卡查询和补卡。
+- **管理端：** 用户管理、批量任务、审计日志查询与清空、通知配置、AI 测试、地理编码、缺卡查询和补卡。
 - **用户端：** 注册 / 登录、绑定工学云账号、个人配置、手动执行、执行记录、日报生成 / 提交、缺卡查询和补卡。
 
 后端任务执行链路集中在：
@@ -20,6 +20,29 @@ AutoMoGuDing SaaS 当前包含两套 Web 界面：
 - `server/coreApi/MainLogicApi.py`：工学云接口客户端。
 
 更多后端维护细节见 `server/README.md`，前端交互说明见 `web/README.md`。
+
+## 地图与地理编码
+
+管理端用户编辑页的打卡设置使用内置 Leaflet 地图。页面内的地址搜索走后端 `/geocode/search`，默认调用 `https://www.mapchaxun.cn/api/getSolidAdress`，会根据响应中的 `location` 和 `address_components` 自动回填经纬度、省市区和地址；地图点击仍走逆地理解析。
+
+后端地址搜索默认配置：
+
+- `GEOCODE_SEARCH_PROVIDER=mapchaxun`
+
+逆地理解析默认配置：
+
+- `GEOCODE_PROVIDER=osm`
+
+也可以把搜索或逆地理解析切换到百度 Web 服务：
+
+- `GEOCODE_SEARCH_PROVIDER=baidu`
+- `GEOCODE_PROVIDER=baidu`
+- `BAIDU_MAP_AK=<百度地图 Web 服务 AK>`
+- `BAIDU_MAP_COORD_TYPE=gcj02ll`
+- `BAIDU_MAP_INPUT_COORD_TYPE=`：可选，百度逆地理输入坐标类型，默认跟随 `BAIDU_MAP_COORD_TYPE`
+- `BAIDU_MAP_OUTPUT_COORD_TYPE=`：可选，百度地理编码返回坐标类型，默认跟随 `BAIDU_MAP_COORD_TYPE`
+
+使用百度但未配置百度 AK 时会直接返回明确错误，不会静默切换到其他服务。历史高德分支仍保留兼容，可通过 `amap` 和 `AMAP_KEY` 启用。
 
 ## 打卡记录与缺卡筛选
 

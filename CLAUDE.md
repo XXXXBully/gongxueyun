@@ -95,13 +95,13 @@ npm run build
 - `web/src/stores/auth.js` 负责在 `localStorage` 中持久化 token、用户名和角色。
 - `web/src/router/index.js` 负责登录跳转与角色路由守卫。
 - `web/src/api/http.js` 统一注入 Bearer Token，并在 `401` 时清空登录态。
-- `web/vite.config.js` 将 `/api` 代理到本地后端 `8147`，构建时按 `vue` / `leaflet` / `axios` 拆分 chunk。
+- `web/vite.config.js` 将 `/api` 代理到本地后端 `8147`，构建时按 `vue` / `axios` 拆分 chunk。
 
 ## Configuration and Runtime Behavior
 
 - 后端默认从项目根目录 `.env` 读取配置；`DATABASE_URL` 必须是 `mysql+pymysql://...`。
 - 生产环境必须显式配置 `APP_SECRET`；开发环境未配置时会临时生成。
-- 常用运行时开关包括 `ADMIN_USERNAME`、`ADMIN_PASSWORD`、`SCHEDULER_TIMEZONE`、`SCHEDULER_JITTER_SECONDS`、`SCHEDULER_REPORT_JITTER_SECONDS`、`GEOCODE_PROVIDER` 和 `AMAP_KEY`。
+- 常用运行时开关包括 `ADMIN_USERNAME`、`ADMIN_PASSWORD`、`SCHEDULER_TIMEZONE`、`SCHEDULER_JITTER_SECONDS`、`SCHEDULER_REPORT_JITTER_SECONDS`、`GEOCODE_SEARCH_PROVIDER`、`GEOCODE_PROVIDER` 和 `BAIDU_MAP_AK`。
 - 启动应用不只是“起一个 API”：还会自动建表、补列、种子管理员、检查模型文件、启动调度器和队列线程。排查启动问题时要把这些副作用一起考虑。
 - 用户创建、更新、绑定后，接口层通常会先移除旧 job，再按新配置重新注册 job。修改排班、报告或启停逻辑时，要把调度重建视为功能的一部分。
 - 工学云账号密码、SMTP 密码等敏感信息是加密存储的；`/ai/test` 默认只允许公网 HTTPS 地址，不允许本机或内网地址。

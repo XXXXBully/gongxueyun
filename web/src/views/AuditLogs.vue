@@ -12,6 +12,7 @@
           />
           <el-button @click="onSearch">搜索</el-button>
           <el-button @click="resetSearch">重置</el-button>
+          <el-button type="danger" :loading="clearing" :disabled="loading || total === 0" @click="clearLogs">清空日志</el-button>
         </div>
       </div>
     </template>
@@ -47,11 +48,13 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { http } from '../api/http'
-import { notifyError, resolveErrorMessage } from '../utils/notify'
+import { notifyError, notifySuccess, resolveErrorMessage } from '../utils/notify'
 
 const items = ref([])
 const loading = ref(false)
+const clearing = ref(false)
 const query = ref('')
 const page = ref(1)
 const pageSize = ref(20)
@@ -98,6 +101,29 @@ const resetSearch = () => {
   query.value = ''
   page.value = 1
   fetchLogs()
+}
+
+const clearLogs = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '清空后不可恢复，确认清空全部审计日志吗？',
+      '清空审计日志',
+      { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  clearing.value = true
+  try {
+    const res = await http.delete('/audit-logs')
+    notifySuccess(`已清空 ${res.data?.deleted || 0} 条审计日志`)
+    page.value = 1
+    await fetchLogs()
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, '清空审计日志失败'))
+  } finally {
+    clearing.value = false
+  }
 }
 
 onMounted(fetchLogs)
