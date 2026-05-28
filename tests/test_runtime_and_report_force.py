@@ -312,7 +312,7 @@ class MapchaxunGeocodeProviderTest(unittest.TestCase):
 
 
 class AuditLogMaintenanceTest(unittest.TestCase):
-    def test_admin_can_clear_all_audit_logs(self):
+    def test_admin_can_clear_all_audit_logs_when_explicitly_enabled(self):
         engine = create_engine("sqlite://")
         SQLModel.metadata.create_all(engine)
         with Session(engine) as session:
@@ -324,11 +324,13 @@ class AuditLogMaintenanceTest(unittest.TestCase):
             )
             session.commit()
 
-            result = api.clear_audit_logs(session=session, admin={"sub": "admin", "role": "admin"})
+            with patch.dict("os.environ", {"ALLOW_AUDIT_LOG_PURGE": "true"}, clear=False):
+                result = api.clear_audit_logs(session=session, admin={"sub": "admin", "role": "admin"})
             remaining = session.exec(select(api.AuditLog)).all()
 
         self.assertEqual(result, {"ok": True, "deleted": 2})
-        self.assertEqual(remaining, [])
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].action, "audit.purge")
 
 
 class ApiClientIPRestrictionTest(unittest.TestCase):
@@ -367,7 +369,15 @@ class ApiClientIPRestrictionTest(unittest.TestCase):
     def test_ip_restricted_response_rotates_proxy_for_makeup_retry(self):
         msg = "IP非法请求过多，已限制访问:111.23.44.229"
         proxy_api = "http://proxy.example/get?accessName=u&accessPassword=p"
-        with patch.dict("os.environ", {"MOGUDING_PROXY_API_URL": proxy_api}, clear=False):
+        with patch.dict(
+            "os.environ",
+            {
+                "MOGUDING_PROXY_API_URL": proxy_api,
+                "MOGUDING_PROXY_ALLOWED_HOSTS": "proxy.example",
+                "ALLOW_PRIVATE_MOGUDING_PROXY_ENDPOINTS": "true",
+            },
+            clear=False,
+        ):
             with patch(
                 "server.coreApi.MainLogicApi.requests.get",
                 side_effect=[

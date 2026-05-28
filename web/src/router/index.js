@@ -22,12 +22,14 @@ const routes = [
       { path: '', component: () => import('../views/user/UserSettings.vue'), meta: { area: 'user' } },
     ],
   },
-  { path: '/', component: () => import('../views/UserList.vue'), meta: { roles: ['admin', 'operator', 'viewer'] } },
-  { path: '/audit', component: () => import('../views/AuditLogs.vue'), meta: { roles: ['admin'] } },
-  { path: '/settings', component: () => import('../views/NotificationSettings.vue'), meta: { roles: ['admin'] } },
-  { path: '/settings/notifications', component: () => import('../views/NotificationSettings.vue'), meta: { roles: ['admin'] } },
-  { path: '/create', component: () => import('../views/UserEdit.vue'), meta: { roles: ['admin', 'operator'] } },
-  { path: '/edit/:id', component: () => import('../views/UserEdit.vue'), meta: { roles: ['admin', 'operator'] } },
+  { path: '/', component: () => import('../views/UserList.vue'), meta: { permissions: ['users:read'] } },
+  { path: '/audit', component: () => import('../views/AuditLogs.vue'), meta: { permissions: ['audit:read'] } },
+  { path: '/tenants', component: () => import('../views/TenantManagement.vue'), meta: { permissions: ['tenants:read'] } },
+  { path: '/security', component: () => import('../views/SecuritySettings.vue'), meta: { permissions: ['audit:read'] } },
+  { path: '/settings', component: () => import('../views/NotificationSettings.vue'), meta: { permissions: ['settings:manage'] } },
+  { path: '/settings/notifications', component: () => import('../views/NotificationSettings.vue'), meta: { permissions: ['settings:manage'] } },
+  { path: '/create', component: () => import('../views/UserEdit.vue'), meta: { permissions: ['users:write'] } },
+  { path: '/edit/:id', component: () => import('../views/UserEdit.vue'), meta: { permissions: ['users:write'] } },
 ]
 
 const router = createRouter({
@@ -38,13 +40,14 @@ const router = createRouter({
 const isUserRoute = (path) => path === '/u' || path.startsWith('/u/')
 const isUserPublicRoute = (path) => path === '/u/login' || path === '/u/register'
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const auth = useAuthStore()
   const userAuth = useUserAuthStore()
 
-  if (auth.isAuthed && !auth.role) auth.logout()
-
   if (isUserRoute(to.path)) {
+    if (!userAuth.sessionChecked) {
+      await userAuth.validateSession()
+    }
     if (isUserPublicRoute(to.path)) {
       if (userAuth.isAuthed) return '/u'
       return true
@@ -52,7 +55,14 @@ router.beforeEach((to) => {
     if (!userAuth.isAuthed) {
       return { path: '/u/login', query: { redirect: to.fullPath } }
     }
+    if (!userAuth.sessionChecked && !(await userAuth.validateSession())) {
+      return { path: '/u/login', query: { redirect: to.fullPath } }
+    }
     return true
+  }
+
+  if (!auth.sessionChecked) {
+    await auth.validateSession()
   }
 
   if (to.meta.public) {
@@ -60,6 +70,16 @@ router.beforeEach((to) => {
     return true
   }
   if (!auth.isAuthed) return { path: '/login', query: { redirect: to.fullPath } }
+  if (!auth.sessionChecked && !(await auth.validateSession())) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  const permissions = Array.isArray(to.meta.permissions) ? to.meta.permissions : []
+  if (permissions.length > 0) {
+    if (permissions.every((permission) => auth.can(permission))) return true
+    if (to.path !== '/') return '/'
+    auth.logout()
+    return { path: '/login' }
+  }
   const roles = to.meta.roles
   if (!roles) return true
   if (roles.includes(auth.role)) return true

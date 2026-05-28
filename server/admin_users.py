@@ -1,7 +1,8 @@
 import os
 from sqlmodel import Session, select
-from server.models import AdminUser, AuditLog
+from server.models import DEFAULT_TENANT_ID, AdminUser, AuditLog
 from server.auth import hash_password
+from server.security import require_safe_admin_credentials
 
 def ensure_seed_admin_users() -> None:
     from server.database import engine
@@ -9,6 +10,7 @@ def ensure_seed_admin_users() -> None:
 
     admin_user = (os.getenv("ADMIN_USERNAME") or "admin").strip()
     admin_pass = (os.getenv("ADMIN_PASSWORD") or "admin123456").strip()
+    require_safe_admin_credentials(admin_user, admin_pass)
 
     with Session(engine) as session:
         has_any = session.exec(select(AdminUser).limit(1)).first() is not None
@@ -17,7 +19,9 @@ def ensure_seed_admin_users() -> None:
                 raise RuntimeError("生产环境必须设置 ADMIN_USERNAME / ADMIN_PASSWORD")
 
         if admin_user and admin_pass and not (app_env in ["prod", "production"] and has_any):
-            existing = session.exec(select(AdminUser).where(AdminUser.username == admin_user)).first()
+            existing = session.exec(
+                select(AdminUser).where((AdminUser.tenant_id == DEFAULT_TENANT_ID) & (AdminUser.username == admin_user))
+            ).first()
             if existing:
                 if existing.role != "admin":
                     existing.role = "admin"
@@ -34,15 +38,5 @@ def ensure_seed_admin_users() -> None:
                     )
                 )
             session.add(AuditLog(actor="system", action="admin_user.seed", target_user_id=None, detail={"username": admin_user, "role": "admin"}))
-
-        others = session.exec(select(AdminUser).where(AdminUser.role != "admin")).all()
-        disabled = 0
-        for u in others:
-            if u.enabled:
-                u.enabled = False
-                session.add(u)
-                disabled += 1
-        if disabled:
-            session.add(AuditLog(actor="system", action="admin_user.disable_non_admin", target_user_id=None, detail={"count": disabled}))
 
         session.commit()

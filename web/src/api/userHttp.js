@@ -5,6 +5,30 @@ import { useUserAuthStore } from '../stores/userAuth'
 export const userHttp = axios.create({
   baseURL: '/api',
   timeout: 20000,
+  withCredentials: true,
+})
+
+const unsafeMethods = new Set(['post', 'put', 'patch', 'delete'])
+
+const readCookie = (name) => {
+  if (typeof document === 'undefined') return ''
+  const prefix = `${name}=`
+  const item = document.cookie.split('; ').find((part) => part.startsWith(prefix))
+  return item ? decodeURIComponent(item.slice(prefix.length)) : ''
+}
+
+userHttp.interceptors.request.use((config) => {
+  const method = String(config.method || 'get').toLowerCase()
+  if (unsafeMethods.has(method)) {
+    const csrfToken = readCookie('csrf_token')
+    if (csrfToken) {
+      config.headers = {
+        ...(config.headers || {}),
+        'X-CSRF-Token': csrfToken,
+      }
+    }
+  }
+  return config
 })
 
 const isUserPublicRoute = (path) => path === '/u/login' || path === '/u/register'
@@ -12,15 +36,6 @@ const resolveUserRedirect = (value) => {
   if (typeof value !== 'string') return '/u'
   return value === '/u' || value.startsWith('/u/') ? value : '/u'
 }
-
-userHttp.interceptors.request.use((config) => {
-  const auth = useUserAuthStore()
-  if (auth.token) {
-    config.headers = config.headers || {}
-    config.headers.Authorization = `Bearer ${auth.token}`
-  }
-  return config
-})
 
 userHttp.interceptors.response.use(
   (res) => res,

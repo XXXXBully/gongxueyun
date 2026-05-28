@@ -1,14 +1,17 @@
 import logging
+import os
 import time
-import threading
+import ipaddress
+import logging
+import socket
+from contextlib import contextmanager
 from typing import Dict, Any, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.exceptions import RequestException
 
 from server.util.HelperFunctions import strip_markdown
-from server.util.LoggerContext import _log_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,118 @@ def _resolve_chat_completions_url(api_base_url: str) -> str:
     if base.endswith("/v1"):
         return urljoin(base + "/", "chat/completions")
     return urljoin(base + "/", "v1/chat/completions")
+
+
+def _split_env_list(value: str) -> list[str]:
+    return [item.strip().lower() for item in (value or "").replace(";", ",").split(",") if item.strip()]
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_matches_allowlist(host: str, allowed_hosts: list[str]) -> bool:
+    if not allowed_hosts:
+        return True
+    if "*" in allowed_hosts or host in allowed_hosts:
+        return True
+    return any(item.startswith(".") and host.endswith(item) for item in allowed_hosts)
+
+
+def _is_private_or_special_ip(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except Exception:
+        return True
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _resolve_host_for_endpoint_policy(host: str, port: int) -> tuple[bool, list]:
+    normalized = (host or "").strip().lower()
+    if not normalized or normalized == "localhost":
+        return True, []
+    try:
+        ipaddress.ip_address(normalized)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    except Exception:
+        return True, []
+
+    if is_ip_literal:
+        infos = socket.getaddrinfo(normalized, port, type=socket.SOCK_STREAM)
+        return _is_private_or_special_ip(normalized), infos
+    try:
+        infos = socket.getaddrinfo(normalized, port, type=socket.SOCK_STREAM)
+    except Exception:
+        return True, []
+    return any(_is_private_or_special_ip(info[4][0]) for info in infos), list(infos)
+
+
+@contextmanager
+def _pin_getaddrinfo(host: str, port: int, infos: list):
+    original_getaddrinfo = socket.getaddrinfo
+    normalized_host = (host or "").strip().lower()
+    normalized_port = int(port)
+
+    def pinned_getaddrinfo(query_host, query_port, *args, **kwargs):
+        if (
+            (str(query_host or "").strip().lower() == normalized_host)
+            and int(query_port or normalized_port) == normalized_port
+            and infos
+        ):
+            return infos
+        return original_getaddrinfo(query_host, query_port, *args, **kwargs)
+
+    socket.getaddrinfo = pinned_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
+def _ai_endpoint_detail(api_url: str) -> Dict[str, Any]:
+    parsed = urlparse((api_url or "").strip())
+    return {
+        "scheme": parsed.scheme,
+        "host": (parsed.hostname or "").lower(),
+        "port": parsed.port,
+        "path": parsed.path,
+    }
+
+
+def _validate_ai_endpoint_policy(api_url: str) -> Dict[str, Any]:
+    detail = _ai_endpoint_detail(api_url)
+    host = detail["host"]
+    if not detail["scheme"] or not host:
+        raise ValueError("AI API URL format is invalid")
+
+    allowed_hosts = _split_env_list(os.getenv("AI_ALLOWED_HOSTS") or "")
+    if not _host_matches_allowlist(host, allowed_hosts):
+        raise ValueError("AI API URL is not in AI_ALLOWED_HOSTS")
+
+    allow_private = _env_flag("ALLOW_PRIVATE_AI_ENDPOINTS")
+    port = int(detail.get("port") or (443 if detail["scheme"] == "https" else 80))
+    private_endpoint, resolved_infos = _resolve_host_for_endpoint_policy(host, port)
+    if private_endpoint:
+        if not allow_private:
+            raise ValueError("AI API URL must not target private, local, or special addresses")
+        if not allowed_hosts:
+            raise ValueError("AI private endpoint requires AI_ALLOWED_HOSTS")
+        detail["_resolved_infos"] = resolved_infos
+        return detail
+
+    if detail["scheme"] != "https":
+        raise ValueError("AI API URL must use HTTPS for public endpoints")
+    detail["_resolved_infos"] = resolved_infos
+    return detail
 
 def _clamp_int(value: Any, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -31,6 +146,38 @@ def _truncate_to_chars(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip()
+
+
+def _ai_timeout_seconds(value: Any) -> int:
+    max_timeout = _clamp_int(os.getenv("AI_REQUEST_MAX_TIMEOUT_SECONDS"), default=60, min_value=1, max_value=60)
+    return _clamp_int(value, default=min(30, max_timeout), min_value=1, max_value=max_timeout)
+
+
+def _ai_max_retries(value: Any) -> int:
+    configured_max = _clamp_int(os.getenv("AI_REQUEST_MAX_RETRIES"), default=2, min_value=1, max_value=3)
+    return _clamp_int(value, default=configured_max, min_value=1, max_value=configured_max)
+
+
+def _submitted_report_prompts(submitted_reports: Optional[list]) -> str:
+    if not isinstance(submitted_reports, list):
+        return ""
+    max_items = _clamp_int(os.getenv("AI_SUBMITTED_REPORT_HISTORY_LIMIT"), default=8, min_value=0, max_value=20)
+    max_chars = _clamp_int(os.getenv("AI_SUBMITTED_REPORT_HISTORY_CHARS"), default=4000, min_value=0, max_value=12000)
+    if max_items <= 0 or max_chars <= 0:
+        return ""
+    prompts = []
+    used = 0
+    for report in submitted_reports[:max_items]:
+        if not isinstance(report, dict):
+            continue
+        item = f"{str(report.get('title') or '')[:120]}: {str(report.get('content') or '')[:1000]}"
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        item = item[:remaining]
+        prompts.append(item)
+        used += len(item)
+    return "\n".join(prompts)
 
 
 def generate_article(
@@ -69,9 +216,16 @@ def generate_article(
         "Authorization": f"Bearer {api_key}",
     }
     api_url = _resolve_chat_completions_url(api_base_url)
+    endpoint_detail = _validate_ai_endpoint_policy(api_url)
+    resolved_infos = endpoint_detail.pop("_resolved_infos", [])
+    endpoint_host = str(endpoint_detail.get("host") or "")
+    endpoint_port = int(endpoint_detail.get("port") or (443 if endpoint_detail.get("scheme") == "https" else 80))
+    logger.info("AI endpoint selected: %s", endpoint_detail)
 
     min_count = _clamp_int(count, default=500, min_value=1, max_value=1000)
     max_chars = 1000
+    request_timeout = _ai_timeout_seconds(timeout)
+    request_retries = _ai_max_retries(max_retries)
 
     # 构造系统提示词
     system_prompt = (
@@ -107,14 +261,11 @@ def generate_article(
         ],
         "max_tokens": 1200,
     }
-    if submitted_reports is not None:
-        prompts = [
-            f"{report['title']}: {report['content']}"
-            for report in submitted_reports
-        ]
+    prompts = _submitted_report_prompts(submitted_reports)
+    if prompts:
         data["messages"].append({
             "role": "user",
-            "content": "\n".join(prompts)
+            "content": prompts
         })
 
     def parse_response(resp_json: Dict) -> Optional[str]:
@@ -132,15 +283,16 @@ def generate_article(
             return None
 
     # === 主重试流程 ===
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, request_retries + 1):
         try:
             logger.info(f"第 {attempt} 次请求，标题：{title}")
-            response = requests.post(
-                url=api_url,
-                headers=headers,
-                json=data,
-                timeout=timeout,
-            )
+            with _pin_getaddrinfo(endpoint_host, endpoint_port, resolved_infos):
+                response = requests.post(
+                    url=api_url,
+                    headers=headers,
+                    json=data,
+                    timeout=request_timeout,
+                )
             response.raise_for_status()
             content = parse_response(response.json())
             if not content:
@@ -150,18 +302,18 @@ def generate_article(
             cleaned = strip_markdown(content)
             return _truncate_to_chars(cleaned, max_chars)
         except RequestException as e:
-            logger.warning(f"网络请求错误 （尝试 {attempt}/{max_retries}）：{e}")
-            if attempt == max_retries:
-                logger.error(f"达到最大重试次数，最后一次错误: {e}")
-                raise ValueError(f"网络异常，生成失败: {e}")
+            logger.warning("网络请求错误（尝试 %s/%s）：%s", attempt, request_retries, e.__class__.__name__)
+            if attempt == request_retries:
+                logger.error("达到最大重试次数，最后一次错误类型: %s", e.__class__.__name__)
+                raise ValueError("网络异常，生成失败")
             time.sleep(retry_delay)
         except ValueError as e:
             logger.error(f"内容错误或解析失败：{e}")
             raise
-        except Exception as e:
-            logger.exception(f"未知异常（第 {attempt} 次）：{e}")
-            if attempt == max_retries:
-                raise ValueError(f"生成文章失败，未知错误: {e}")
+        except Exception:
+            logger.exception("未知异常（第 %s 次）", attempt)
+            if attempt == request_retries:
+                raise ValueError("生成文章失败，未知错误")
             time.sleep(retry_delay)
 
     raise ValueError("文章生成失败，所有重试均未成功")

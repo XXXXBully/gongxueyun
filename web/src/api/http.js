@@ -2,18 +2,31 @@ import axios from 'axios'
 import router from '../router'
 import { useAuthStore } from '../stores/auth'
 
-const TOKEN_KEY = 'auth_token'
-
 export const http = axios.create({
   baseURL: '/api',
   timeout: 20000,
+  withCredentials: true,
 })
 
+const unsafeMethods = new Set(['post', 'put', 'patch', 'delete'])
+
+const readCookie = (name) => {
+  if (typeof document === 'undefined') return ''
+  const prefix = `${name}=`
+  const item = document.cookie.split('; ').find((part) => part.startsWith(prefix))
+  return item ? decodeURIComponent(item.slice(prefix.length)) : ''
+}
+
 http.interceptors.request.use((config) => {
-  const token = localStorage.getItem(TOKEN_KEY)
-  if (token) {
-    config.headers = config.headers || {}
-    config.headers.Authorization = `Bearer ${token}`
+  const method = String(config.method || 'get').toLowerCase()
+  if (unsafeMethods.has(method)) {
+    const csrfToken = readCookie('csrf_token')
+    if (csrfToken) {
+      config.headers = {
+        ...(config.headers || {}),
+        'X-CSRF-Token': csrfToken,
+      }
+    }
   }
   return config
 })

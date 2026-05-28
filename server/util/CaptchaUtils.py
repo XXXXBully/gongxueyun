@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import json
 import logging
 import random
+import re
 import struct
 
 from cv2.typing import MatLike
@@ -12,6 +14,7 @@ import cv2
 import os
 import requests
 import threading
+from server.security import is_production
 
 logger = logging.getLogger(__name__)
 
@@ -22,23 +25,54 @@ MODEL_BASE_URL = (os.getenv("MODEL_BASE_URL") or DEFAULT_MODEL_BASE_URL).rstrip(
 def get_model_path(filename: str) -> str:
     return os.path.join(MODEL_DIR, filename)
 
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _model_checksum_env_name(filename: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", str(filename or "")).strip("_").upper()
+    return f"CAPTCHA_MODEL_SHA256_{normalized}"
+
+
+def _expected_model_sha256(filename: str) -> str:
+    return str(os.getenv(_model_checksum_env_name(filename)) or "").strip().lower()
+
+
+def _model_download_requires_checksum() -> bool:
+    configured = os.getenv("CAPTCHA_MODEL_REQUIRE_CHECKSUM")
+    if configured is not None:
+        return _env_flag("CAPTCHA_MODEL_REQUIRE_CHECKSUM")
+    return is_production()
+
+
 def ensure_model_exists(filename: str, url: str):
     path = get_model_path(filename)
     if os.path.exists(path):
         return
 
+    expected_sha256 = _expected_model_sha256(filename)
+    if _model_download_requires_checksum() and not expected_sha256:
+        raise ValueError(f"checksum is required before downloading captcha model {filename}")
+
     logger.info(f"模型文件 {filename} 不存在，正在下载...")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or MODEL_DIR or ".", exist_ok=True)
     try:
-        resp = requests.get(url, stream=True)
+        resp = requests.get(url, stream=True, timeout=30)
         resp.raise_for_status()
+        digest = hashlib.sha256()
         with open(path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                digest.update(chunk)
                 f.write(chunk)
+        if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
+            raise ValueError(f"checksum mismatch for captcha model {filename}")
         logger.info(f"模型文件 {filename} 下载完成")
     except Exception as e:
         logger.error(f"下载模型 {filename} 失败: {e}")
-        if os.path.exists(path) and os.path.getsize(path) == 0:
+        if os.path.exists(path) and (expected_sha256 or os.path.getsize(path) == 0):
             os.remove(path)
         raise
 

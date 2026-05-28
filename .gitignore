@@ -11,7 +11,6 @@ __pycache__/
 .coverage
 coverage/
 htmlcov/
-tests/
 
 # Runtime data
 database.db
@@ -48,8 +47,6 @@ gxyzj.py
 
 # ONNX models
 *.onnx
-!server/models_onnx/
-!server/models_onnx/*.onnx
 
 # Local tools and editors
 .superpowers/

@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173 --strictPort",
+    "lint": "node ../scripts/frontend_quality_gate.mjs",
+    "test": "npm run test:static",
+    "test:static": "node ../scripts/frontend_quality_gate.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },

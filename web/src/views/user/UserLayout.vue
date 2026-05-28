@@ -21,12 +21,18 @@
 
 <script setup>
 import { useRouter } from 'vue-router'
+import { userHttp } from '../../api/userHttp'
 import { useUserAuthStore } from '../../stores/userAuth'
 
 const router = useRouter()
 const auth = useUserAuthStore()
 
-const logout = () => {
+const logout = async () => {
+  try {
+    await userHttp.post('/app/auth/logout')
+  } catch {
+    // Cookie may already be expired; local state still needs to be cleared.
+  }
   auth.logout()
   router.replace('/u/login')
 }

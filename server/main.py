@@ -1,25 +1,90 @@
 import os
-from fastapi import FastAPI, Request
+import time
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from server.database import create_db_and_tables
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from sqlalchemy import text
+from server.database import create_db_and_tables, engine, should_run_runtime_schema_migrations
 from server.api import router
-from server.scheduler import start_scheduler
+from server.scheduler import is_scheduler_running, start_scheduler
 from server.admin_users import ensure_seed_admin_users
-from server.queue_worker import start_queue_worker, stop_queue_worker
+from server.queue_worker import is_queue_worker_running, start_queue_worker, stop_queue_worker
+from server.runtime_mode import should_start_background_services
+from server.observability import prometheus_metrics_text, record_http_request, runtime_metrics
+from server.request_context import request_context
+from server.security import apply_security_headers, require_metrics_access, should_reject_cookie_csrf
 
-app = FastAPI(title="AutoMoGuDing SaaS")
+logger = logging.getLogger(__name__)
+
+
+def _bool_env(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_auto_download_captcha_models() -> bool:
+    configured = _bool_env("CAPTCHA_MODEL_AUTO_DOWNLOAD")
+    if configured is not None:
+        return configured
+    app_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").strip().lower()
+    return app_env not in {"prod", "production"}
+
+
+def _should_expose_api_docs() -> bool:
+    configured = _bool_env("EXPOSE_API_DOCS")
+    if configured is not None:
+        return configured
+    app_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").strip().lower()
+    return app_env not in {"prod", "production"}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    on_startup()
+    try:
+        yield
+    finally:
+        on_shutdown()
+
+
+app = FastAPI(
+    title="AutoMoGuDing SaaS",
+    lifespan=lifespan,
+    docs_url="/docs" if _should_expose_api_docs() else None,
+    redoc_url="/redoc" if _should_expose_api_docs() else None,
+    openapi_url="/openapi.json" if _should_expose_api_docs() else None,
+)
 
 @app.middleware("http")
 async def _security_headers(request, call_next):
-    resp = await call_next(request)
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-    return resp
+    started = time.perf_counter()
+    status_code = 500
+    path = request.url.path or "/"
+    with request_context(request.headers.get("x-request-id")) as request_id:
+        try:
+            if should_reject_cookie_csrf(request):
+                resp = JSONResponse(status_code=403, content={"detail": "CSRF origin rejected"})
+            else:
+                resp = await call_next(request)
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            apply_security_headers(resp)
+            resp.headers["X-Request-ID"] = request_id
+            return resp
+        finally:
+            if not path.startswith("/metrics"):
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                record_http_request(
+                    method=request.method,
+                    path=path,
+                    status_code=status_code,
+                    duration_ms=duration_ms,
+                    request_id=request_id,
+                )
 
 def _strip_wrapping(s: str) -> str:
     s2 = (s or "").strip()
@@ -38,13 +103,23 @@ def _parse_origins(s: str) -> list[str]:
             out.append(v)
     return out
 
-app_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").strip().lower()
-origins_env = os.getenv("CORS_ORIGINS") or os.getenv("FRONTEND_ORIGINS") or ""
-origins = _parse_origins(origins_env)
 
-if origins or app_env not in ["prod", "production"]:
-    if not origins:
-        origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+def _resolve_cors_origins() -> list[str]:
+    app_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").strip().lower()
+    origins_env = os.getenv("CORS_ORIGINS") or os.getenv("FRONTEND_ORIGINS") or ""
+    origins = _parse_origins(origins_env)
+    if "*" in origins and app_env in ["prod", "production"] and not _bool_env("ALLOW_WILDCARD_CORS"):
+        raise RuntimeError("Wildcard CORS origins are not allowed in production")
+    if origins:
+        return origins
+    if app_env not in ["prod", "production"]:
+        return ["http://localhost:5173", "http://127.0.0.1:5173"]
+    return []
+
+
+origins = _resolve_cors_origins()
+
+if origins:
     allow_all = len(origins) == 1 and origins[0] == "*"
     app.add_middleware(
         CORSMiddleware,
@@ -53,29 +128,73 @@ if origins or app_env not in ["prod", "production"]:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-@app.on_event("startup")
 def on_startup():
-    create_db_and_tables()
+    if should_run_runtime_schema_migrations():
+        create_db_and_tables()
+    else:
+        logger.info("runtime schema migrations are disabled; run alembic before startup")
     ensure_seed_admin_users()
 
-    try:
-        from server.util.CaptchaUtils import ensure_model_exists, MODEL_URLS
+    if _should_auto_download_captcha_models():
+        try:
+            from server.util.CaptchaUtils import ensure_model_exists, MODEL_URLS
 
-        for filename, url in MODEL_URLS.items():
-            ensure_model_exists(filename, url)
-    except Exception as e:
-        print(f"Warning: Failed to download models: {e}")
+            for filename, url in MODEL_URLS.items():
+                ensure_model_exists(filename, url)
+        except Exception as e:
+            logger.warning("failed to download captcha models: %s", e)
 
-    start_scheduler()
-    start_queue_worker()
+    if should_start_background_services():
+        start_scheduler()
+        start_queue_worker()
 
 
-@app.on_event("shutdown")
 def on_shutdown():
     stop_queue_worker()
 
 
 app.include_router(router, prefix="/api")
+
+
+def _background_services_ready() -> bool:
+    if not should_start_background_services():
+        return True
+    return is_scheduler_running() and is_queue_worker_running()
+
+
+@app.get("/healthz")
+def healthz():
+    return {
+        "ok": True,
+        "background_services": should_start_background_services(),
+        "background_ready": _background_services_ready(),
+    }
+
+
+@app.get("/readyz")
+def readyz():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    background_ready = _background_services_ready()
+    if not background_ready:
+        raise HTTPException(status_code=503, detail="background services are not ready")
+    return {
+        "ok": True,
+        "background_services": should_start_background_services(),
+        "background_ready": background_ready,
+    }
+
+
+@app.get("/metrics")
+def metrics(request: Request):
+    require_metrics_access(request)
+    return runtime_metrics()
+
+
+@app.get("/metrics.prom")
+def metrics_prometheus(request: Request):
+    require_metrics_access(request)
+    return PlainTextResponse(prometheus_metrics_text(), media_type="text/plain; version=0.0.4")
 
 static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web/dist")
 if os.path.exists(static_dir):

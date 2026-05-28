@@ -3,8 +3,9 @@ from typing import Any, Dict
 from sqlmodel import Session
 
 from server.database import engine
-from server.models import SystemSetting
+from server.models import DEFAULT_TENANT_ID
 from server.secret_store import decrypt_secret, encrypt_secret
+from server.settings_store import get_setting
 
 PROXY_SETTINGS_KEY = "moguding_proxy"
 DEFAULT_PROXY_TTL_SECONDS = 55.0
@@ -63,10 +64,12 @@ def encode_proxy_settings(settings: Any) -> Dict[str, Any]:
     return stored
 
 
-def load_global_proxy_settings() -> Dict[str, Any]:
+def load_global_proxy_settings(tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
     try:
         with Session(engine) as session:
-            row = session.get(SystemSetting, PROXY_SETTINGS_KEY)
+            row = get_setting(session, PROXY_SETTINGS_KEY, tenant_id)
+            if not row and tenant_id != DEFAULT_TENANT_ID:
+                row = get_setting(session, PROXY_SETTINGS_KEY, DEFAULT_TENANT_ID)
             raw = row.value if row and isinstance(row.value, dict) else {}
         return normalize_proxy_settings(_decode_proxy_settings(raw))
     except Exception:

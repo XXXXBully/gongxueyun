@@ -16,7 +16,8 @@ from server.clockin_backfill import (
     parse_clockin_date,
 )
 from server.database import engine
-from server.models import SystemSetting
+from server.models import DEFAULT_TENANT_ID
+from server.settings_store import get_setting
 from server.util.Config import ConfigManager
 from server.util.MessagePush import MessagePusher
 from server.user_runtime import (
@@ -254,9 +255,17 @@ def _same_report_period(report: Dict[str, Any], report_type: str, current_time: 
     return False
 
 
-def _load_global_smtp_settings() -> Dict[str, Any]:
+def _tenant_id_from_config(config_data: Dict[str, Any] | None) -> str:
+    if not isinstance(config_data, dict):
+        return DEFAULT_TENANT_ID
+    return str(config_data.get("tenant_id") or config_data.get("tenantId") or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+
+
+def _load_global_smtp_settings(tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
     with Session(engine) as session:
-        row = session.get(SystemSetting, "notifications")
+        row = get_setting(session, "notifications", tenant_id)
+        if not row and tenant_id != DEFAULT_TENANT_ID:
+            row = get_setting(session, "notifications", DEFAULT_TENANT_ID)
         value = row.value if row and isinstance(row.value, dict) else {}
     return normalize_smtp_settings((value or {}).get("smtp"))
 
@@ -905,7 +914,7 @@ def run_task_by_config(
         pusher = MessagePusher(
             build_effective_push_notifications(
                 user_push=config.get_value("config.pushNotifications"),
-                smtp_settings=_load_global_smtp_settings(),
+                smtp_settings=_load_global_smtp_settings(_tenant_id_from_config(config_data)),
             )
         )
 
@@ -947,8 +956,9 @@ def run_task_by_config(
             # 如果指定了任务类型，则只执行匹配的任务
             # report 匹配所有报告
             if specific_task_type:
-                if specific_task_type == "report" and "report" in t_type:
-                    pass
+                if specific_task_type == "report":
+                    if "report" not in t_type:
+                        continue
                 elif specific_task_type != t_type:
                     continue
             

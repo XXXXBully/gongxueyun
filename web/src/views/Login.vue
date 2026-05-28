@@ -9,11 +9,17 @@
           </div>
         </template>
         <el-form :model="form" @keyup.enter="submit">
+          <el-form-item label="租户">
+            <el-input v-model="form.tenant_id" autocomplete="organization" />
+          </el-form-item>
           <el-form-item label="账号">
             <el-input v-model="form.username" autocomplete="username" />
           </el-form-item>
           <el-form-item label="密码">
             <el-input v-model="form.password" type="password" show-password autocomplete="current-password" />
+          </el-form-item>
+          <el-form-item label="MFA">
+            <el-input v-model="form.mfa_code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
           </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="loading" style="width: 100%" @click="submit">登录</el-button>
@@ -35,8 +41,10 @@ const router = useRouter()
 const auth = useAuthStore()
 
 const form = reactive({
+  tenant_id: 'default',
   username: '',
-  password: ''
+  password: '',
+  mfa_code: ''
 })
 
 const loading = ref(false)
@@ -48,10 +56,14 @@ const submit = async () => {
   }
   loading.value = true
   try {
-    const res = await http.post('/auth/login', form)
-    const token = res.data?.token
-    if (!token) throw new Error('no token')
-    auth.setAuth(token, res.data?.username, res.data?.role)
+    const res = await http.post('/auth/login', {
+      username: form.username,
+      password: form.password,
+      tenant_id: form.tenant_id,
+      mfa_code: form.mfa_code || undefined,
+    })
+    if (!res.data?.role) throw new Error('login response missing role')
+    auth.setAuth(res.data?.token || 'cookie', res.data?.username, res.data?.role, res.data?.tenant_id || form.tenant_id)
     router.replace('/')
   } catch (e) {
     notifyError(resolveErrorMessage(e, '登录失败'))

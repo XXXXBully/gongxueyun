@@ -1,30 +1,33 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlmodel import Session, select
 from sqlalchemy import func
 from server.database import get_session, engine
 from server.batch_jobs import get_batch_job_item_status_counts
-from server.models import User, UserCreate, UserRead, UserUpdate, UserListRead, AuditLog, BatchJob, BatchJobItem, AdminUser, AppUser, SystemSetting
+from server.models import DEFAULT_TENANT_ID, User, UserCreate, UserRead, UserUpdate, UserListRead, AuditLog, BatchJob, BatchJobItem, AdminUser, AppUser, SystemSetting, Tenant
 from server.scheduler import add_user_job, remove_user_job, user_to_config
 from server.task_runner import perform_clock_in_makeup, perform_clock_in_makeup_many, run_task_by_config
 from server.clockin_backfill import build_missing_clockin_day_options, normalize_clockin_records, parse_clockin_date
 from server.util.Config import ConfigManager
 from server.coreApi.MainLogicApi import ApiClient
-from server.coreApi.AiServiceClient import generate_article
+from server.coreApi.AiServiceClient import generate_article, _ai_endpoint_detail
 from typing import List, Any, Dict, Optional
 import datetime
+import hashlib
 import json
+import logging
 import requests
-from pydantic import BaseModel
-from urllib.parse import urljoin, urlparse
+from pydantic import BaseModel, Field as PydanticField
+from urllib.parse import urljoin
 import time
 import os
-import ipaddress
-import socket
 import re
 import threading
 from collections import OrderedDict
-from server.auth import get_admin, get_operator, get_viewer, get_user, issue_token, get_client_ip, verify_password, hash_password
+from server.auth import clear_auth_cookie, generate_totp_secret, get_auth_payload, get_user, issue_token, get_optional_auth_payload, get_client_ip, permissions_for_payload, require_active_tenant, require_permission, revoke_token_subject, set_auth_cookie, tenant_id_from_payload, totp_uri, verify_password, verify_totp_code, hash_password
+from server.rate_limit import check_rate_limit
+from server.security import env_flag, int_env, is_production, is_safe_outbound_url, require_password_strength
 from server.secret_store import decrypt_secret, encrypt_secret
+from server.time_utils import utc_now
 from server.user_runtime import apply_execution_results_to_user, normalize_push_notifications, normalize_smtp_settings, runtime_login_valid, runtime_plan_required, sync_runtime_fields_to_user
 from server.util.MessagePush import send_test_smtp_message
 from server.proxy_settings import (
@@ -33,8 +36,24 @@ from server.proxy_settings import (
     load_global_proxy_settings,
     normalize_proxy_settings,
 )
+from server.http_client import safe_external_error_detail
+from server.settings_store import get_setting, upsert_setting
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+require_audit_read = require_permission("audit:read")
+require_audit_purge = require_permission("audit:purge")
+require_admin_manage = require_permission("admin_users:manage")
+require_tenants_read = require_permission("tenants:read")
+require_tenants_manage = require_permission("tenants:manage")
+require_settings_read = require_permission("settings:read")
+require_settings_manage = require_permission("settings:manage")
+require_users_read = require_permission("users:read")
+require_users_write = require_permission("users:write")
+require_users_delete = require_permission("users:delete")
+require_tasks_run = require_permission("tasks:run")
+require_batch_read = require_permission("batch:read")
+require_batch_manage = require_permission("batch:manage")
 
 NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org"
 MAPCHAXUN_GEOCODE_URL = "https://www.mapchaxun.cn/api/getSolidAdress"
@@ -54,8 +73,8 @@ def _report_makeup_batch_delay_seconds() -> float:
     return min(value, MAX_REPORT_MAKEUP_BATCH_DELAY_SECONDS)
 
 
-def _notification_settings_row(session: Session) -> SystemSetting | None:
-    return session.get(SystemSetting, NOTIFICATION_SETTINGS_KEY)
+def _notification_settings_row(session: Session, tenant_id: str = DEFAULT_TENANT_ID) -> SystemSetting | None:
+    return get_setting(session, NOTIFICATION_SETTINGS_KEY, tenant_id)
 
 
 def _decode_smtp_settings(raw: Any) -> Dict[str, Any]:
@@ -68,8 +87,8 @@ def _decode_smtp_settings(raw: Any) -> Dict[str, Any]:
     return data
 
 
-def _get_notification_settings(session: Session) -> Dict[str, Any]:
-    row = _notification_settings_row(session)
+def _get_notification_settings(session: Session, tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
+    row = _notification_settings_row(session, tenant_id)
     value = row.value if row and isinstance(row.value, dict) else {}
     smtp = normalize_smtp_settings(_decode_smtp_settings((value or {}).get("smtp")))
     return {"smtp": smtp}
@@ -79,8 +98,8 @@ def _sanitize_notification_settings_for_read(settings: Dict[str, Any]) -> Dict[s
     return {"smtp": normalize_smtp_settings(settings.get("smtp"))}
 
 
-def _save_notification_settings(session: Session, smtp_payload: Dict[str, Any]) -> Dict[str, Any]:
-    current = _get_notification_settings(session)
+def _save_notification_settings(session: Session, smtp_payload: Dict[str, Any], tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
+    current = _get_notification_settings(session, tenant_id)
     smtp = normalize_smtp_settings(smtp_payload, current.get("smtp"))
     if not str(smtp.get("username") or "").strip():
         raise HTTPException(status_code=400, detail="请填写 QQ 邮箱")
@@ -89,65 +108,58 @@ def _save_notification_settings(session: Session, smtp_payload: Dict[str, Any]) 
     if not str(smtp.get("password") or "").strip():
         raise HTTPException(status_code=400, detail="请填写授权码")
 
-    row = _notification_settings_row(session)
-    if not row:
-        row = SystemSetting(key=NOTIFICATION_SETTINGS_KEY, value={})
     stored_smtp = dict(smtp)
     stored_smtp["password"] = encrypt_secret(str(stored_smtp.get("password") or ""))
-    row.value = {"smtp": stored_smtp}
-    session.add(row)
+    upsert_setting(session, NOTIFICATION_SETTINGS_KEY, {"smtp": stored_smtp}, tenant_id)
     return {"smtp": smtp}
 
 
-def _save_proxy_settings(session: Session, proxy_payload: Dict[str, Any]) -> Dict[str, Any]:
+def _save_proxy_settings(session: Session, proxy_payload: Dict[str, Any], tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
     proxy = normalize_proxy_settings(proxy_payload)
     if proxy.get("enabled") and not str(proxy.get("apiUrl") or "").strip() and not str(proxy.get("proxyUrls") or "").strip():
         raise HTTPException(status_code=400, detail="启用代理时请填写动态代理接口或静态代理列表")
-    row = session.get(SystemSetting, PROXY_SETTINGS_KEY)
-    if not row:
-        row = SystemSetting(key=PROXY_SETTINGS_KEY, value={})
-    row.value = encode_proxy_settings(proxy)
-    session.add(row)
+    upsert_setting(session, PROXY_SETTINGS_KEY, encode_proxy_settings(proxy), tenant_id)
     return proxy
 
-def _is_private_or_special_ip(ip: str) -> bool:
-    try:
-        a = ipaddress.ip_address(ip)
-        return bool(
-            a.is_private
-            or a.is_loopback
-            or a.is_link_local
-            or a.is_multicast
-            or a.is_reserved
-            or a.is_unspecified
-        )
-    except Exception:
-        return True
-
 def _is_safe_outbound_url(url: str) -> bool:
-    allow_private = (os.getenv("ALLOW_PRIVATE_AI_TEST") or "").strip().lower() in ["1", "true", "yes", "on"]
-    if allow_private:
-        return True
-    u = urlparse(url)
-    if u.scheme != "https":
-        return False
-    host = (u.hostname or "").strip()
-    if not host:
-        return False
-    if host.lower() == "localhost":
-        return False
-    port = u.port or 443
-    if port != 443:
-        return False
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except Exception:
-        return False
-    for info in infos:
-        ip = info[4][0]
-        if _is_private_or_special_ip(ip):
-            return False
-    return True
+    return is_safe_outbound_url(url, allow_private=env_flag("ALLOW_PRIVATE_AI_TEST"))
+
+
+def _ai_audit_detail(config: ConfigManager, title: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ai_cfg = config.get_value("config.ai")
+    if not isinstance(ai_cfg, dict):
+        ai_cfg = {}
+    detail = {
+        "title": title,
+        "endpoint": _ai_endpoint_detail(str(ai_cfg.get("apiUrl") or "")),
+        "model": str(ai_cfg.get("model") or ""),
+    }
+    if extra:
+        detail.update(extra)
+    return detail
+
+
+def _login_payload(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload)
+    if env_flag("RETURN_AUTH_TOKEN"):
+        data["token"] = token
+    return data
+
+
+def _app_registration_enabled() -> bool:
+    configured = os.getenv("APP_REGISTRATION_ENABLED")
+    if configured is not None:
+        return env_flag("APP_REGISTRATION_ENABLED")
+    return not is_production()
+
+
+def _ensure_app_registration_allowed(session: Session, tenant_id: str) -> None:
+    tenant = require_active_tenant(tenant_id, session=session)
+    if not _app_registration_enabled():
+        raise HTTPException(status_code=403, detail="App registration is disabled")
+    settings = tenant.settings if tenant is not None and isinstance(tenant.settings, dict) else {}
+    if settings.get("registration_enabled") is False:
+        raise HTTPException(status_code=403, detail="App registration is disabled for this tenant")
 
 def _sanitize_user_for_read(user: User) -> Dict[str, Any]:
     data = UserRead.model_validate(user).model_dump()
@@ -170,6 +182,33 @@ def _sanitize_user_for_self(user: User) -> Dict[str, Any]:
     return data
 
 
+def _is_deleted_user(user: User | None) -> bool:
+    return bool(user is not None and getattr(user, "deleted_at", None) is not None)
+
+
+def _tenant_matches(row_tenant_id: Optional[str], expected_tenant_id: str) -> bool:
+    if expected_tenant_id == DEFAULT_TENANT_ID and not row_tenant_id:
+        return True
+    return str(row_tenant_id or "") == expected_tenant_id
+
+
+def _tenant_filter(column, tenant_id: str):
+    if tenant_id == DEFAULT_TENANT_ID:
+        return (column == tenant_id) | (column.is_(None))
+    return column == tenant_id
+
+
+def _get_active_user_or_404(session: Session, user_id: int, tenant_id: str = DEFAULT_TENANT_ID) -> User:
+    user = session.get(User, user_id)
+    if not user or _is_deleted_user(user) or not _tenant_matches(getattr(user, "tenant_id", None), tenant_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def _get_active_user_for_payload(session: Session, user_id: int, payload: dict | None) -> User:
+    return _get_active_user_or_404(session, user_id, tenant_id_from_payload(payload))
+
+
 def _ensure_remote_runtime(api_client: ApiClient, config: ConfigManager) -> None:
     if not runtime_login_valid(config.get_value("userInfo")):
         api_client.login()
@@ -188,6 +227,8 @@ def _get_authed_app_user(*, session: Session, payload: dict) -> AppUser:
             raise HTTPException(status_code=401, detail="未登录或登录已过期")
         if app_user.enabled is not True:
             raise HTTPException(status_code=403, detail="账号已被禁用")
+        if not _tenant_matches(getattr(app_user, "tenant_id", None), tenant_id_from_payload(payload)):
+            raise HTTPException(status_code=401, detail="未登录或登录已过期")
         return app_user
 
     if not sub.startswith("user:"):
@@ -197,15 +238,21 @@ def _get_authed_app_user(*, session: Session, payload: dict) -> AppUser:
     except Exception:
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
     legacy_user = session.get(User, legacy_user_id)
-    if not legacy_user:
+    if not legacy_user or _is_deleted_user(legacy_user):
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
     if legacy_user.app_enabled is not True:
         raise HTTPException(status_code=403, detail="账号已被禁用")
     if not legacy_user.app_password_hash:
         raise HTTPException(status_code=403, detail="账号未启用用户端登录")
-    app_user = session.exec(select(AppUser).where(AppUser.phone == legacy_user.phone)).first()
+    tenant_id = tenant_id_from_payload(payload)
+    if not _tenant_matches(getattr(legacy_user, "tenant_id", None), tenant_id):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    app_user = session.exec(
+        select(AppUser).where((AppUser.tenant_id == tenant_id) & (AppUser.phone == legacy_user.phone))
+    ).first()
     if not app_user:
         app_user = AppUser(
+            tenant_id=tenant_id,
             phone=legacy_user.phone,
             password_hash=legacy_user.app_password_hash,
             enabled=bool(legacy_user.app_enabled),
@@ -222,8 +269,10 @@ def _get_bound_task_user(*, session: Session, app_user: AppUser) -> User:
     if not app_user.bound_user_id:
         raise HTTPException(status_code=403, detail="请先绑定工学云账号")
     user = session.get(User, int(app_user.bound_user_id))
-    if not user:
+    if not user or _is_deleted_user(user):
         raise HTTPException(status_code=403, detail="绑定信息已失效，请重新绑定工学云账号")
+    if not _tenant_matches(getattr(user, "tenant_id", None), str(app_user.tenant_id or DEFAULT_TENANT_ID)):
+        raise HTTPException(status_code=403, detail="Bound task user tenant mismatch")
     return user
 
 def _any_report_enabled(user: User) -> bool:
@@ -237,10 +286,12 @@ def _any_report_enabled(user: User) -> bool:
 class AppRegisterRequest(BaseModel):
     phone: str
     password: str
+    tenant_id: Optional[str] = None
 
 class AppLoginRequest(BaseModel):
     phone: str
     password: str
+    tenant_id: Optional[str] = None
 
 class AppReportSubmitRequest(BaseModel):
     content: str
@@ -249,6 +300,7 @@ class AppReportSubmitRequest(BaseModel):
 class AppMeResponse(BaseModel):
     app_phone: str
     bound: bool
+    tenant_id: str = DEFAULT_TENANT_ID
     task_user: Optional[Dict[str, Any]] = None
 
 class AppRunRequest(BaseModel):
@@ -832,54 +884,137 @@ def _makeup_all_reports_for_user(user: User, report_key: str) -> tuple[Dict[str,
     return result, latest_config_data, target_periods
 
 @router.post("/app/auth/register")
-def app_register(request: Request, req: AppRegisterRequest):
+def app_register(request: Request, response: Response, req: AppRegisterRequest):
     client_ip = get_client_ip(request)
-    _rate_limit(f"app_register:{client_ip}", limit=10, per_seconds=60)
     phone = (req.phone or "").strip()
     password = (req.password or "").strip()
+    tenant_id = str(req.tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+    _rate_limit_login_attempt(
+        scope="app_register",
+        client_ip=client_ip,
+        tenant_id=tenant_id,
+        principal=phone,
+        ip_limit=10,
+        principal_limit=3,
+        per_seconds=60,
+    )
+    password = require_password_strength(password, label="Password")
     if not phone or len(phone) < 4:
         raise HTTPException(status_code=400, detail="请输入正确的手机号/账号")
     if not password or len(password) < 6:
         raise HTTPException(status_code=400, detail="密码长度需为 6-100")
+    if not _app_registration_enabled():
+        raise HTTPException(status_code=403, detail="App registration is disabled")
     with Session(engine) as session:
-        exists = session.exec(select(AppUser).where(AppUser.phone == phone)).first()
+        _ensure_app_registration_allowed(session, tenant_id)
+        exists = session.exec(select(AppUser).where((AppUser.tenant_id == tenant_id) & (AppUser.phone == phone))).first()
         if exists:
             raise HTTPException(status_code=400, detail="该账号已注册")
-        legacy = session.exec(select(User).where(User.phone == phone)).first()
+        legacy = session.exec(select(User).where(_tenant_filter(User.tenant_id, tenant_id) & (User.phone == phone))).first()
         if legacy and legacy.app_password_hash:
             raise HTTPException(status_code=400, detail="该账号已注册")
-        app_user = AppUser(phone=phone, password_hash=hash_password(password), enabled=True, bound_user_id=None)
+        app_user = AppUser(tenant_id=tenant_id, phone=phone, password_hash=hash_password(password), enabled=True, bound_user_id=None)
         session.add(app_user)
         session.flush()
-        session.add(AuditLog(actor=f"app:{app_user.id}", action="app.register", target_user_id=None, detail={}))
+        session.add(AuditLog(tenant_id=tenant_id, actor=f"app:{app_user.id}", action="app.register", target_user_id=None, detail={}))
         session.commit()
-        token = issue_token(subject=f"app:{app_user.id}", role="user")
-        return {"token": token, "user_id": app_user.id, "phone": phone}
+        token = issue_token(
+            subject=f"app:{app_user.id}",
+            role="user",
+            tenant_id=app_user.tenant_id,
+            token_version=app_user.token_version,
+        )
+        set_auth_cookie(response, token, "user")
+        return _login_payload(token, {"user_id": app_user.id, "phone": phone, "tenant_id": app_user.tenant_id})
 
 @router.post("/app/auth/login")
-def app_login(request: Request, req: AppLoginRequest):
+def app_login(request: Request, response: Response, req: AppLoginRequest):
     client_ip = get_client_ip(request)
-    _rate_limit(f"app_login:{client_ip}", limit=15, per_seconds=60)
     phone = (req.phone or "").strip()
     password = (req.password or "").strip()
+    tenant_id = str(req.tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+    _rate_limit_login_attempt(
+        scope="app_login",
+        client_ip=client_ip,
+        tenant_id=tenant_id,
+        principal=phone,
+        ip_limit=15,
+        principal_limit=5,
+        per_seconds=60,
+    )
     with Session(engine) as session:
-        app_user = session.exec(select(AppUser).where(AppUser.phone == phone)).first()
+        require_active_tenant(tenant_id, session=session)
+        app_user = session.exec(select(AppUser).where((AppUser.tenant_id == tenant_id) & (AppUser.phone == phone))).first()
         if app_user:
             if app_user.enabled is not True:
+                _record_login_failure(
+                    session,
+                    tenant_id=tenant_id,
+                    principal=phone,
+                    client_ip=client_ip,
+                    action="app.login.failed",
+                    reason="account_disabled",
+                    account=app_user,
+                    increment=False,
+                )
                 raise HTTPException(status_code=403, detail="账号已被禁用")
+            _raise_if_login_locked(
+                session,
+                app_user,
+                tenant_id=tenant_id,
+                principal=phone,
+                client_ip=client_ip,
+                action="app.login.failed",
+            )
             if not verify_password(password, app_user.password_hash):
+                _record_login_failure(
+                    session,
+                    tenant_id=tenant_id,
+                    principal=phone,
+                    client_ip=client_ip,
+                    action="app.login.failed",
+                    reason="invalid_credentials",
+                    account=app_user,
+                )
                 raise HTTPException(status_code=401, detail="账号或密码错误")
-            token = issue_token(subject=f"app:{app_user.id}", role="user")
-            session.add(AuditLog(actor=f"app:{app_user.id}", action="app.login", target_user_id=None, detail={}))
+            _reset_login_failure_state(app_user)
+            token = issue_token(
+                subject=f"app:{app_user.id}",
+                role="user",
+                tenant_id=app_user.tenant_id,
+                token_version=app_user.token_version,
+            )
+            session.add(app_user)
+            session.add(AuditLog(tenant_id=app_user.tenant_id, actor=f"app:{app_user.id}", action="app.login", target_user_id=None, detail={}))
             session.commit()
-            return {"token": token, "user_id": app_user.id, "phone": phone}
+            set_auth_cookie(response, token, "user")
+            return _login_payload(token, {"user_id": app_user.id, "phone": phone, "tenant_id": app_user.tenant_id})
 
-        legacy_user = session.exec(select(User).where(User.phone == phone)).first()
+        legacy_user = session.exec(select(User).where(_tenant_filter(User.tenant_id, tenant_id) & (User.phone == phone))).first()
         if not legacy_user or legacy_user.app_enabled is not True or not legacy_user.app_password_hash:
+            _record_login_failure(
+                session,
+                tenant_id=tenant_id,
+                principal=phone,
+                client_ip=client_ip,
+                action="app.login.failed",
+                reason="invalid_credentials",
+                increment=False,
+            )
             raise HTTPException(status_code=401, detail="账号或密码错误")
         if not verify_password(password, legacy_user.app_password_hash):
+            _record_login_failure(
+                session,
+                tenant_id=tenant_id,
+                principal=phone,
+                client_ip=client_ip,
+                action="app.login.failed",
+                reason="invalid_credentials",
+                increment=False,
+            )
             raise HTTPException(status_code=401, detail="账号或密码错误")
         app_user = AppUser(
+            tenant_id=tenant_id,
             phone=phone,
             password_hash=legacy_user.app_password_hash,
             enabled=True,
@@ -887,20 +1022,39 @@ def app_login(request: Request, req: AppLoginRequest):
         )
         session.add(app_user)
         session.flush()
-        token = issue_token(subject=f"app:{app_user.id}", role="user")
-        session.add(AuditLog(actor=f"app:{app_user.id}", action="app.login", target_user_id=legacy_user.id, detail={"legacy": True}))
+        token = issue_token(
+            subject=f"app:{app_user.id}",
+            role="user",
+            tenant_id=app_user.tenant_id,
+            token_version=app_user.token_version,
+        )
+        session.add(AuditLog(tenant_id=tenant_id, actor=f"app:{app_user.id}", action="app.login", target_user_id=legacy_user.id, detail={"legacy": True}))
         session.commit()
-        return {"token": token, "user_id": app_user.id, "phone": phone}
+        set_auth_cookie(response, token, "user")
+        return _login_payload(token, {"user_id": app_user.id, "phone": phone, "tenant_id": app_user.tenant_id})
+
+
+@router.post("/app/auth/logout")
+def app_logout(
+    response: Response,
+    session: Session = Depends(get_session),
+    payload: Optional[dict] = Depends(get_optional_auth_payload),
+):
+    if payload and payload.get("role") == "user":
+        revoke_token_subject(payload, session=session)
+    clear_auth_cookie(response, "user")
+    return {"ok": True}
 
 @router.get("/app/me")
 def app_me(*, session: Session = Depends(get_session), payload: dict = Depends(get_user)):
     app_user = _get_authed_app_user(session=session, payload=payload)
     if not app_user.bound_user_id:
-        return AppMeResponse(app_phone=app_user.phone, bound=False, task_user=None)
-    user = session.get(User, int(app_user.bound_user_id))
-    if not user:
-        return AppMeResponse(app_phone=app_user.phone, bound=False, task_user=None)
-    return AppMeResponse(app_phone=app_user.phone, bound=True, task_user=_sanitize_user_for_self(user))
+        return AppMeResponse(app_phone=app_user.phone, bound=False, tenant_id=app_user.tenant_id, task_user=None)
+    try:
+        user = _get_bound_task_user(session=session, app_user=app_user)
+    except HTTPException:
+        return AppMeResponse(app_phone=app_user.phone, bound=False, tenant_id=app_user.tenant_id, task_user=None)
+    return AppMeResponse(app_phone=app_user.phone, bound=True, tenant_id=app_user.tenant_id, task_user=_sanitize_user_for_self(user))
 
 class AppMeUpdateRequest(BaseModel):
     password: Optional[str] = None
@@ -955,9 +1109,16 @@ def app_bind(
                 raise HTTPException(status_code=400, detail="工学云账号验证失败：触发验证码，请稍后再试")
             raise HTTPException(status_code=400, detail="工学云账号或密码错误")
 
-    user = session.exec(select(User).where(User.phone == task_phone)).first()
+    tenant_id = tenant_id_from_payload(payload)
+    user = session.exec(select(User).where(_tenant_filter(User.tenant_id, tenant_id) & (User.phone == task_phone))).first()
     if user:
-        other = session.exec(select(AppUser).where((AppUser.bound_user_id == user.id) & (AppUser.id != app_user.id))).first()
+        other = session.exec(
+            select(AppUser).where(
+                (AppUser.tenant_id == tenant_id)
+                & (AppUser.bound_user_id == user.id)
+                & (AppUser.id != app_user.id)
+            )
+        ).first()
         if other:
             raise HTTPException(status_code=400, detail="该工学云账号已被其他账号绑定")
         user.password = encrypt_secret(task_password)
@@ -965,6 +1126,7 @@ def app_bind(
             user.enable_clockin = True
     else:
         user = User(
+            tenant_id=tenant_id,
             phone=task_phone,
             password=encrypt_secret(task_password),
             remark=None,
@@ -980,7 +1142,7 @@ def app_bind(
         sync_runtime_fields_to_user(user, cfg.config)
     session.add(app_user)
     session.add(user)
-    session.add(AuditLog(actor=str(payload.get("sub")), action="app.bind", target_user_id=user.id, detail={"task_phone": _mask_phone(task_phone)}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=str(payload.get("sub")), action="app.bind", target_user_id=user.id, detail={"task_phone": _mask_phone(task_phone)}))
     session.commit()
     session.refresh(user)
     remove_user_job(user.id)
@@ -1106,7 +1268,7 @@ def app_update_me(
             user.ai = merged_ai
             changed.append("ai")
     session.add(user)
-    session.add(AuditLog(actor=str(payload.get("sub")), action="app.user.update", target_user_id=user.id, detail={"fields": changed}))
+    session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.user.update", target_user_id=user.id, detail={"fields": changed}))
     session.commit()
     session.refresh(user)
     remove_user_job(user.id)
@@ -1137,7 +1299,7 @@ def app_run(
         target_period=req.target_period if req else None,
     )
     status = apply_execution_results_to_user(user, results, config_data)
-    session.add(AuditLog(actor=str(payload.get("sub")), action="app.user.run", target_user_id=user.id, detail={"status": status}))
+    session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.user.run", target_user_id=user.id, detail={"status": status}))
     session.add(user)
     session.commit()
     return {"results": results}
@@ -1185,7 +1347,7 @@ def app_clockin_makeup(
         target_type = _clockin_makeup_type_from_request(req)
         result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=str(payload.get("sub")), action="app.clockin.makeup", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.clockin.makeup", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result}
@@ -1212,7 +1374,7 @@ def app_clockin_makeup_all(
         target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
         result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=str(payload.get("sub")), action="app.clockin.makeup_all", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.clockin.makeup_all", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
@@ -1253,6 +1415,19 @@ def app_generate_report(
     try:
         generated = _generate_report_content_for_user(user, report_key, target_period)
         sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=str(payload.get("sub")),
+                action="app.report.generate",
+                target_user_id=user.id,
+                detail=_ai_audit_detail(
+                    generated["config"],
+                    generated["title"],
+                    {"report_key": report_key, "target_period": target_period},
+                ),
+            )
+        )
         session.add(user)
         session.commit()
         return {"ok": True, "title": generated["title"], "content": generated["content"]}
@@ -1307,7 +1482,7 @@ def app_makeup_all_reports(
     try:
         result, config_data, target_periods = _makeup_all_reports_for_user(user, report_key)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=str(payload.get("sub")), action="app.report.makeup_all", target_user_id=user.id, detail={"report_key": report_key, "target_periods": target_periods, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.report.makeup_all", target_user_id=user.id, detail={"report_key": report_key, "target_periods": target_periods, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result, "target_periods": target_periods, "report_key": report_key}
@@ -1354,14 +1529,22 @@ def app_generate_daily_report(
                     last_time = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                     if last_time.date() == current_time.date():
                         already_submitted = True
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
         job_info = api_client.get_job_info()
         content = generate_article(config, title, job_info, config.get_value("planInfo.planPaper.dayPaperNum"))
         sync_runtime_fields_to_user(user, config_data)
         session.add(user)
-        session.add(AuditLog(actor=str(payload.get("sub")), action="app.report.daily.generate", target_user_id=user.id, detail={"title": title, "already_submitted": already_submitted}))
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=str(payload.get("sub")),
+                action="app.report.daily.generate",
+                target_user_id=user.id,
+                detail=_ai_audit_detail(config, title, {"already_submitted": already_submitted}),
+            )
+        )
         session.commit()
         return {"ok": True, "title": title, "content": content, "already_submitted": already_submitted}
     except HTTPException:
@@ -1403,8 +1586,8 @@ def app_submit_daily_report(
                         raise HTTPException(status_code=400, detail="今天已经提交过日报")
                 except HTTPException:
                     raise
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
         count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
         title = f"第{count}天日报"
@@ -1421,7 +1604,7 @@ def app_submit_daily_report(
         api_client.submit_report(report_info)
         sync_runtime_fields_to_user(user, config_data)
         session.add(user)
-        session.add(AuditLog(actor=str(payload.get("sub")), action="app.report.daily.submit", target_user_id=user.id, detail={"title": title}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.report.daily.submit", target_user_id=user.id, detail={"title": title}))
         session.commit()
         return {"ok": True, "title": title, "submitted_at": report_info["reportTime"]}
     except HTTPException:
@@ -1504,7 +1687,6 @@ class ReportSubmitRequest(BaseModel):
     content: str
     target_period: Optional[str] = None
 
-_RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 _GEOCODE_CACHE: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
 _GEOCODE_LOCK = threading.Lock()
 
@@ -1591,14 +1773,171 @@ def _mapchaxun_address(data: Dict[str, Any]) -> Dict[str, Any]:
     return address
 
 def _rate_limit(key: str, limit: int, per_seconds: int, detail: Optional[str] = None) -> None:
-    now = time.time()
-    bucket = _RATE_LIMIT_BUCKETS.get(key, [])
-    cutoff = now - per_seconds
-    bucket = [t for t in bucket if t >= cutoff]
-    if len(bucket) >= limit:
-        raise HTTPException(status_code=429, detail=detail or "操作过于频繁，请稍后再试")
-    bucket.append(now)
-    _RATE_LIMIT_BUCKETS[key] = bucket
+    check_rate_limit(key, limit, per_seconds, detail)
+
+
+def _rate_limit_principal_digest(tenant_id: str, principal: str) -> str:
+    normalized = f"{tenant_id}:{principal}".strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _rate_limit_login_attempt(
+    *,
+    scope: str,
+    client_ip: str,
+    tenant_id: str,
+    principal: str,
+    ip_limit: int,
+    principal_limit: int,
+    per_seconds: int,
+) -> None:
+    _rate_limit(f"{scope}:ip:{client_ip}", limit=ip_limit, per_seconds=per_seconds)
+    principal_key = _rate_limit_principal_digest(tenant_id or DEFAULT_TENANT_ID, principal or "")
+    _rate_limit(
+        f"{scope}:principal:{tenant_id or DEFAULT_TENANT_ID}:{principal_key}",
+        limit=principal_limit,
+        per_seconds=per_seconds,
+    )
+
+
+def _login_lockout_failures() -> int:
+    return int_env("LOGIN_LOCKOUT_FAILURES", 5, min_value=2, max_value=50)
+
+
+def _login_lockout_seconds() -> int:
+    return int_env("LOGIN_LOCKOUT_SECONDS", 15 * 60, min_value=60, max_value=24 * 60 * 60)
+
+
+def _as_aware_utc(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, datetime.datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+def _login_locked_until(account: Any) -> datetime.datetime | None:
+    locked_until = _as_aware_utc(getattr(account, "locked_until", None))
+    if locked_until and locked_until > utc_now():
+        return locked_until
+    return None
+
+
+def _reset_login_failure_state(account: Any) -> None:
+    if account is None:
+        return
+    if hasattr(account, "failed_login_count"):
+        account.failed_login_count = 0
+    if hasattr(account, "locked_until"):
+        account.locked_until = None
+
+
+def _login_failure_detail(*, tenant_id: str, principal: str, client_ip: str, reason: str, account: Any = None) -> Dict[str, Any]:
+    detail = {
+        "principal_hash": _rate_limit_principal_digest(tenant_id or DEFAULT_TENANT_ID, principal or ""),
+        "client_ip": client_ip,
+        "reason": reason,
+    }
+    if account is not None and hasattr(account, "failed_login_count"):
+        detail["failed_login_count"] = int(getattr(account, "failed_login_count", 0) or 0)
+    locked_until = _login_locked_until(account)
+    if locked_until is not None:
+        detail["locked_until"] = locked_until.isoformat()
+    return detail
+
+
+def _record_login_failure(
+    session: Session,
+    *,
+    tenant_id: str,
+    principal: str,
+    client_ip: str,
+    action: str,
+    reason: str,
+    account: Any = None,
+    increment: bool = True,
+) -> None:
+    if account is not None and increment and hasattr(account, "failed_login_count"):
+        account.failed_login_count = int(getattr(account, "failed_login_count", 0) or 0) + 1
+        if int(account.failed_login_count or 0) >= _login_lockout_failures() and hasattr(account, "locked_until"):
+            account.locked_until = utc_now() + datetime.timedelta(seconds=_login_lockout_seconds())
+        session.add(account)
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id or DEFAULT_TENANT_ID,
+            actor="auth:failed",
+            action=action,
+            target_user_id=None,
+            detail=_login_failure_detail(
+                tenant_id=tenant_id,
+                principal=principal,
+                client_ip=client_ip,
+                reason=reason,
+                account=account,
+            ),
+        )
+    )
+    session.commit()
+
+
+def _raise_if_login_locked(session: Session, account: Any, *, tenant_id: str, principal: str, client_ip: str, action: str) -> None:
+    if _login_locked_until(account) is None:
+        return
+    _record_login_failure(
+        session,
+        tenant_id=tenant_id,
+        principal=principal,
+        client_ip=client_ip,
+        action=action,
+        reason="account_locked",
+        account=account,
+        increment=False,
+    )
+    raise HTTPException(status_code=423, detail="Account is temporarily locked")
+
+
+def _current_admin_user(session: Session, payload: dict) -> AdminUser:
+    username = str((payload or {}).get("sub") or "")
+    tenant_id = tenant_id_from_payload(payload)
+    if not username or username.startswith("app:") or str((payload or {}).get("role") or "") == "user":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    user = session.exec(
+        select(AdminUser).where((AdminUser.tenant_id == tenant_id) & (AdminUser.username == username))
+    ).first()
+    if not user or user.enabled is not True:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
+
+def _admin_mfa_secret(user: AdminUser) -> str:
+    raw = str(getattr(user, "mfa_totp_secret", None) or "")
+    if not raw:
+        return ""
+    try:
+        return decrypt_secret(raw)
+    except Exception:
+        return ""
+
+
+def _record_mfa_failure(
+    session: Session,
+    *,
+    tenant_id: str,
+    username: str,
+    client_ip: str,
+    user: AdminUser,
+    reason: str,
+) -> None:
+    _record_login_failure(
+        session,
+        tenant_id=tenant_id,
+        principal=username,
+        client_ip=client_ip,
+        action="auth.mfa.failed",
+        reason=reason,
+        account=user,
+    )
+
 
 def _ensure_clockin_schedule_defaults(user: User):
     if not isinstance(user.clockIn, dict):
@@ -1624,6 +1963,21 @@ def _ensure_clockin_schedule_defaults(user: User):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    tenant_id: Optional[str] = None
+    mfa_code: Optional[str] = None
+
+
+class MfaCodeRequest(BaseModel):
+    code: str
+
+
+class MfaSetupRequest(BaseModel):
+    password: str
+
+
+class MfaDisableRequest(BaseModel):
+    password: str
+    code: Optional[str] = None
 
 
 class NotificationSettingsUpdateRequest(BaseModel):
@@ -1638,22 +1992,226 @@ class ProxySettingsUpdateRequest(BaseModel):
     proxy: Dict[str, Any]
 
 @router.post("/auth/login")
-def admin_login(request: Request, req: LoginRequest):
+def admin_login(request: Request, response: Response, req: LoginRequest):
     client_ip = get_client_ip(request)
-    _rate_limit(f"login:{client_ip}", limit=10, per_seconds=60)
     username = (req.username or "").strip()
     password = (req.password or "").strip()
+    tenant_id = str(req.tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+    _rate_limit_login_attempt(
+        scope="admin_login",
+        client_ip=client_ip,
+        tenant_id=tenant_id,
+        principal=username,
+        ip_limit=10,
+        principal_limit=5,
+        per_seconds=60,
+    )
     with Session(engine) as session:
-        user = session.exec(select(AdminUser).where(AdminUser.username == username)).first()
+        require_active_tenant(tenant_id, session=session)
+        user = session.exec(
+            select(AdminUser).where((AdminUser.tenant_id == tenant_id) & (AdminUser.username == username))
+        ).first()
         if not user or not user.enabled:
+            _record_login_failure(
+                session,
+                tenant_id=tenant_id,
+                principal=username,
+                client_ip=client_ip,
+                action="auth.login.failed",
+                reason="invalid_credentials",
+                account=user if user is not None else None,
+                increment=False,
+            )
             raise HTTPException(status_code=401, detail="账号或密码错误")
+        _raise_if_login_locked(
+            session,
+            user,
+            tenant_id=tenant_id,
+            principal=username,
+            client_ip=client_ip,
+            action="auth.login.failed",
+        )
         if not verify_password(password, user.password_hash):
+            _record_login_failure(
+                session,
+                tenant_id=tenant_id,
+                principal=username,
+                client_ip=client_ip,
+                action="auth.login.failed",
+                reason="invalid_credentials",
+                account=user,
+            )
             raise HTTPException(status_code=401, detail="账号或密码错误")
+        if user.mfa_enabled is True:
+            mfa_secret = _admin_mfa_secret(user)
+            if not mfa_secret or not verify_totp_code(mfa_secret, req.mfa_code or ""):
+                _record_mfa_failure(
+                    session,
+                    tenant_id=tenant_id,
+                    username=username,
+                    client_ip=client_ip,
+                    user=user,
+                    reason="invalid_mfa_code" if req.mfa_code else "mfa_required",
+                )
+                raise HTTPException(status_code=401, detail="MFA code is required")
+        _reset_login_failure_state(user)
         role = user.role or "viewer"
-        token = issue_token(subject=username, role=role)
-        session.add(AuditLog(actor=username, action="auth.login", target_user_id=None, detail={"role": role}))
+        token = issue_token(subject=username, role=role, tenant_id=user.tenant_id, token_version=user.token_version)
+        session.add(user)
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=username, action="auth.login", target_user_id=None, detail={"role": role}))
         session.commit()
-        return {"token": token, "role": role, "username": username}
+        set_auth_cookie(response, token, role)
+        return _login_payload(token, {"role": role, "username": username, "tenant_id": user.tenant_id})
+
+
+@router.get("/auth/me")
+def admin_me(payload: dict = Depends(require_audit_read)):
+    role = str(payload.get("role") or "")
+    return {
+        "username": str(payload.get("sub") or ""),
+        "role": role,
+        "tenant_id": tenant_id_from_payload(payload),
+        "permissions": sorted(permissions_for_payload(payload)),
+    }
+
+
+@router.post("/auth/mfa/setup")
+def admin_mfa_setup(
+    req: MfaSetupRequest,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(require_audit_read),
+):
+    if "admin_users:manage" not in permissions_for_payload(payload):
+        raise HTTPException(status_code=403, detail="权限不足")
+    user = _current_admin_user(session, payload)
+    if not verify_password(req.password, user.password_hash):
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=user.username,
+                action="auth.mfa.setup.failed",
+                target_user_id=None,
+                detail={"reason": "invalid_password"},
+            )
+        )
+        session.commit()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    secret = _admin_mfa_secret(user)
+    if not secret or user.mfa_enabled is not True:
+        secret = generate_totp_secret()
+        user.mfa_totp_secret = encrypt_secret(secret)
+        user.mfa_enabled = False
+        user.mfa_confirmed_at = None
+        session.add(user)
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=user.username,
+                action="auth.mfa.setup",
+                target_user_id=None,
+                detail={},
+            )
+        )
+        session.commit()
+    return {
+        "mfa_enabled": bool(user.mfa_enabled),
+        "secret": secret,
+        "otpauth_uri": totp_uri(secret, issuer="AutoMoGuDing", account_name=f"{user.tenant_id}:{user.username}"),
+    }
+
+
+@router.get("/auth/mfa/status")
+def admin_mfa_status(
+    session: Session = Depends(get_session),
+    payload: dict = Depends(require_audit_read),
+):
+    user = _current_admin_user(session, payload)
+    return {
+        "mfa_enabled": bool(user.mfa_enabled),
+        "mfa_confirmed_at": user.mfa_confirmed_at,
+        "mfa_pending_setup": bool(_admin_mfa_secret(user) and user.mfa_enabled is not True),
+    }
+
+
+@router.post("/auth/mfa/enable")
+def admin_mfa_enable(
+    req: MfaCodeRequest,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(require_audit_read),
+):
+    user = _current_admin_user(session, payload)
+    secret = _admin_mfa_secret(user)
+    if not secret:
+        raise HTTPException(status_code=400, detail="MFA setup is required")
+    if not verify_totp_code(secret, req.code):
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=user.username,
+                action="auth.mfa.enable.failed",
+                target_user_id=None,
+                detail={},
+            )
+        )
+        session.commit()
+        raise HTTPException(status_code=400, detail="Invalid MFA code")
+    user.mfa_enabled = True
+    user.mfa_confirmed_at = utc_now()
+    user.token_version = int(user.token_version or 0) + 1
+    session.add(user)
+    session.add(
+        AuditLog(
+            tenant_id=user.tenant_id,
+            actor=user.username,
+            action="auth.mfa.enable",
+            target_user_id=None,
+            detail={},
+        )
+    )
+    session.commit()
+    return {"mfa_enabled": True}
+
+
+@router.post("/auth/mfa/disable")
+def admin_mfa_disable(
+    req: MfaDisableRequest,
+    session: Session = Depends(get_session),
+    payload: dict = Depends(require_audit_read),
+):
+    user = _current_admin_user(session, payload)
+    if not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    secret = _admin_mfa_secret(user)
+    if user.mfa_enabled is True and (not secret or not verify_totp_code(secret, req.code or "")):
+        raise HTTPException(status_code=400, detail="Invalid MFA code")
+    user.mfa_enabled = False
+    user.mfa_totp_secret = None
+    user.mfa_confirmed_at = None
+    user.token_version = int(user.token_version or 0) + 1
+    session.add(user)
+    session.add(
+        AuditLog(
+            tenant_id=user.tenant_id,
+            actor=user.username,
+            action="auth.mfa.disable",
+            target_user_id=None,
+            detail={},
+        )
+    )
+    session.commit()
+    return {"mfa_enabled": False}
+
+
+@router.post("/auth/logout")
+def admin_logout(
+    response: Response,
+    session: Session = Depends(get_session),
+    payload: Optional[dict] = Depends(get_optional_auth_payload),
+):
+    if payload and payload.get("role") != "user":
+        revoke_token_subject(payload, session=session)
+    clear_auth_cookie(response, "admin")
+    return {"ok": True}
 
 class AuditLogPageResponse(BaseModel):
     items: List[Dict[str, Any]]
@@ -1665,12 +2223,13 @@ class AuditLogPageResponse(BaseModel):
 def read_audit_logs_page(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_audit_read),
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=200),
     q: Optional[str] = Query(None, max_length=60),
 ):
-    stmt = select(AuditLog)
+    tenant_id = tenant_id_from_payload(admin)
+    stmt = select(AuditLog).where(_tenant_filter(AuditLog.tenant_id, tenant_id))
     if q:
         qq = q.strip()
         stmt = stmt.where((AuditLog.actor.contains(qq)) | (AuditLog.action.contains(qq)))
@@ -1696,12 +2255,24 @@ def read_audit_logs_page(
 def clear_audit_logs(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_audit_purge),
 ):
-    rows = session.exec(select(AuditLog)).all()
+    if not env_flag("ALLOW_AUDIT_LOG_PURGE"):
+        raise HTTPException(status_code=403, detail="Audit log purge is disabled")
+    tenant_id = tenant_id_from_payload(admin)
+    rows = session.exec(select(AuditLog).where(_tenant_filter(AuditLog.tenant_id, tenant_id))).all()
     deleted = len(rows)
     for row in rows:
         session.delete(row)
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id,
+            actor=str(admin.get("sub") or "admin"),
+            action="audit.purge",
+            target_user_id=None,
+            detail={"deleted": deleted},
+        )
+    )
     session.commit()
     return {"ok": True, "deleted": deleted}
 
@@ -1710,21 +2281,23 @@ def clear_audit_logs(
 def get_notification_settings(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_settings_read),
 ):
-    return _sanitize_notification_settings_for_read(_get_notification_settings(session))
+    return _sanitize_notification_settings_for_read(_get_notification_settings(session, tenant_id_from_payload(admin)))
 
 
 @router.patch("/settings/notifications")
 def update_notification_settings(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_settings_manage),
     req: NotificationSettingsUpdateRequest,
 ):
-    settings = _save_notification_settings(session, req.smtp)
+    tenant_id = tenant_id_from_payload(admin)
+    settings = _save_notification_settings(session, req.smtp, tenant_id)
     session.add(
         AuditLog(
+            tenant_id=tenant_id,
             actor=admin.get("sub"),
             action="settings.notifications.update",
             target_user_id=None,
@@ -1738,7 +2311,7 @@ def update_notification_settings(
 @router.post("/settings/notifications/smtp/test")
 def test_notification_smtp(
     *,
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_settings_manage),
     req: NotificationSettingsTestRequest,
 ):
     smtp = normalize_smtp_settings(req.smtp)
@@ -1755,21 +2328,24 @@ def test_notification_smtp(
 @router.get("/settings/proxy")
 def get_proxy_settings(
     *,
-    admin: dict = Depends(get_admin),
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_settings_read),
 ):
-    return {"proxy": load_global_proxy_settings()}
+    return {"proxy": load_global_proxy_settings(tenant_id=tenant_id_from_payload(admin))}
 
 
 @router.patch("/settings/proxy")
 def update_proxy_settings(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_settings_manage),
     req: ProxySettingsUpdateRequest,
 ):
-    proxy = _save_proxy_settings(session, req.proxy)
+    tenant_id = tenant_id_from_payload(admin)
+    proxy = _save_proxy_settings(session, req.proxy, tenant_id)
     session.add(
         AuditLog(
+            tenant_id=tenant_id,
             actor=admin.get("sub"),
             action="settings.proxy.update",
             target_user_id=None,
@@ -1797,16 +2373,177 @@ class AdminUserPageResponse(BaseModel):
     page: int
     pageSize: int
 
-@router.get("/admin-users/page", response_model=AdminUserPageResponse)
-def read_admin_users_page(
+
+ADMIN_ROLES = {"admin", "operator", "viewer"}
+
+
+def _normalize_admin_role(role: str) -> str:
+    normalized = str(role or "viewer").strip().lower() or "viewer"
+    if normalized not in ADMIN_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid admin role")
+    return normalized
+
+
+class TenantCreateRequest(BaseModel):
+    id: str
+    name: str
+    settings: Dict[str, Any] = PydanticField(default_factory=dict)
+
+
+class TenantUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    status: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+
+
+class TenantPageResponse(BaseModel):
+    items: List[Dict[str, Any]]
+    total: int
+    page: int
+    pageSize: int
+
+
+def _tenant_to_dict(tenant: Tenant) -> Dict[str, Any]:
+    return {
+        "id": tenant.id,
+        "name": tenant.name,
+        "status": tenant.status,
+        "created_at": tenant.created_at.isoformat(sep=" ", timespec="seconds"),
+        "settings": tenant.settings or {},
+    }
+
+
+def _normalize_tenant_id(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}", value):
+        raise HTTPException(status_code=400, detail="Tenant id must be 2-64 chars: lowercase letters, digits, '-' or '_'")
+    return value
+
+
+def _require_platform_tenant_admin(payload: dict) -> None:
+    if tenant_id_from_payload(payload) != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=403, detail="Tenant management is restricted to the default tenant")
+
+
+@router.get("/tenants/page", response_model=TenantPageResponse)
+def read_tenants_page(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_tenants_read),
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=200),
     q: Optional[str] = Query(None, max_length=60),
 ):
-    stmt = select(AdminUser).where(AdminUser.role == "admin")
+    _require_platform_tenant_admin(admin)
+    if not isinstance(page, int):
+        page = 1
+    if not isinstance(pageSize, int):
+        pageSize = 20
+    if not isinstance(q, str):
+        q = None
+    stmt = select(Tenant)
+    if q:
+        qq = q.strip()
+        stmt = stmt.where((Tenant.id.contains(qq)) | (Tenant.name.contains(qq)))
+    total = session.exec(select(func.count()).select_from(stmt.subquery())).one()
+    rows = session.exec(
+        stmt.order_by(Tenant.id.asc()).offset((page - 1) * pageSize).limit(pageSize)
+    ).all()
+    return {
+        "items": [_tenant_to_dict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "pageSize": pageSize,
+    }
+
+
+@router.post("/tenants")
+def create_tenant(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_tenants_manage),
+    req: TenantCreateRequest,
+):
+    _require_platform_tenant_admin(admin)
+    tenant_id = _normalize_tenant_id(req.id)
+    if session.get(Tenant, tenant_id):
+        raise HTTPException(status_code=409, detail="Tenant already exists")
+    name = str(req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tenant name is required")
+    tenant = Tenant(id=tenant_id, name=name, status="active", settings=req.settings or {})
+    session.add(tenant)
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id_from_payload(admin),
+            actor=str(admin.get("sub") or "admin"),
+            action="tenant.create",
+            target_user_id=None,
+            detail={"tenant_id": tenant_id, "name": name},
+        )
+    )
+    session.commit()
+    session.refresh(tenant)
+    return _tenant_to_dict(tenant)
+
+
+@router.patch("/tenants/{tenant_id}")
+def update_tenant(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_tenants_manage),
+    tenant_id: str,
+    req: TenantUpdateRequest,
+):
+    _require_platform_tenant_admin(admin)
+    normalized_id = _normalize_tenant_id(tenant_id)
+    tenant = session.get(Tenant, normalized_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    changed: List[str] = []
+    if req.name is not None:
+        name = str(req.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Tenant name is required")
+        tenant.name = name
+        changed.append("name")
+    if req.status is not None:
+        status = str(req.status or "").strip().lower()
+        if status not in {"active", "disabled"}:
+            raise HTTPException(status_code=400, detail="Tenant status must be active or disabled")
+        if normalized_id == DEFAULT_TENANT_ID and status == "disabled":
+            raise HTTPException(status_code=400, detail="Default tenant cannot be disabled")
+        tenant.status = status
+        changed.append("status")
+    if req.settings is not None:
+        tenant.settings = req.settings
+        changed.append("settings")
+    session.add(tenant)
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id_from_payload(admin),
+            actor=str(admin.get("sub") or "admin"),
+            action="tenant.update",
+            target_user_id=None,
+            detail={"tenant_id": normalized_id, "fields": changed},
+        )
+    )
+    session.commit()
+    session.refresh(tenant)
+    return _tenant_to_dict(tenant)
+
+
+@router.get("/admin-users/page", response_model=AdminUserPageResponse)
+def read_admin_users_page(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_manage),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=200),
+    q: Optional[str] = Query(None, max_length=60),
+):
+    tenant_id = tenant_id_from_payload(admin)
+    stmt = select(AdminUser).where(_tenant_filter(AdminUser.tenant_id, tenant_id))
     if q:
         qq = q.strip()
         stmt = stmt.where(AdminUser.username.contains(qq))
@@ -1830,39 +2567,101 @@ def read_admin_users_page(
 def create_admin_user(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_admin_manage),
     req: AdminUserCreateRequest,
 ):
-    raise HTTPException(status_code=400, detail="该管理平台仅保留管理员账号，此功能已禁用")
+    tenant_id = tenant_id_from_payload(admin)
+    username = str(req.username or "").strip()
+    if not username or username.startswith("app:") or len(username) > 64:
+        raise HTTPException(status_code=400, detail="Invalid username")
+    role = _normalize_admin_role(req.role)
+    password = require_password_strength(str(req.password or "").strip(), min_length=12, label="Admin password")
+    existing = session.exec(
+        select(AdminUser).where((AdminUser.tenant_id == tenant_id) & (AdminUser.username == username))
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Admin user already exists")
+    user = AdminUser(
+        tenant_id=tenant_id,
+        username=username,
+        password_hash=hash_password(password),
+        role=role,
+        enabled=True,
+    )
+    session.add(user)
+    session.flush()
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id,
+            actor=admin.get("sub"),
+            action="admin_user.create",
+            target_user_id=None,
+            detail={"id": user.id, "username": username, "role": role},
+        )
+    )
+    session.commit()
+    session.refresh(user)
+    return {
+        "id": user.id,
+        "created_at": user.created_at.isoformat(sep=" ", timespec="seconds"),
+        "username": user.username,
+        "role": user.role,
+        "enabled": user.enabled,
+    }
 
 @router.patch("/admin-users/{admin_user_id}")
 def update_admin_user(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_admin_manage),
     admin_user_id: int,
     req: AdminUserUpdateRequest,
 ):
+    tenant_id = tenant_id_from_payload(admin)
     user = session.get(AdminUser, admin_user_id)
+    if user and not _tenant_matches(getattr(user, "tenant_id", None), tenant_id):
+        user = None
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     changed: List[str] = []
-    if user.role != "admin":
-        raise HTTPException(status_code=400, detail="仅允许管理管理员账号")
     if req.role is not None:
-        raise HTTPException(status_code=400, detail="不允许修改角色")
+        role = _normalize_admin_role(req.role)
+        if user.role == "admin" and role != "admin":
+            enabled_admins = session.exec(
+                select(func.count())
+                .select_from(AdminUser)
+                .where(
+                    (AdminUser.tenant_id == tenant_id)
+                    & (AdminUser.role == "admin")
+                    & (AdminUser.enabled == True)
+                )
+            ).one()
+            if enabled_admins <= 1 and user.enabled is True:
+                raise HTTPException(status_code=400, detail="至少保留一个启用的管理员")
+        if user.role != role:
+            user.role = role
+            user.token_version = int(user.token_version or 0) + 1
+        changed.append("role")
     if req.enabled is not None:
         enabled = bool(req.enabled)
         if not enabled and user.role == "admin":
             enabled_admins = session.exec(
-                select(func.count()).select_from(AdminUser).where((AdminUser.role == "admin") & (AdminUser.enabled == True))
+                select(func.count())
+                .select_from(AdminUser)
+                .where(
+                    (AdminUser.tenant_id == tenant_id)
+                    & (AdminUser.role == "admin")
+                    & (AdminUser.enabled == True)
+                )
             ).one()
             if enabled_admins <= 1:
                 raise HTTPException(status_code=400, detail="至少保留一个启用的管理员")
-        user.enabled = enabled
+        if user.enabled != enabled:
+            user.enabled = enabled
+            user.token_version = int(user.token_version or 0) + 1
         changed.append("enabled")
     session.add(user)
-    session.add(AuditLog(actor=admin.get("sub"), action="admin_user.update", target_user_id=None, detail={"id": admin_user_id, "fields": changed}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=admin.get("sub"), action="admin_user.update", target_user_id=None, detail={"id": admin_user_id, "fields": changed}))
     session.commit()
     return {"ok": True}
 
@@ -1870,33 +2669,37 @@ def update_admin_user(
 def reset_admin_user_password(
     *,
     session: Session = Depends(get_session),
-    admin: dict = Depends(get_admin),
+    admin: dict = Depends(require_admin_manage),
     admin_user_id: int,
     req: AdminUserResetPasswordRequest,
 ):
+    tenant_id = tenant_id_from_payload(admin)
     user = session.get(AdminUser, admin_user_id)
+    if user and not _tenant_matches(getattr(user, "tenant_id", None), tenant_id):
+        user = None
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.role != "admin":
-        raise HTTPException(status_code=400, detail="仅允许管理管理员账号")
     password = (req.password or "").strip()
     if not password or len(password) < 6 or len(password) > 100:
         raise HTTPException(status_code=400, detail="密码长度需为 6-100")
+    password = require_password_strength(password, min_length=12, label="Admin password")
     user.password_hash = hash_password(password)
+    user.token_version = int(user.token_version or 0) + 1
     session.add(user)
-    session.add(AuditLog(actor=admin.get("sub"), action="admin_user.reset_password", target_user_id=None, detail={"id": admin_user_id, "username": user.username}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=admin.get("sub"), action="admin_user.reset_password", target_user_id=None, detail={"id": admin_user_id, "username": user.username}))
     session.commit()
     return {"ok": True}
 
 @router.post("/users", response_model=UserRead)
-def create_user(*, session: Session = Depends(get_session), user: UserCreate, operator: dict = Depends(get_operator)):
-    db_user = User.from_orm(user)
+def create_user(*, session: Session = Depends(get_session), user: UserCreate, operator: dict = Depends(require_users_write)):
+    db_user = User.model_validate(user)
+    db_user.tenant_id = tenant_id_from_payload(operator)
     db_user.password = encrypt_secret(db_user.password)
     db_user.pushNotifications = normalize_push_notifications(db_user.pushNotifications)
     _ensure_clockin_schedule_defaults(db_user)
     session.add(db_user)
     session.flush()
-    session.add(AuditLog(actor=operator.get("sub"), action="user.create", target_user_id=db_user.id, detail={"phone": db_user.phone}))
+    session.add(AuditLog(tenant_id=db_user.tenant_id, actor=operator.get("sub"), action="user.create", target_user_id=db_user.id, detail={"phone": db_user.phone}))
     session.commit()
     session.refresh(db_user)
     if db_user.enable_clockin or _any_report_enabled(db_user):
@@ -1904,8 +2707,21 @@ def create_user(*, session: Session = Depends(get_session), user: UserCreate, op
     return _sanitize_user_for_read(db_user)
 
 @router.get("/users", response_model=List[UserRead])
-def read_users(*, session: Session = Depends(get_session), admin: dict = Depends(get_admin)):
-    users = session.exec(select(User)).all()
+def read_users(
+    *,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_users_read),
+    limit: int = Query(200, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    tenant_id = tenant_id_from_payload(admin)
+    users = session.exec(
+        select(User)
+        .where(_tenant_filter(User.tenant_id, tenant_id) & (User.deleted_at.is_(None)))
+        .order_by(User.id.asc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
     return [_sanitize_user_for_read(u) for u in users]
 
 class UserPageResponse(BaseModel):
@@ -1919,19 +2735,21 @@ class UserPageResponse(BaseModel):
 def read_users_page(
     *,
     session: Session = Depends(get_session),
-    viewer: dict = Depends(get_viewer),
+    viewer: dict = Depends(require_users_read),
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=200),
     q: Optional[str] = Query(None, min_length=1, max_length=50),
 ):
+    tenant_id = tenant_id_from_payload(viewer)
     cond = None
     if q:
         qq = q.strip()
-        cond = (User.phone.contains(qq)) | (func.coalesce(User.remark, "").contains(qq))
+        cond = ((User.phone.contains(qq)) | (func.coalesce(User.remark, "").contains(qq))) & (User.deleted_at.is_(None)) & _tenant_filter(User.tenant_id, tenant_id)
+    else:
+        cond = (User.deleted_at.is_(None)) & _tenant_filter(User.tenant_id, tenant_id)
 
     count_stmt = select(func.count()).select_from(User)
-    if cond is not None:
-        count_stmt = count_stmt.where(cond)
+    count_stmt = count_stmt.where(cond)
     total = session.exec(count_stmt).one()
 
     stmt = select(
@@ -1943,8 +2761,7 @@ def read_users_page(
         User.last_status,
         User.logs,
     )
-    if cond is not None:
-        stmt = stmt.where(cond)
+    stmt = stmt.where(cond)
     rows = session.exec(
         stmt.order_by(User.id.desc()).offset((page - 1) * pageSize).limit(pageSize)
     ).all()
@@ -1963,15 +2780,15 @@ def read_users_page(
     return {"items": items, "total": total, "page": page, "pageSize": pageSize, "q": q}
 
 @router.get("/users/{user_id}", response_model=UserRead)
-def read_user(*, session: Session = Depends(get_session), user_id: int, viewer: dict = Depends(get_viewer)):
-    user = session.get(User, user_id)
+def read_user(*, session: Session = Depends(get_session), user_id: int, viewer: dict = Depends(require_users_read)):
+    user = _get_active_user_for_payload(session, user_id, viewer)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return _sanitize_user_for_read(user)
 
 @router.get("/users/{user_id}/execution")
-def read_user_execution(*, session: Session = Depends(get_session), user_id: int, viewer: dict = Depends(get_viewer)):
-    user = session.get(User, user_id)
+def read_user_execution(*, session: Session = Depends(get_session), user_id: int, viewer: dict = Depends(require_users_read)):
+    user = _get_active_user_for_payload(session, user_id, viewer)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"results": user.last_execution_result or []}
@@ -1982,13 +2799,11 @@ def read_user_job_info(
     request: Request,
     session: Session = Depends(get_session),
     user_id: int,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_read),
 ):
     client_ip = get_client_ip(request)
     _rate_limit(f"job_info:{client_ip}:{user_id}", limit=3, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法自动获取岗位信息")
 
@@ -2038,13 +2853,11 @@ def read_user_account_address(
     request: Request,
     session: Session = Depends(get_session),
     user_id: int,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_read),
 ):
     client_ip = get_client_ip(request)
     _rate_limit(f"account_addr:{client_ip}:{user_id}", limit=3, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法自动获取账号地址")
 
@@ -2118,13 +2931,11 @@ def read_user_clockin_missing_days(
     request: Request,
     session: Session = Depends(get_session),
     user_id: int,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_read),
 ):
     client_ip = get_client_ip(request)
     _rate_limit(f"clockin_missing:{client_ip}:{user_id}", limit=10, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         return _get_missing_clockin_days_for_user(user)
     except HTTPException:
@@ -2140,19 +2951,17 @@ def makeup_user_clockin(
     session: Session = Depends(get_session),
     user_id: int,
     req: ClockInMakeupRequest,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
     _rate_limit(f"clockin_makeup:{client_ip}:{user_id}", limit=3, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         target_dates = _clockin_makeup_dates_from_request(req)
         target_type = _clockin_makeup_type_from_request(req)
         result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=operator.get("sub"), action="user.clockin.makeup", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.clockin.makeup", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result}
@@ -2170,18 +2979,16 @@ def makeup_all_user_clockin(
     session: Session = Depends(get_session),
     user_id: int,
     req: Optional[ClockInMakeupRequest] = None,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
     _rate_limit(f"clockin_makeup_all:{client_ip}:{user_id}", limit=2, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
         result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=operator.get("sub"), action="user.clockin.makeup_all", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.clockin.makeup_all", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
@@ -2192,10 +2999,8 @@ def makeup_all_user_clockin(
         raise HTTPException(status_code=400, detail=str(e) or "全部补卡失败")
 
 @router.patch("/users/{user_id}", response_model=UserRead)
-def update_user(*, session: Session = Depends(get_session), user_id: int, user_update: UserUpdate, operator: dict = Depends(get_operator)):
-    db_user = session.get(User, user_id)
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User not found")
+def update_user(*, session: Session = Depends(get_session), user_id: int, user_update: UserUpdate, operator: dict = Depends(require_users_write)):
+    db_user = _get_active_user_for_payload(session, user_id, operator)
 
     user_data = user_update.dict(exclude_unset=True)
     if "password" in user_data:
@@ -2219,7 +3024,7 @@ def update_user(*, session: Session = Depends(get_session), user_id: int, user_u
     _ensure_clockin_schedule_defaults(db_user)
 
     session.add(db_user)
-    session.add(AuditLog(actor=operator.get("sub"), action="user.update", target_user_id=user_id, detail={"fields": list(user_data.keys())}))
+    session.add(AuditLog(tenant_id=db_user.tenant_id, actor=operator.get("sub"), action="user.update", target_user_id=user_id, detail={"fields": list(user_data.keys())}))
     session.commit()
     session.refresh(db_user)
 
@@ -2230,14 +3035,21 @@ def update_user(*, session: Session = Depends(get_session), user_id: int, user_u
     return _sanitize_user_for_read(db_user)
 
 @router.delete("/users/{user_id}")
-def delete_user(*, session: Session = Depends(get_session), user_id: int, admin: dict = Depends(get_admin)):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+def delete_user(*, session: Session = Depends(get_session), user_id: int, admin: dict = Depends(require_users_delete)):
+    user = _get_active_user_or_404(session, user_id, tenant_id_from_payload(admin))
 
     remove_user_job(user_id)
-    session.delete(user)
-    session.add(AuditLog(actor=admin.get("sub"), action="user.delete", target_user_id=user_id, detail={}))
+    user.deleted_at = utc_now()
+    user.deleted_by = str(admin.get("sub") or "admin")
+    user.delete_reason = "admin_delete"
+    user.enable_clockin = False
+    user.app_enabled = False
+    for app_user in session.exec(select(AppUser).where(AppUser.bound_user_id == user_id)).all():
+        app_user.enabled = False
+        app_user.token_version = int(app_user.token_version or 0) + 1
+        session.add(app_user)
+    session.add(user)
+    session.add(AuditLog(tenant_id=user.tenant_id, actor=admin.get("sub"), action="user.soft_delete", target_user_id=user_id, detail={}))
     session.commit()
     return {"ok": True}
 
@@ -2248,14 +3060,12 @@ def run_user_task(
     session: Session = Depends(get_session),
     user_id: int,
     req: Optional[AppRunRequest] = None,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
     if _should_rate_limit_run_request(req):
         _rate_limit(f"run:{client_ip}:{user_id}", limit=2, per_seconds=60)
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
 
     config_data = user_to_config(user)
     specific_task_type = req.task_type if req else None
@@ -2267,7 +3077,7 @@ def run_user_task(
     )
     status = apply_execution_results_to_user(user, results, config_data)
 
-    session.add(AuditLog(actor=operator.get("sub"), action="user.run", target_user_id=user_id, detail={"status": status}))
+    session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.run", target_user_id=user_id, detail={"status": status}))
     session.add(user)
     session.commit()
 
@@ -2278,29 +3088,52 @@ class BatchRunRequest(BaseModel):
     concurrency: int = 5
 
 @router.post("/users/run/batch")
-def run_users_batch(*, request: Request, req: BatchRunRequest, operator: dict = Depends(get_operator)):
+def run_users_batch(*, request: Request, req: BatchRunRequest, operator: dict = Depends(require_batch_manage)):
     client_ip = get_client_ip(request)
     _rate_limit(f"run_batch:{client_ip}", limit=1, per_seconds=10)
-    ids = [int(x) for x in (req.ids or []) if int(x) > 0]
+    try:
+        ids = [int(x) for x in (req.ids or []) if int(x) > 0]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id list")
     if not ids:
         raise HTTPException(status_code=400, detail="请选择要运行的账号")
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=400, detail="Duplicate user ids are not allowed")
+    max_users = int_env("BATCH_JOB_MAX_USERS", 200, min_value=1, max_value=5000)
+    if len(ids) > max_users:
+        raise HTTPException(status_code=400, detail=f"Batch job cannot include more than {max_users} users")
     max_concurrency = int(os.getenv("BATCH_JOB_MAX_CONCURRENCY") or "10")
     max_concurrency = max(1, min(max_concurrency, 50))
     concurrency = max(1, min(int(req.concurrency or 5), max_concurrency))
     with Session(engine) as session:
-        job = BatchJob(created_by=operator.get("sub"), total=len(ids), concurrency=concurrency, user_ids=ids, status="queued")
+        tenant_id = tenant_id_from_payload(operator)
+        active_limit = int_env("BATCH_TENANT_MAX_ACTIVE_JOBS", 5, min_value=1, max_value=100)
+        active_jobs = session.exec(
+            select(func.count())
+            .select_from(BatchJob)
+            .where(_tenant_filter(BatchJob.tenant_id, tenant_id) & (BatchJob.status.in_(["queued", "running", "paused"])))
+        ).one()
+        if int(active_jobs or 0) >= active_limit:
+            raise HTTPException(status_code=429, detail="Too many active batch jobs for this tenant")
+        valid_ids = session.exec(
+            select(User.id).where(_tenant_filter(User.tenant_id, tenant_id) & (User.deleted_at.is_(None)) & (User.id.in_(ids)))
+        ).all()
+        if len(valid_ids) != len(set(ids)):
+            raise HTTPException(status_code=404, detail="User not found")
+        job = BatchJob(tenant_id=tenant_id, created_by=operator.get("sub"), total=len(ids), concurrency=concurrency, user_ids=ids, status="queued")
         session.add(job)
         session.flush()
-        items = [BatchJobItem(job_id=job.id, user_id=uid, status="queued") for uid in ids]
+        items = [BatchJobItem(tenant_id=tenant_id, job_id=job.id, user_id=uid, status="queued") for uid in ids]
         session.add_all(items)
-        session.add(AuditLog(actor=operator.get("sub"), action="batch.enqueue", target_user_id=None, detail={"job_id": job.id, "total": len(ids), "concurrency": concurrency}))
+        session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.enqueue", target_user_id=None, detail={"job_id": job.id, "total": len(ids), "concurrency": concurrency}))
         session.commit()
         job_id = job.id
     return {"ok": True, "queued": len(ids), "concurrency": concurrency, "job_id": job_id}
 
 @router.get("/batch-jobs/{job_id}")
-def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, viewer: dict = Depends(get_viewer)):
-    job = session.get(BatchJob, job_id)
+def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, viewer: dict = Depends(require_batch_read)):
+    tenant_id = tenant_id_from_payload(viewer)
+    job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     status_counts = get_batch_job_item_status_counts(session, job_id, ["running", "queued"])
@@ -2329,42 +3162,45 @@ def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, 
     }
 
 @router.post("/batch-jobs/{job_id}/pause")
-def pause_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(get_operator)):
-    job = session.get(BatchJob, job_id)
+def pause_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(require_batch_manage)):
+    tenant_id = tenant_id_from_payload(operator)
+    job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job.paused = True
     session.add(job)
-    session.add(AuditLog(actor=operator.get("sub"), action="batch.pause", target_user_id=None, detail={"job_id": job_id}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.pause", target_user_id=None, detail={"job_id": job_id}))
     session.commit()
     return {"ok": True}
 
 @router.post("/batch-jobs/{job_id}/resume")
-def resume_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(get_operator)):
-    job = session.get(BatchJob, job_id)
+def resume_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(require_batch_manage)):
+    tenant_id = tenant_id_from_payload(operator)
+    job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job.paused = False
     if job.status in ["paused", "queued"]:
         job.status = "queued"
     session.add(job)
-    session.add(AuditLog(actor=operator.get("sub"), action="batch.resume", target_user_id=None, detail={"job_id": job_id}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.resume", target_user_id=None, detail={"job_id": job_id}))
     session.commit()
     return {"ok": True}
 
 @router.post("/batch-jobs/{job_id}/cancel")
-def cancel_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(get_operator)):
-    job = session.get(BatchJob, job_id)
+def cancel_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(require_batch_manage)):
+    tenant_id = tenant_id_from_payload(operator)
+    job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job.cancel_requested = True
     session.add(job)
-    session.add(AuditLog(actor=operator.get("sub"), action="batch.cancel", target_user_id=None, detail={"job_id": job_id}))
+    session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.cancel", target_user_id=None, detail={"job_id": job_id}))
     session.commit()
     return {"ok": True}
 
 @router.post("/ai/test")
-def ai_test(request: Request, req: AiTestRequest, operator: dict = Depends(get_operator)):
+def ai_test(request: Request, req: AiTestRequest, operator: dict = Depends(require_settings_manage)):
     client_ip = get_client_ip(request)
     _rate_limit(f"ai_test:{client_ip}", limit=5, per_seconds=60)
     api_url = (req.apiUrl or "").strip()
@@ -2403,7 +3239,7 @@ def ai_test(request: Request, req: AiTestRequest, operator: dict = Depends(get_o
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AI 接口请求失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=safe_external_error_detail("AI 接口请求失败", e))
 
 
 @router.post("/users/{user_id}/reports/{report_key}/generate")
@@ -2414,14 +3250,25 @@ def generate_report(
     user_id: int,
     report_key: str,
     target_period: Optional[str] = None,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         generated = _generate_report_content_for_user(user, report_key, target_period)
         sync_runtime_fields_to_user(user, generated["config_data"])
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=operator.get("sub"),
+                action="user.report.generate",
+                target_user_id=user_id,
+                detail=_ai_audit_detail(
+                    generated["config"],
+                    generated["title"],
+                    {"report_key": report_key, "target_period": target_period},
+                ),
+            )
+        )
         session.add(user)
         session.commit()
         return {"ok": True, "title": generated["title"], "content": generated["content"]}
@@ -2438,11 +3285,9 @@ def report_missing_periods(
     session: Session = Depends(get_session),
     user_id: int,
     report_key: str,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_read),
 ):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         return _get_missing_report_periods_for_user(user, report_key)
     except HTTPException:
@@ -2459,14 +3304,12 @@ def submit_report_manual(
     user_id: int,
     report_key: str,
     req: ReportSubmitRequest,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
     content = (req.content or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="报告内容不能为空")
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         generated = _generate_report_content_for_user(user, report_key, req.target_period, generate_content=False)
         report_info = _build_report_info(
@@ -2494,15 +3337,13 @@ def makeup_all_reports_manual(
     session: Session = Depends(get_session),
     user_id: int,
     report_key: str,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     try:
         result, config_data, target_periods = _makeup_all_reports_for_user(user, report_key)
         sync_runtime_fields_to_user(user, config_data)
-        session.add(AuditLog(actor=operator.get("sub"), action="user.report.makeup_all", target_user_id=user_id, detail={"report_key": report_key, "target_periods": target_periods, "status": result.get("status")}))
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.report.makeup_all", target_user_id=user_id, detail={"report_key": report_key, "target_periods": target_periods, "status": result.get("status")}))
         session.add(user)
         session.commit()
         return {"ok": result.get("status") != "fail", "result": result, "target_periods": target_periods, "report_key": report_key}
@@ -2519,11 +3360,9 @@ def generate_daily_report(
     request: Request,
     session: Session = Depends(get_session),
     user_id: int,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_tasks_run),
 ):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法生成日报")
 
@@ -2555,13 +3394,22 @@ def generate_daily_report(
                     last_time = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                     if last_time.date() == current_time.date():
                         already_submitted = True
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
         job_info = api_client.get_job_info()
         content = generate_article(config, title, job_info, config.get_value("planInfo.planPaper.dayPaperNum"))
         sync_runtime_fields_to_user(user, config_data)
         session.add(user)
+        session.add(
+            AuditLog(
+                tenant_id=user.tenant_id,
+                actor=operator.get("sub"),
+                action="user.report.daily.generate",
+                target_user_id=user_id,
+                detail=_ai_audit_detail(config, title, {"already_submitted": already_submitted}),
+            )
+        )
         session.commit()
         return {"ok": True, "title": title, "content": content, "already_submitted": already_submitted}
     except HTTPException:
@@ -2577,15 +3425,13 @@ def submit_daily_report_manual(
     session: Session = Depends(get_session),
     user_id: int,
     req: ReportSubmitRequest,
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_write),
 ):
     content = (req.content or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="日报内容不能为空")
 
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = _get_active_user_for_payload(session, user_id, operator)
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法提交日报")
 
@@ -2609,8 +3455,8 @@ def submit_daily_report_manual(
                         raise HTTPException(status_code=400, detail="今天已经提交过日报")
                 except HTTPException:
                     raise
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
         count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
         title = f"第{count}天日报"
@@ -2636,7 +3482,7 @@ def submit_daily_report_manual(
 
 
 @router.get("/geocode/search")
-def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: dict = Depends(get_operator)):
+def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: dict = Depends(require_users_write)):
     provider, amap_key, baidu_key = _geocode_search_provider_config()
     baidu_output_coord_type = ""
     if provider == "baidu":
@@ -2678,7 +3524,7 @@ def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: 
             _geocode_cache_set(cache_key, out, ttl_seconds=6 * 60 * 60, maxsize=800)
             return out
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(e)}")
+            raise HTTPException(status_code=502, detail=safe_external_error_detail("地理搜索失败", e))
 
     if provider == "baidu":
         try:
@@ -2705,7 +3551,7 @@ def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: 
             _geocode_cache_set(cache_key, out, ttl_seconds=6 * 60 * 60, maxsize=800)
             return out
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(e)}")
+            raise HTTPException(status_code=502, detail=safe_external_error_detail("地理搜索失败", e))
 
     if provider == "amap":
         try:
@@ -2734,7 +3580,7 @@ def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: 
             _geocode_cache_set(cache_key, out, ttl_seconds=6 * 60 * 60, maxsize=800)
             return out
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(e)}")
+            raise HTTPException(status_code=502, detail=safe_external_error_detail("地理搜索失败", e))
 
     nominatim_base = NOMINATIM_BASE_URL.rstrip("/")
     params = {"q": q2, "format": "json", "limit": 5, "addressdetails": 1}
@@ -2780,14 +3626,14 @@ def geocode_search(q: str = Query(..., min_length=1, max_length=200), operator: 
         except Exception as e:
             last_err = e
             time.sleep(0.4 * (attempt + 1))
-    raise HTTPException(status_code=502, detail=f"地理搜索失败: {str(last_err) if last_err else 'unknown'}")
+    raise HTTPException(status_code=502, detail=safe_external_error_detail("地理搜索失败", last_err))
 
 
 @router.get("/geocode/reverse")
 def geocode_reverse(
     lat: float = Query(...),
     lon: float = Query(...),
-    operator: dict = Depends(get_operator),
+    operator: dict = Depends(require_users_write),
 ):
     provider, amap_key, baidu_key = _geocode_provider_config()
     baidu_input_coord_type = ""
@@ -2853,7 +3699,7 @@ def geocode_reverse(
             _geocode_cache_set(cache_key, out2, ttl_seconds=6 * 60 * 60, maxsize=1200)
             return out2
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"逆地理解析失败: {str(e)}")
+            raise HTTPException(status_code=502, detail=safe_external_error_detail("逆地理解析失败", e))
 
     if provider == "amap":
         try:
@@ -2899,7 +3745,7 @@ def geocode_reverse(
             _geocode_cache_set(cache_key, out2, ttl_seconds=6 * 60 * 60, maxsize=1200)
             return out2
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"逆地理解析失败: {str(e)}")
+            raise HTTPException(status_code=502, detail=safe_external_error_detail("逆地理解析失败", e))
 
     nominatim_base = NOMINATIM_BASE_URL.rstrip("/")
     params = {"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1}
@@ -2921,4 +3767,4 @@ def geocode_reverse(
         except Exception as e:
             last_err = e
             time.sleep(0.4 * (attempt + 1))
-    raise HTTPException(status_code=502, detail=f"逆地理解析失败: {str(last_err) if last_err else 'unknown'}")
+    raise HTTPException(status_code=502, detail=safe_external_error_detail("逆地理解析失败", last_err))

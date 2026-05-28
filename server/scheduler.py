@@ -1,15 +1,19 @@
 import logging
 import datetime
 import os
+import time
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from server.task_runner import run_task_by_config
 from server.database import engine
-from server.models import User
+from server.models import DEFAULT_TENANT_ID, Tenant, User
 from server.user_runtime import apply_execution_results_to_user, user_to_config as build_user_config
 from sqlmodel import Session, select
 from typing import Dict, Any
+from server.execution_locks import acquire_task_lock, release_task_lock
+from server.observability import record_task_event
+from server.security import int_env
 
 def _resolve_scheduler_timezone():
     tz_name = (os.getenv("SCHEDULER_TIMEZONE") or os.getenv("TZ") or "").strip()
@@ -22,6 +26,14 @@ def _resolve_scheduler_timezone():
 
 scheduler = BackgroundScheduler(timezone=_resolve_scheduler_timezone())
 logger = logging.getLogger(__name__)
+
+
+def _task_lock_ttl_seconds() -> int:
+    try:
+        value = int(os.getenv("TASK_LOCK_TTL_SECONDS") or "1800")
+    except Exception:
+        value = 1800
+    return max(60, min(value, 24 * 60 * 60))
 
 def user_to_config(user: User) -> Dict[str, Any]:
     return build_user_config(user)
@@ -75,7 +87,12 @@ def _get_schedule(user: User) -> Dict[str, Any]:
 def run_job(user_id: int, forced_checkin_type: str):
     with Session(engine) as session:
         user = session.get(User, user_id)
-        if not user or not user.enable_clockin:
+        if (
+            not user
+            or getattr(user, "deleted_at", None) is not None
+            or not user.enable_clockin
+            or not _is_user_tenant_active(session, user)
+        ):
             logger.info(f"用户 {user_id} 不存在或已禁用，跳过任务")
             return
 
@@ -98,24 +115,59 @@ def run_job(user_id: int, forced_checkin_type: str):
                     remove_user_job(user_id)
                     logger.info(f"用户 {user_id} 打卡天数已到期，已自动停用")
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("invalid schedule startDate for user %s: %r (%s)", user_id, start_date, exc)
             
         config_data = user_to_config(user)
+
+    lock_key = f"scheduler:user:{user_id}:clock_in:{forced_checkin_type}"
+    lock_token = acquire_task_lock(
+        lock_key,
+        ttl_seconds=_task_lock_ttl_seconds(),
+        detail={"user_id": user_id, "forced_checkin_type": forced_checkin_type},
+    )
+    if lock_token is None:
+        logger.info("scheduler job already running: %s", lock_key)
+        record_task_event(
+            source="scheduler",
+            event="skip_locked",
+            task_key=lock_key,
+            user_id=user_id,
+            status="locked",
+        )
+        return
         
     logger.info(f"开始执行用户 {user_id} 的定时任务")
+    started = time.monotonic()
+    status = "success"
+    error = None
     try:
         results = run_task_by_config(config_data, forced_checkin_type=forced_checkin_type)
         
         # 更新状态
         with Session(engine) as session:
             user = session.get(User, user_id)
-            if user:
+            if user and getattr(user, "deleted_at", None) is None:
                 apply_execution_results_to_user(user, results, config_data)
                 session.add(user)
                 session.commit()
     except Exception as e:
+        status = "fail"
+        error = str(e)
         logger.error(f"任务执行异常: {e}")
+
+    finally:
+        record_task_event(
+            source="scheduler",
+            event="finish",
+            task_key=lock_key,
+            user_id=user_id,
+            status=status,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=error,
+        )
+        release_task_lock(lock_token)
+
 
 def _get_report_settings(user: User) -> Dict[str, Any]:
     rs = user.reportSettings or {}
@@ -132,22 +184,60 @@ def _parse_hhmm_str(value: Any, default_h: int, default_m: int):
 def run_report_job(user_id: int, specific_task_type: str):
     with Session(engine) as session:
         user = session.get(User, user_id)
-        if not user:
+        if not user or getattr(user, "deleted_at", None) is not None or not _is_user_tenant_active(session, user):
             logger.info(f"用户 {user_id} 不存在，跳过任务")
+            return
+        if not _is_report_task_enabled(user, specific_task_type):
+            logger.info("用户 %s 未启用报告任务 %s，跳过任务", user_id, specific_task_type)
             return
         config_data = user_to_config(user)
 
+    lock_key = f"scheduler:user:{user_id}:report:{specific_task_type}"
+    lock_token = acquire_task_lock(
+        lock_key,
+        ttl_seconds=_task_lock_ttl_seconds(),
+        detail={"user_id": user_id, "specific_task_type": specific_task_type},
+    )
+    if lock_token is None:
+        logger.info("scheduler report job already running: %s", lock_key)
+        record_task_event(
+            source="scheduler",
+            event="skip_locked",
+            task_key=lock_key,
+            user_id=user_id,
+            status="locked",
+        )
+        return
+
     logger.info(f"开始执行用户 {user_id} 的定时报告任务: {specific_task_type}")
+    started = time.monotonic()
+    status = "success"
+    error = None
     try:
         results = run_task_by_config(config_data, specific_task_type=specific_task_type)
         with Session(engine) as session:
             user = session.get(User, user_id)
-            if user:
+            if user and getattr(user, "deleted_at", None) is None:
                 apply_execution_results_to_user(user, results, config_data)
                 session.add(user)
                 session.commit()
     except Exception as e:
         logger.error(f"任务执行异常: {e}")
+
+        status = "fail"
+        error = str(e)
+    finally:
+        record_task_event(
+            source="scheduler",
+            event="finish",
+            task_key=lock_key,
+            user_id=user_id,
+            status=status,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=error,
+        )
+        release_task_lock(lock_token)
+
 
 def add_user_job(user: User):
     schedule = _get_schedule(user)
@@ -252,23 +342,89 @@ def add_user_job(user: User):
         )
 
 def remove_user_job(user_id: int):
-    try:
-        scheduler.remove_job(f"user_{user_id}_start")
-        scheduler.remove_job(f"user_{user_id}_end")
-        scheduler.remove_job(f"user_{user_id}_daily_report")
-        scheduler.remove_job(f"user_{user_id}_weekly_report")
-        scheduler.remove_job(f"user_{user_id}_monthly_report")
-    except Exception:
-        pass
+    for suffix in ("start", "end", "daily_report", "weekly_report", "monthly_report"):
+        job_id = f"user_{user_id}_{suffix}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception as exc:
+            logger.debug("scheduler job removal skipped for %s: %s", job_id, exc)
+
+
+def _has_enabled_report(user: User) -> bool:
+    settings = user.reportSettings if isinstance(user.reportSettings, dict) else {}
+    for key in ("daily", "weekly", "monthly"):
+        value = settings.get(key)
+        if isinstance(value, dict) and value.get("enabled") is True:
+            return True
+    return False
+
+
+def _report_key_from_task_type(task_type: str) -> str:
+    normalized = str(task_type or "").strip()
+    if normalized.endswith("_report"):
+        normalized = normalized[: -len("_report")]
+    return normalized
+
+
+def _is_report_task_enabled(user: User, task_type: str) -> bool:
+    key = _report_key_from_task_type(task_type)
+    if key == "report":
+        return _has_enabled_report(user)
+    if key not in {"daily", "weekly", "monthly"}:
+        return False
+    settings = _get_report_settings(user).get(key) or {}
+    return isinstance(settings, dict) and settings.get("enabled") is True
+
+
+def _has_scheduled_work(user: User) -> bool:
+    return bool(user.enable_clockin or _has_enabled_report(user))
+
+
+def _is_tenant_active(session: Session, tenant_id: str | None) -> bool:
+    normalized = str(tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+    tenant = session.get(Tenant, normalized)
+    if tenant is None:
+        return normalized == DEFAULT_TENANT_ID
+    return str(tenant.status or "active").lower() == "active"
+
+
+def _is_user_tenant_active(session: Session, user: User) -> bool:
+    return _is_tenant_active(session, getattr(user, "tenant_id", DEFAULT_TENANT_ID))
+
+
+def _iter_schedulable_users(session: Session, page_size: int | None = None):
+    size = int(page_size or int_env("SCHEDULER_LOAD_PAGE_SIZE", 500, min_value=50, max_value=5000))
+    last_id = 0
+    while True:
+        rows = session.exec(
+            select(User)
+            .where((User.deleted_at.is_(None)) & (User.id > last_id))
+            .order_by(User.id)
+            .limit(size)
+        ).all()
+        if not rows:
+            break
+        last_id = int(rows[-1].id or last_id)
+        for user in rows:
+            if _is_user_tenant_active(session, user) and _has_scheduled_work(user):
+                yield user
+
 
 def start_scheduler():
+    if scheduler.running:
+        return
     scheduler.start()
     with Session(engine) as session:
         # 注意：这里可能需要处理数据库还没初始化的问题，最好在 main.py 里先调 create_db_and_tables
         try:
-            users = session.exec(select(User)).all()
-            for user in users:
+            loaded = 0
+            for user in _iter_schedulable_users(session):
                 add_user_job(user)
-            logger.info(f"调度器启动，加载了 {len(users)} 个用户的任务")
+                loaded += 1
+            logger.info(f"调度器启动，加载了 {loaded} 个用户的任务")
         except Exception as e:
             logger.error(f"加载任务失败（可能是数据库未初始化）: {e}")
+
+
+def is_scheduler_running() -> bool:
+    return bool(scheduler.running)

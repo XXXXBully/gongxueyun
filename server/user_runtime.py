@@ -3,6 +3,7 @@ import datetime
 import time
 from typing import Any, Callable, Dict, List
 
+from server.models import DEFAULT_TENANT_ID
 from server.secret_store import decrypt_secret
 
 SERVER_PUSH_TYPE = "Server"
@@ -171,6 +172,7 @@ def user_to_config(
         password = ""
 
     return {
+        "tenant_id": getattr(user, "tenant_id", DEFAULT_TENANT_ID),
         "config": {
             "user": {"phone": getattr(user, "phone", ""), "password": password},
             "clockIn": _json_copy(getattr(user, "clockIn", {}) or {}),

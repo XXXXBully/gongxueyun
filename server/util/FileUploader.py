@@ -1,11 +1,14 @@
 import os
 import io
+import logging
 import random
 from typing import Optional
 
 from PIL import Image
 
 from server.coreApi.FileUploadApi import upload
+
+logger = logging.getLogger(__name__)
 
 
 def process_image(image_path: str) -> bytes:
@@ -109,8 +112,7 @@ def upload_img(token: str, snowFlakeId: str, userId: str, count: int) -> str:
         try:
             processed_images.append(process_image(img_path))
         except Exception as e:
-            # 记录日志或忽略坏图
-            print(f"处理图片失败 {img_path}: {e}") # 这里应该用logger，但这个文件没有logger
+            logger.warning("failed to process image %s: %s", img_path, e)
             continue
             
     if not processed_images:

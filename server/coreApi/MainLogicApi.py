@@ -7,6 +7,8 @@ import uuid
 import random
 import threading
 import datetime
+import ipaddress
+import socket
 from typing import Dict, Any, List, Optional
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 
@@ -68,6 +70,76 @@ def _parse_float_env(name: str, default: float, max_value: float) -> float:
     return min(value, max_value)
 
 
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _split_env_list(value: str) -> List[str]:
+    return [item.strip().lower() for item in (value or "").replace(";", ",").split(",") if item.strip()]
+
+
+def _host_matches_allowlist(host: str, allowed_hosts: List[str]) -> bool:
+    normalized = (host or "").strip().lower()
+    if not allowed_hosts:
+        return True
+    if "*" in allowed_hosts or normalized in allowed_hosts:
+        return True
+    return any(item.startswith(".") and normalized.endswith(item) for item in allowed_hosts)
+
+
+def _is_private_or_special_ip(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except Exception:
+        return True
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _proxy_fetch_url_is_private_or_special(host: str, port: int) -> bool:
+    normalized = (host or "").strip().lower()
+    if not normalized or normalized == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(normalized)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    except Exception:
+        return True
+
+    if is_ip_literal:
+        return _is_private_or_special_ip(normalized)
+    try:
+        infos = socket.getaddrinfo(normalized, port, type=socket.SOCK_STREAM)
+    except Exception:
+        return True
+    return any(_is_private_or_special_ip(info[4][0]) for info in infos)
+
+
+def _is_safe_proxy_fetch_url(fetch_url: str) -> bool:
+    parsed = urlparse(str(fetch_url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    allowed_hosts = _split_env_list(os.getenv("MOGUDING_PROXY_ALLOWED_HOSTS") or "")
+    if not _host_matches_allowlist(host, allowed_hosts):
+        return False
+    port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    private_endpoint = _proxy_fetch_url_is_private_or_special(host, port)
+    if private_endpoint:
+        return _env_flag("ALLOW_PRIVATE_MOGUDING_PROXY_ENDPOINTS") and bool(allowed_hosts)
+    return True
+
+
 def _extract_proxy_host_port(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -121,7 +193,7 @@ def _mask_proxy_url(value: str) -> str:
             netloc = f"{user}:***@{host}{port}" if user else f"***@{host}{port}"
             return urlunparse(parsed._replace(netloc=netloc))
     except Exception:
-        pass
+        logger.debug("failed to mask proxy url", exc_info=True)
     return value
 
 
@@ -240,7 +312,13 @@ class ApiClient:
             ]
         ):
             return {}
-        settings = load_global_proxy_settings()
+        tenant_id = "default"
+        try:
+            root = self.config.config if isinstance(self.config.config, dict) else {}
+            tenant_id = str(root.get("tenant_id") or root.get("tenantId") or "default").strip() or "default"
+        except Exception:
+            tenant_id = "default"
+        settings = load_global_proxy_settings(tenant_id=tenant_id)
         return settings if settings.get("enabled") else {}
 
     def _load_proxy_fetch_url(self) -> str:
@@ -264,13 +342,16 @@ class ApiClient:
                 ]
             )
         except Exception:
-            pass
+            logger.debug("failed to read configured proxy fetch url", exc_info=True)
 
         raw_values.append(self._global_proxy_settings.get("apiUrl"))
         for raw in raw_values:
             value = str(raw or "").strip()
-            if value:
+            if not value:
+                continue
+            if _is_safe_proxy_fetch_url(value):
                 return value
+            logger.warning("已拒绝不安全的工学云代理获取接口: %s", _mask_proxy_url(value))
         return ""
 
     def _proxy_fetch_timeout_seconds(self) -> float:
@@ -346,7 +427,7 @@ class ApiClient:
                 ]
             )
         except Exception:
-            pass
+            logger.debug("failed to read configured proxy url list", exc_info=True)
         raw_values.append(self._global_proxy_settings.get("proxyUrls"))
 
         urls: List[str] = []

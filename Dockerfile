@@ -1,5 +1,5 @@
 # Stage 1: Build Frontend
-FROM node:20-alpine AS frontend-build
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS frontend-build
 WORKDIR /app
 
 COPY web/package*.json ./web/
@@ -9,7 +9,7 @@ COPY web/ ./web/
 RUN cd web && npm run build
 
 # Stage 2: Backend
-FROM python:3.10-slim
+FROM python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10
 WORKDIR /app
 
 ARG BUILD_DATE=""
@@ -26,18 +26,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \
     DEBIAN_FRONTEND=noninteractive
 
-# 修复 Debian 源 + 安装依赖（国内网络专用）
-RUN sed -i "s@deb.debian.org@mirrors.aliyun.com@g" /etc/apt/sources.list.d/debian.sources && \
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s@deb.debian.org@$APT_MIRROR@g" /etc/apt/sources.list.d/debian.sources ; \
+    fi && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    ca-certificates \
-    tzdata \
+      libgl1 \
+      libglib2.0-0 \
+      ca-certificates \
+      tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY server/requirements.txt ./
-RUN python -m pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=""
+RUN if [ -n "$PIP_INDEX_URL" ]; then \
+      python -m pip install --no-cache-dir -r requirements.txt -i "$PIP_INDEX_URL" ; \
+    else \
+      python -m pip install --no-cache-dir -r requirements.txt ; \
+    fi
 
 COPY server/ ./server/
 COPY --from=frontend-build /app/web/dist ./web/dist
@@ -47,6 +54,15 @@ RUN if [ "$DOWNLOAD_MODELS" = "1" ]; then \
       python -c "from server.util.CaptchaUtils import ensure_model_exists, MODEL_URLS; [ensure_model_exists(k,v) for k,v in MODEL_URLS.items()]" ; \
     fi
 
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser && \
+    mkdir -p /app/server/images /app/server/models_onnx && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
 EXPOSE 8147
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8147/healthz', timeout=5).read()" || exit 1
 
 CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8147"]

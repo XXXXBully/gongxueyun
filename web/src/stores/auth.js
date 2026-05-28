@@ -1,34 +1,91 @@
 import { defineStore } from 'pinia'
 
-const TOKEN_KEY = 'auth_token'
-const USER_KEY = 'auth_user'
-const ROLE_KEY = 'auth_role'
+const META_KEY = 'auth_meta'
+
+const readMeta = () => {
+  try {
+    return JSON.parse(sessionStorage.getItem(META_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
 
 export const useAuthStore = defineStore('auth', {
-  state: () => ({
-    token: localStorage.getItem(TOKEN_KEY) || '',
-    username: localStorage.getItem(USER_KEY) || '',
-    role: localStorage.getItem(ROLE_KEY) || '',
-  }),
+  state: () => {
+    const meta = readMeta()
+    return {
+      authed: meta.authed === true,
+      username: meta.username || '',
+      role: meta.role || '',
+      tenantId: meta.tenantId || 'default',
+      permissions: Array.isArray(meta.permissions) ? meta.permissions : [],
+      sessionChecked: false,
+    }
+  },
   getters: {
-    isAuthed: (s) => !!s.token,
+    isAuthed: (s) => !!s.authed,
     isAdmin: (s) => s.role === 'admin',
     canWrite: (s) => s.role === 'admin' || s.role === 'operator',
+    can: (s) => (permission) => Array.isArray(s.permissions) && s.permissions.includes(permission),
   },
   actions: {
-    setAuth(token, username, role) {
-      this.token = token || ''
+    setAuth(_token, username, role, tenantId = 'default', permissions = []) {
+      this.authed = !!(_token || role)
       this.username = username || ''
       this.role = role || ''
-      if (this.token) localStorage.setItem(TOKEN_KEY, this.token)
-      else localStorage.removeItem(TOKEN_KEY)
-      if (this.username) localStorage.setItem(USER_KEY, this.username)
-      else localStorage.removeItem(USER_KEY)
-      if (this.role) localStorage.setItem(ROLE_KEY, this.role)
-      else localStorage.removeItem(ROLE_KEY)
+      this.tenantId = tenantId || 'default'
+      this.permissions = Array.isArray(permissions) ? permissions : []
+      this.sessionChecked = false
+      if (this.authed) {
+        sessionStorage.setItem(META_KEY, JSON.stringify({
+          authed: true,
+          username: this.username,
+          role: this.role,
+          tenantId: this.tenantId,
+          permissions: this.permissions,
+        }))
+      } else {
+        sessionStorage.removeItem(META_KEY)
+      }
     },
     logout() {
-      this.setAuth('', '', '')
+      this.authed = false
+      this.username = ''
+      this.role = ''
+      this.tenantId = 'default'
+      this.permissions = []
+      this.sessionChecked = false
+      sessionStorage.removeItem(META_KEY)
+    },
+    async validateSession() {
+      try {
+        const response = await fetch('/api/auth/me', { credentials: 'include' })
+        if (!response.ok) throw new Error('session invalid')
+        const data = await response.json()
+        this.authed = true
+        this.username = data.username || ''
+        this.role = data.role || ''
+        this.tenantId = data.tenant_id || 'default'
+        this.permissions = Array.isArray(data.permissions) ? data.permissions : []
+        this.sessionChecked = true
+        sessionStorage.setItem(META_KEY, JSON.stringify({
+          authed: true,
+          username: this.username,
+          role: this.role,
+          tenantId: this.tenantId,
+          permissions: this.permissions,
+        }))
+        return true
+      } catch {
+        this.authed = false
+        this.username = ''
+        this.role = ''
+        this.tenantId = 'default'
+        this.permissions = []
+        this.sessionChecked = true
+        sessionStorage.removeItem(META_KEY)
+        return false
+      }
     },
   },
 })

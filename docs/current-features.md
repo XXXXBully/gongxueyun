@@ -6,7 +6,7 @@
 
 AutoMoGuDing SaaS 当前包含两套 Web 界面：
 
-- **管理端：** 用户管理、批量任务、审计日志查询与清空、通知配置、AI 测试、地理编码、缺卡查询和补卡。
+- **管理端：** 用户管理、租户管理、批量任务、审计日志查询、通知配置、AI 测试、地理编码、缺卡查询和补卡。审计清空默认禁用，用户删除为软删除。
 - **用户端：** 注册 / 登录、绑定工学云账号、个人配置、手动执行、执行记录、日报生成 / 提交、缺卡查询和补卡。
 
 后端任务执行链路集中在：
@@ -18,6 +18,8 @@ AutoMoGuDing SaaS 当前包含两套 Web 界面：
 - `server/task_runner.py`：打卡、补卡、报告提交等任务执行。
 - `server/clockin_backfill.py`：打卡记录归一化和待补卡日期筛选。
 - `server/coreApi/MainLogicApi.py`：工学云接口客户端。
+- `server/execution_locks.py`：定时任务分布式锁。
+- `server/observability.py`：任务事件记录与 `/metrics` 运行统计。
 
 更多后端维护细节见 `server/README.md`，前端交互说明见 `web/README.md`。
 
@@ -205,12 +207,35 @@ POST /users/{user_id}/clock-in/makeup-all
 
 「立即执行日报 / 周报 / 月报」属于报告类手动任务，不触发本系统 `/run` 接口的 429 限流。打卡和默认手动运行仍保留内部限流。
 
+## 认证、AI 与运行观测
+
+- 浏览器登录态默认写入 HttpOnly Cookie，前端不再把 token 放进 `localStorage`。非安全方法的 Cookie 请求会校验 `Origin` / `Referer`，跨域前端需要配置 `FRONTEND_ORIGINS` 或 `CORS_ORIGINS`；外部脚本客户端如需响应体 token，需要显式配置 `RETURN_AUTH_TOKEN=true`。
+- 默认响应安全头和 CSP；生产环境默认启用 HSTS。
+- 审计日志默认不可清空；用户删除为软删除，会停用打卡和用户端绑定账号并保留历史记录。
+- 生产环境必须配置 `USER_PASSWORD_KEY` 或 `FERNET_KEY` 才允许保存新的工学云密码、SMTP 授权码和代理接口密钥；本地开发保留历史明文兼容。
+- 核心表具备默认租户 `default` 和 `tenant_id` 字段，旧数据迁移时兼容 `NULL` 默认租户值。
+- 管理端提供租户列表、创建和停用页面及接口，并为租户变更写入审计日志；租户管理仅对默认租户 `default` 的平台管理员开放。管理端和用户端登录/注册页提交租户 ID，用户详情、执行、编辑、补卡和报告接口按登录租户过滤。
+- 停用租户会阻断登录、现有 token、定时任务加载、残留调度执行和批量队列执行。
+- 管理端权限从纯角色判断推进到权限点依赖，用户、任务、批量、设置和审计接口按动作权限校验。
+- `/ai/test` 默认只允许公网 HTTPS 地址；正式 AI 生成链路允许内网 AI 地址，适配本地或内网模型服务。需要收口时配置 `AI_ALLOWED_HOSTS`。
+- 定时任务使用数据库锁避免重复执行，锁 TTL 由 `TASK_LOCK_TTL_SECONDS` 控制。
+- 批量队列认领会把 queued 项原子更新为 running，并写入 worker owner、lease token 和 lease 到期时间，降低多 worker 或多线程重复执行风险；running 项超过 `BATCH_RUNNING_ITEM_TIMEOUT_SECONDS` 后会回收，过期线程不能再覆盖新状态。
+- 数据库限流后端按 bucket 聚合计数，登录和注册同时按 IP 与账号维度限流，避免低速撞库绕过单 IP 限制。
+- `/metrics` 返回任务事件、批量任务、批量项、活动锁、HTTP 请求状态分布、延迟统计和最近请求 ID；`/metrics.prom` 返回 Prometheus 文本格式。生产环境默认不裸露 metrics，需要配置 `METRICS_AUTH_TOKEN` 并通过 `X-Metrics-Token` 或 Bearer token 访问。HTTP 请求明细默认保留 14 天，并按小时节流清理；静态资源和健康检查默认不落库，避免指标表被无价值请求刷爆。
+- 通知 SMTP 和工学云补卡代理 Web 配置按租户隔离保存；默认租户继续使用历史 key，非默认租户使用租户前缀 key，避免多租户互相覆盖系统设置。
+- 生产环境默认不在启动时自动下载验证码 ONNX 模型，避免外网下载失败影响 API 启动；需要自动拉取时配置 `CAPTCHA_MODEL_AUTO_DOWNLOAD=true`。
+- 数据库 schema 使用 Alembic 维护，生产环境默认不做运行时 schema 写操作，发布前执行 `python -m alembic upgrade head`；需要保留开发期自动初始化时设置 `ALLOW_RUNTIME_SCHEMA_MIGRATIONS=true`。
+- 数据库备份/恢复可使用 `python -m server.backup_cli export backup.json` 和 `python -m server.backup_cli import backup.json --replace-existing`，导出包包含 manifest、表行数和表校验和，导入前会校验篡改。生产环境导出默认要求 `BACKUP_ENCRYPTION_KEY` 或 `--encryption-key`，除非显式设置 `ALLOW_PLAINTEXT_BACKUP=true`。
+- CI 质量门禁会运行 `python scripts/quality_gate.py`，检查 UTC 时间、前端敏感登录态存储、服务器端 `print`、裸 `except/pass` 和不带租户上下文的用户读取回归；发布流程还会跑 `pip-audit`、`npm audit` 与 Trivy 扫描。
+
 ## 验证命令
 
 后端测试：
 
 ```bash
 python -m unittest discover -s tests
+python -m alembic upgrade head
+python scripts/quality_gate.py
 ```
 
 后端语法编译：
