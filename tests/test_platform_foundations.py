@@ -380,6 +380,21 @@ class PlatformFoundationsTest(unittest.TestCase):
         self.assertGreaterEqual(version, (0, 0, 29))
         self.assertNotIn("python-multipart==0.0.9", "\n".join(requirements))
 
+    def test_backend_requirements_pin_recent_audit_fixes(self):
+        requirements = (ROOT / "server" / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        versions = {}
+        for line in requirements:
+            if "==" not in line:
+                continue
+            name, version = line.split("==", 1)
+            versions[name] = tuple(int(part) for part in version.split("."))
+
+        self.assertGreaterEqual(versions["fastapi"], (0, 136, 3))
+        self.assertGreaterEqual(versions["starlette"], (1, 0, 1))
+        self.assertGreaterEqual(versions["python-dotenv"], (1, 2, 2))
+        self.assertGreaterEqual(versions["requests"], (2, 33, 0))
+        self.assertGreaterEqual(versions["pillow"], (12, 2, 0))
+
     def test_frontend_lockfile_uses_non_vulnerable_vite(self):
         package = json.loads((ROOT / "web" / "package.json").read_text(encoding="utf-8"))
         lock = json.loads((ROOT / "web" / "package-lock.json").read_text(encoding="utf-8"))
