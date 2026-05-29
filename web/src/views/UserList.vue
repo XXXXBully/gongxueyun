@@ -239,6 +239,7 @@
           <div class="job-meta">完成：{{ jobInfo.completed }}</div>
           <div class="job-meta">成功：{{ jobInfo.success }}</div>
           <div class="job-meta">失败：{{ jobInfo.fail }}</div>
+          <div class="job-meta">待重试：{{ jobInfo.failed }}</div>
         </div>
 
         <el-divider>最近错误</el-divider>
@@ -260,6 +261,14 @@
       <el-empty v-else description="暂无任务信息" />
       <template #footer>
         <span class="dialog-footer">
+          <el-button
+            v-if="(jobInfo?.failed || 0) > 0"
+            type="warning"
+            :loading="retryingFailed"
+            @click="retryFailedItems"
+          >
+            重试失败
+          </el-button>
           <el-button @click="manualRefreshJob" :loading="jobLoading">刷新</el-button>
           <el-button @click="jobVisible = false">关闭</el-button>
         </span>
@@ -316,6 +325,7 @@ const jobInfo = ref(null)
 const jobId = ref(null)
 const jobTimer = ref(null)
 const jobPercent = ref(0)
+const retryingFailed = ref(false)
 const remarkVisible = ref(false)
 const remarkSaving = ref(false)
 const remarkText = ref('')
@@ -588,6 +598,45 @@ const refreshJob = async () => {
 const manualRefreshJob = async () => {
   await refreshJob()
   showInfo('任务进度已刷新')
+}
+
+const retryFailedItems = async () => {
+  if (!jobId.value || retryingFailed.value) return
+  const failedCount = Number(jobInfo.value?.failed || 0)
+  if (failedCount <= 0) {
+    notifyInfo('当前没有可重试的失败项')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `将重新加入 ${failedCount} 个失败项到队列，是否继续？`,
+      '重试失败项',
+      {
+        type: 'warning',
+        confirmButtonText: '重试',
+        cancelButtonText: '取消',
+        closeOnClickModal: false,
+      }
+    )
+  } catch {
+    return
+  }
+
+  retryingFailed.value = true
+  try {
+    showInfo('正在重试失败项')
+    await flushUiMessage()
+    const res = await http.post(`/batch-jobs/${jobId.value}/retry-failed`)
+    notifySuccess(`已重试 ${res.data?.requeued || 0} 个失败项`)
+    await refreshJob()
+    startJobPolling()
+    startPolling()
+  } catch (e) {
+    notifyError(resolveErrorMessage(e, '重试失败项失败'))
+  } finally {
+    retryingFailed.value = false
+  }
 }
 
 const stopJobPolling = () => {

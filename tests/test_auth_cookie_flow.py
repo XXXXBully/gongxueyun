@@ -109,6 +109,18 @@ class AuthCookieFlowTest(unittest.TestCase):
         self.assertFalse(has_permission({"role": "operator"}, "audit:purge"))
         self.assertIn("users:read", permissions_for_role("viewer"))
 
+    def test_role_permissions_can_be_overridden_from_env(self):
+        from server.auth import has_permission, permissions_for_role
+
+        with patch.dict(
+            "os.environ",
+            {"ROLE_PERMISSIONS_JSON": '{"viewer":["users:read"],"operator":["users:read","tasks:run"]}'},
+            clear=False,
+        ):
+            self.assertEqual(permissions_for_role("viewer"), {"users:read"})
+            self.assertTrue(has_permission({"role": "operator"}, "tasks:run"))
+            self.assertFalse(has_permission({"role": "operator"}, "batch:manage"))
+
     def test_admin_me_returns_tenant_and_permissions(self):
         from server.api import admin_me
 

@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 import re
 
 
@@ -20,9 +19,6 @@ def _workflow_files() -> list[Path]:
 
 
 def check_github_actions_are_pinned() -> list[str]:
-    if str(os.getenv("ACTIONS_ALLOW_UNPINNED") or "").strip().lower() in {"1", "true", "yes", "on"}:
-        return []
-
     failures: list[str] = []
     for path in _workflow_files():
         rel = path.relative_to(ROOT).as_posix()

@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, Callable
 
 from server.coreApi.MainLogicApi import ApiClient
 from server.coreApi.AiServiceClient import generate_article
+from server.ai_governance import check_ai_generation_quota
 from server.clockin_backfill import (
     CLOCKIN_TYPE_LABELS,
     combine_date_time,
@@ -684,6 +685,11 @@ def _submit_report_common(
 
         # 生成内容
         job_info = api_client.get_job_info()
+        check_ai_generation_quota(
+            tenant_id=str(config.get_value("tenant_id") or DEFAULT_TENANT_ID),
+            user_id=config.get_value("userInfo.userId"),
+            raise_http_exception=False,
+        )
         content = generate_article(
             config,
             title,

@@ -240,24 +240,36 @@ EXPOSE_API_DOCS=false
 AUTH_COOKIE_SECURE=false
 RETURN_AUTH_TOKEN=false
 ALLOW_LEGACY_TOKENS=false
+ROLE_PERMISSIONS_JSON=
 FRONTEND_ORIGINS=
 ALLOW_WILDCARD_CORS=false
+TRUSTED_HOSTS=
+ALLOW_MISSING_TRUSTED_HOSTS=false
+MAX_REQUEST_BODY_BYTES=8388608
 ENABLE_HSTS=false
 DISABLE_CSP=false
 CONTENT_SECURITY_POLICY=
 ALLOW_AUDIT_LOG_PURGE=false
 TASK_LOCK_TTL_SECONDS=1800
 AI_ALLOWED_HOSTS=
+AI_ALLOWED_MODELS=
 ALLOW_PRIVATE_AI_ENDPOINTS=false
 AI_REQUEST_MAX_TIMEOUT_SECONDS=60
 AI_REQUEST_MAX_RETRIES=2
+AI_MAX_OUTPUT_TOKENS=1200
 AI_SUBMITTED_REPORT_HISTORY_LIMIT=8
 AI_SUBMITTED_REPORT_HISTORY_CHARS=4000
+AI_PROMPT_VERSION=2026-05-29.1
+AI_TENANT_DAILY_LIMIT=1000
+AI_USER_DAILY_LIMIT=50
+AI_RATE_LIMIT_WINDOW_SECONDS=86400
 METRICS_AUTH_TOKEN=
+METRICS_CACHE_TTL_SECONDS=5
 HTTP_METRIC_RETENTION_DAYS=14
 HTTP_METRIC_PURGE_INTERVAL_SECONDS=3600
 HTTP_METRIC_SAMPLE_RATE=1
 HTTP_METRIC_EXCLUDE_PATH_PREFIXES=
+RECENT_METRIC_WINDOW_SECONDS=300
 CAPTCHA_MODEL_AUTO_DOWNLOAD=false
 CAPTCHA_MODEL_REQUIRE_CHECKSUM=true
 CAPTCHA_MODEL_SHA256_OCR_ONNX=
@@ -279,6 +291,7 @@ MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS=600
 BATCH_RUNNING_ITEM_TIMEOUT_SECONDS=1800
 BATCH_JOB_MAX_USERS=200
 BATCH_TENANT_MAX_ACTIVE_JOBS=5
+IDEMPOTENCY_TTL_SECONDS=604800
 MOGUDING_PROXY_API_URL=
 MOGUDING_PROXY_ALLOWED_HOSTS=
 ALLOW_PRIVATE_MOGUDING_PROXY_ENDPOINTS=false
@@ -300,27 +313,28 @@ AMAP_KEY=your-amap-key
 - 生产环境必须配置 `USER_PASSWORD_KEY` 或 `FERNET_KEY`，否则后端会拒绝保存新的工学云密码、SMTP 授权码和代理接口密钥；本地开发未配置时仍兼容历史明文数据。
 - `APP_ROLE` 控制进程角色：`api` 只提供 Web / API，`worker` 启动定时任务和批量队列，未配置时为本地开发兼容模式 `all`。
 - `RATE_LIMIT_BACKEND` 支持 `memory` 和 `database`；生产 Compose 默认使用 `database`，避免多 API 副本各自限流。数据库后端按 bucket 聚合计数，不再为每次请求插入一行限流事件。
-- `ALLOW_RUNTIME_SCHEMA_MIGRATIONS` 控制启动时是否允许应用进程自动建表、补列和建索引。生产环境默认关闭，发布前必须执行 `python -m alembic upgrade head`；本地开发可设为 `true` 保留自动初始化体验。
+- `ALLOW_RUNTIME_SCHEMA_MIGRATIONS` 控制启动时是否允许应用进程自动建表、补列和建索引。生产环境默认关闭，发布前必须执行 `python -m alembic upgrade head`；运行时迁移关闭时，后端启动会校验数据库 `alembic_version` 是否处于 head，不一致会直接拒绝启动。本地开发可设为 `true` 保留自动初始化体验。
 - 登录态默认写入 HttpOnly Cookie，前端不再把 token 存到 `localStorage`。生产环境默认启用 Secure Cookie，并通过非 HttpOnly 的 `csrf_token` Cookie + `X-CSRF-Token` 请求头做双提交 CSRF 校验；浏览器直连 HTTP 开发时才设置 `AUTH_COOKIE_SECURE=false`。跨域部署前端时必须配置 `FRONTEND_ORIGINS` 或 `CORS_ORIGINS`。生产环境默认拒绝 `*` 通配 CORS，除非显式设置 `ALLOW_WILDCARD_CORS=true`。只有兼容外部脚本客户端时才打开 `RETURN_AUTH_TOKEN=true`。`ALLOW_LEGACY_TOKENS=true` 只用于短迁移窗口兼容旧版无版本 token，生产默认拒绝。
+- 生产环境必须配置 `TRUSTED_HOSTS`，或通过 `FRONTEND_ORIGINS` / `CORS_ORIGINS` 自动推导 Host 白名单；如果三者都为空，后端会拒绝启动。只有明确接受 Host 校验缺失风险时才设置 `ALLOW_MISSING_TRUSTED_HOSTS=true`。`MAX_REQUEST_BODY_BYTES` 控制非 GET 请求体上限，生产默认 8 MiB，最高 10 MiB，包含无 `Content-Length` 的分块请求，避免大包把 API worker 当文件垃圾桶用。
 - 系统内置默认租户 `default`，核心用户、管理员、审计、批量任务和运行指标表均带 `tenant_id`。管理端和用户端登录/注册页会提交租户 ID；管理端用户详情、执行、编辑、补卡和报告接口会按登录租户过滤；现有单租户部署会自动回填默认租户。
 - 租户列表、创建和停用是 `default` 默认租户管理员的平台代理能力；非默认租户管理员即使角色为 `admin`，也不会获得 `tenants:read` / `tenants:manage` 权限。
 - 停用租户会阻断管理端登录、用户端登录、现有 token 继续访问、定时调度加载、残留调度执行和批量队列执行，不再只是列表里好看的一行状态。
 - `APP_REGISTRATION_ENABLED` 控制用户端自助注册，生产默认关闭；租户 `settings.registration_enabled=false` 也会禁用该租户自助注册。这里没有做用户邀请功能。
 - `USER_PASSWORD_MIN_LENGTH` 控制用户端密码最小长度，默认 10；管理端重置管理员密码按更高标准校验。
-- 管理端接口逐步改为权限点校验，角色只负责映射权限；审计、设置、用户、任务和批量任务接口不再只依赖粗粒度角色判断。
+- 管理端接口逐步改为权限点校验，角色只负责映射权限；审计、设置、用户、任务和批量任务接口不再只依赖粗粒度角色判断。需要临时做权限灰度或租户差异化时，可用 `ROLE_PERMISSIONS_JSON` 覆盖角色权限映射，但默认还是内置策略。
 - 默认启用基础安全响应头和 CSP，内置 `frame-src 'self' https://www.mapchaxun.cn` 以兼容经纬度核对页；生产环境默认启用 HSTS，只有明确设置 `ENABLE_HSTS=false` 才关闭。只有前端资源策略确实冲突时才临时设置 `DISABLE_CSP=true` 或自定义 `CONTENT_SECURITY_POLICY`。
-- `EXPOSE_API_DOCS` 控制 `/docs`、`/redoc` 和 `/openapi.json`，生产默认关闭，本地开发默认开启。
+- `EXPOSE_API_DOCS` 控制 `/docs`、`/redoc` 和 `/openapi.json`，生产默认关闭，本地开发默认开启。接口契约快照放在 `docs/api/openapi-contract.json`，变更 API 路径、请求体或响应模型后必须运行 `python scripts/openapi_contract.py --write` 并让 `python scripts/openapi_contract.py` 通过。
 - 审计日志默认不可清空。只有明确设置 `ALLOW_AUDIT_LOG_PURGE=true` 时清空接口才可用，并会留下 `audit.purge` 记录。
 - 管理端删除用户改为软删除：停用打卡、停用用户端绑定账号、保留历史审计和执行记录，不再物理删除业务主体。
 - `TASK_LOCK_TTL_SECONDS` 控制定时任务分布式锁过期时间，避免多个 worker 或误扩容时重复执行同一个用户任务。
 - `BATCH_RUNNING_ITEM_TIMEOUT_SECONDS` 控制批量队列 running 项 lease 超时回收时间，默认 1800 秒。队列认领会写入 worker owner 和 lease token；超时后仍有重试次数的项目会重新排队，次数耗尽的项目会标记失败并推进批量任务进度，过期线程不能再覆盖新状态。
-- `AI_ALLOWED_HOSTS` 可选限制 AI 生成链路允许访问的 host。默认只允许解析到公网地址的 HTTPS 端点；本机、内网、链路本地和特殊地址会被拒绝，并会把已校验的 DNS 解析结果固定到本次请求，避免校验后解析漂移。确需接入内网模型服务时，必须同时设置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和明确的 `AI_ALLOWED_HOSTS` 白名单。`AI_REQUEST_MAX_TIMEOUT_SECONDS`、`AI_REQUEST_MAX_RETRIES`、`AI_SUBMITTED_REPORT_HISTORY_LIMIT` 和 `AI_SUBMITTED_REPORT_HISTORY_CHARS` 控制 AI 请求超时、重试和历史报告注入规模，避免一次生成把线程长期挂死。`/ai/test` 仍默认执行公网 HTTPS 安全检查。
-- `/metrics` 和 `/metrics.prom` 包含任务事件、批量任务、活动锁、HTTP 请求状态/延迟统计，以及最近请求 ID 和任务追踪链路。生产环境默认要求配置 `METRICS_AUTH_TOKEN` 后用 `X-Metrics-Token` 或 Bearer token 访问；HTTP 请求明细默认保留 `HTTP_METRIC_RETENTION_DAYS=14` 天，并按 `HTTP_METRIC_PURGE_INTERVAL_SECONDS=3600` 秒节流清理；静态资源和健康检查默认不写入 HTTP 明细，可用 `HTTP_METRIC_SAMPLE_RATE` 与 `HTTP_METRIC_EXCLUDE_PATH_PREFIXES` 控制采样和排除前缀。
+- `AI_ALLOWED_HOSTS` 可选限制 AI 生成链路允许访问的 host。默认只允许解析到公网地址的 HTTPS 端点；本机、内网、链路本地和特殊地址会被拒绝，并会把已校验的 DNS 解析结果固定到本次请求，避免校验后解析漂移。确需接入内网模型服务时，必须同时设置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和明确的 `AI_ALLOWED_HOSTS` 白名单。`AI_ALLOWED_MODELS` 可再加一层模型白名单，`AI_MAX_OUTPUT_TOKENS` 控制输出长度上限，`AI_PROMPT_VERSION` 记录提示词版本，方便回放和审计。`AI_TENANT_DAILY_LIMIT`、`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制 AI 生成的租户级和用户级配额，避免循环任务或滥用把外部模型费用打穿。`AI_REQUEST_MAX_TIMEOUT_SECONDS`、`AI_REQUEST_MAX_RETRIES`、`AI_SUBMITTED_REPORT_HISTORY_LIMIT` 和 `AI_SUBMITTED_REPORT_HISTORY_CHARS` 控制 AI 请求超时、重试和历史报告注入规模，避免一次生成把线程长期挂死。`/ai/test` 仍默认执行公网 HTTPS 安全检查。
+- `/metrics` 和 `/metrics.prom` 包含认证失败、任务事件、批量任务、活动锁、HTTP 请求状态/延迟统计，以及最近请求 ID 和任务追踪链路。生产环境默认要求配置 `METRICS_AUTH_TOKEN` 后用 `X-Metrics-Token` 或 Bearer token 访问；指标快照默认缓存 `METRICS_CACHE_TTL_SECONDS=5` 秒，并会在相关写入提交后失效，避免 Prometheus 高频抓取时每次重新扫业务库又不至于长期返回旧数据；HTTP 请求明细默认保留 `HTTP_METRIC_RETENTION_DAYS=14` 天，并按 `HTTP_METRIC_PURGE_INTERVAL_SECONDS=3600` 秒节流清理；静态资源和健康检查默认不写入 HTTP 明细，可用 `HTTP_METRIC_SAMPLE_RATE` 与 `HTTP_METRIC_EXCLUDE_PATH_PREFIXES` 控制采样和排除前缀；`RECENT_METRIC_WINDOW_SECONDS=300` 控制最近窗口。Prometheus 告警规则放在 `monitoring/prometheus/alerts.yml`，排障步骤见 `docs/ops/runbook.md`。
 - `CAPTCHA_MODEL_AUTO_DOWNLOAD` 控制启动时是否自动下载验证码 ONNX 模型。生产环境默认关闭，避免启动依赖外网；需要自动拉取时显式设置为 `true`。
 - `CAPTCHA_MODEL_REQUIRE_CHECKSUM` 控制模型自动下载时是否强制校验 SHA256，生产默认要求。需要下载 `ocr.onnx` 和 `yolov5n.onnx` 时分别配置 `CAPTCHA_MODEL_SHA256_OCR_ONNX`、`CAPTCHA_MODEL_SHA256_YOLOV5N_ONNX`，否则就是把启动链路交给一个裸下载链接。
 - 管理端提供租户列表、创建和停用接口；默认租户为 `default`，历史数据迁移时会自动回填兼容。租户管理入口只对默认租户管理员开放。
 - 数据库可用 `python -m server.backup_cli export backup.json` 导出 JSON 备份，用 `python -m server.backup_cli import backup.json --replace-existing` 恢复到目标库，导出文件包含完整性 manifest 和表校验和。生产环境导出默认要求 `--encryption-key` 或 `BACKUP_ENCRYPTION_KEY`，只有显式设置 `ALLOW_PLAINTEXT_BACKUP=true` 才允许明文备份。
-- `BATCH_JOB_MAX_USERS` 限制单个批量任务的用户数量，`BATCH_TENANT_MAX_ACTIVE_JOBS` 限制单租户同时处于 queued/running/paused 的批量任务数，避免一个请求把队列打爆。
+- `BATCH_JOB_MAX_USERS` 限制单个批量任务的用户数量，`BATCH_TENANT_MAX_ACTIVE_JOBS` 限制单租户同时处于 queued/running/paused 的批量任务数，避免一个请求把队列打爆。批量运行接口支持 `Idempotency-Key` / `X-Idempotency-Key`，相同租户、操作者、用户列表和并发参数会回放同一 `job_id`；一键补卡、批量补卡、手动运行和批量补报告也会按同样的幂等键逻辑去重；批量任务详情支持失败项重试；`IDEMPOTENCY_TTL_SECONDS=604800` 控制记录保留窗口。
 - CI 会执行 `python scripts/quality_gate.py`，阻止重新引入 `utcnow()`、前端 token localStorage 存储、服务器端 `print`、裸 `except/pass`、不带租户上下文的用户读取，以及用户邀请入口。
 - 默认不信任 `X-Forwarded-For`。生产环境会忽略单独的 `TRUST_PROXY_HEADERS=true`，必须设置 `TRUSTED_PROXY_IPS` 为代理 IP 或 CIDR；只有可信代理传来的转发头才会用于限流和审计。
 - `DATABASE_POOL_SIZE`、`DATABASE_MAX_OVERFLOW`、`DATABASE_POOL_RECYCLE_SECONDS`、`DATABASE_POOL_TIMEOUT_SECONDS` 控制 MySQL 连接池，避免峰值请求或 MySQL 空闲断连时把应用拖死。
@@ -351,6 +365,7 @@ python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147
 
 - API 文档：本地开发默认开启，生产需设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/docs`
 - OpenAPI：本地开发默认开启，生产需设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/openapi.json`
+- API 契约快照：`python scripts/openapi_contract.py` 检查，`python scripts/openapi_contract.py --write` 更新 `docs/api/openapi-contract.json`
 
 ### 3. 启动前端
 

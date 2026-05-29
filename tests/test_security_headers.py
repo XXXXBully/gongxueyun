@@ -1,9 +1,22 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi import HTTPException
-from starlette.responses import Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
+from starlette.responses import JSONResponse, Response
+
+
+class FakeStreamingRequest:
+    def __init__(self, *, method="POST", headers=None, chunks=None):
+        self.method = method
+        self.headers = headers or {}
+        self._chunks = list(chunks or [])
+
+    async def stream(self):
+        for chunk in self._chunks:
+            yield chunk
 
 
 class SecurityHeadersTest(unittest.TestCase):
@@ -87,6 +100,87 @@ class SecurityHeadersTest(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(_resolve_cors_origins(), ["*"])
+
+    def test_request_body_limit_defaults_to_disabled_in_development(self):
+        from server.main import _max_request_body_bytes, _request_body_too_large
+
+        with patch.dict("os.environ", {"APP_ENV": "development", "MAX_REQUEST_BODY_BYTES": ""}, clear=False):
+            limit = _max_request_body_bytes()
+            self.assertEqual(limit, 0)
+            self.assertFalse(_request_body_too_large(SimpleNamespace(method="POST", headers={"content-length": "2048"}), limit))
+
+    def test_request_body_limit_uses_configured_limit_and_detects_large_payloads(self):
+        from server.main import _max_request_body_bytes, _request_body_too_large
+
+        with patch.dict("os.environ", {"APP_ENV": "production", "MAX_REQUEST_BODY_BYTES": "1024"}, clear=False):
+            self.assertEqual(_max_request_body_bytes(), 1024)
+            self.assertTrue(_request_body_too_large(SimpleNamespace(method="POST", headers={"content-length": "2048"}), 1024))
+
+    def test_streaming_request_body_limit_rejects_chunked_large_payloads(self):
+        from server.main import _cache_request_body_with_limit
+
+        request = FakeStreamingRequest(headers={}, chunks=[b"a" * 600, b"b" * 600])
+
+        too_large = asyncio.run(_cache_request_body_with_limit(request, 1024))
+
+        self.assertTrue(too_large)
+
+    def test_streaming_request_body_limit_caches_safe_payloads_for_downstream(self):
+        from server.main import _cache_request_body_with_limit
+
+        request = FakeStreamingRequest(headers={}, chunks=[b"abc", b"def"])
+
+        too_large = asyncio.run(_cache_request_body_with_limit(request, 1024))
+
+        self.assertFalse(too_large)
+        self.assertEqual(request._body, b"abcdef")
+
+    def test_request_body_limit_keeps_safe_body_readable_by_endpoint(self):
+        from server.main import _cache_request_body_with_limit
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def body_limit(request, call_next):
+            if await _cache_request_body_with_limit(request, 8):
+                return JSONResponse(status_code=413, content={"detail": "too large"})
+            return await call_next(request)
+
+        @app.post("/echo-size")
+        async def echo_size(request: Request):
+            return {"size": len(await request.body())}
+
+        client = TestClient(app)
+
+        self.assertEqual(client.post("/echo-size", content=b"abcdef").json(), {"size": 6})
+        self.assertEqual(client.post("/echo-size", content=b"abcdefghi").status_code, 413)
+
+    def test_trusted_hosts_are_loaded_from_env(self):
+        from server.main import _resolve_trusted_hosts
+
+        with patch.dict("os.environ", {"TRUSTED_HOSTS": "api.example.com, admin.example.com"}, clear=False):
+            self.assertEqual(_resolve_trusted_hosts(), ["api.example.com", "admin.example.com"])
+
+    def test_trusted_hosts_fall_back_to_cors_origins(self):
+        from server.main import _resolve_trusted_hosts
+
+        with patch.dict(
+            "os.environ",
+            {"TRUSTED_HOSTS": "", "FRONTEND_ORIGINS": "https://admin.example.com,https://app.example.com:8443"},
+            clear=False,
+        ):
+            self.assertEqual(_resolve_trusted_hosts(), ["admin.example.com", "app.example.com"])
+
+    def test_trusted_hosts_fail_closed_in_production_when_missing(self):
+        from server.main import _resolve_trusted_hosts
+
+        with patch.dict(
+            "os.environ",
+            {"APP_ENV": "production", "TRUSTED_HOSTS": "", "FRONTEND_ORIGINS": "", "CORS_ORIGINS": ""},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                _resolve_trusted_hosts()
 
 
 if __name__ == "__main__":

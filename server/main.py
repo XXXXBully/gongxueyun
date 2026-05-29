@@ -1,13 +1,15 @@
 import os
 import time
 import logging
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from sqlalchemy import text
-from server.database import create_db_and_tables, engine, should_run_runtime_schema_migrations
+from server.database import create_db_and_tables, engine, require_database_schema_current, should_run_runtime_schema_migrations
 from server.api import router
 from server.scheduler import is_scheduler_running, start_scheduler
 from server.admin_users import ensure_seed_admin_users
@@ -15,7 +17,7 @@ from server.queue_worker import is_queue_worker_running, start_queue_worker, sto
 from server.runtime_mode import should_start_background_services
 from server.observability import prometheus_metrics_text, record_http_request, runtime_metrics
 from server.request_context import request_context
-from server.security import apply_security_headers, require_metrics_access, should_reject_cookie_csrf
+from server.security import apply_security_headers, is_production, require_metrics_access, should_reject_cookie_csrf
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,91 @@ def _should_expose_api_docs() -> bool:
     return app_env not in {"prod", "production"}
 
 
+def _split_env_list(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").replace(";", ",").split(",") if item.strip()]
+
+
+def _origin_host(value: str) -> str:
+    parsed = urlparse((value or "").strip())
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    return parsed.hostname.lower()
+
+
+def _resolve_trusted_hosts() -> list[str]:
+    hosts: list[str] = []
+    for value in _split_env_list(os.getenv("TRUSTED_HOSTS") or ""):
+        lowered = value.lower()
+        if lowered and lowered not in hosts:
+            hosts.append(lowered)
+    if hosts:
+        return hosts
+
+    for env_name in ("FRONTEND_ORIGINS", "CORS_ORIGINS"):
+        for value in _split_env_list(os.getenv(env_name) or ""):
+            host = _origin_host(value)
+            if host and host not in hosts:
+                hosts.append(host)
+
+    if hosts:
+        return hosts
+
+    if is_production():
+        if _bool_env("ALLOW_MISSING_TRUSTED_HOSTS"):
+            logger.warning("TRUSTED_HOSTS is not configured; Host header validation is explicitly disabled")
+            return []
+        raise RuntimeError("TRUSTED_HOSTS or FRONTEND_ORIGINS/CORS_ORIGINS must be configured in production")
+    return []
+
+
+def _max_request_body_bytes() -> int:
+    default = 8 * 1024 * 1024 if is_production() else 0
+    raw = os.getenv("MAX_REQUEST_BODY_BYTES")
+    if raw is not None and str(raw).strip():
+        try:
+            return max(0, min(int(str(raw).strip()), 10 * 1024 * 1024))
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _request_body_too_large(request: Request, limit: int) -> bool:
+    if limit <= 0:
+        return False
+    if (getattr(request, "method", "") or "").upper() in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+        return False
+    headers = getattr(request, "headers", {}) or {}
+    content_length = headers.get("content-length")
+    if not content_length:
+        return False
+    try:
+        return int(content_length) > limit
+    except (TypeError, ValueError):
+        return False
+
+
+async def _cache_request_body_with_limit(request: Request, limit: int) -> bool:
+    if limit <= 0:
+        return False
+    if (getattr(request, "method", "") or "").upper() in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+        return False
+    if _request_body_too_large(request, limit):
+        return True
+
+    body_parts: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            return True
+        body_parts.append(chunk)
+
+    setattr(request, "_body", b"".join(body_parts))
+    return False
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     on_startup()
@@ -60,6 +147,10 @@ app = FastAPI(
     openapi_url="/openapi.json" if _should_expose_api_docs() else None,
 )
 
+trusted_hosts = _resolve_trusted_hosts()
+if trusted_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+
 @app.middleware("http")
 async def _security_headers(request, call_next):
     started = time.perf_counter()
@@ -67,6 +158,13 @@ async def _security_headers(request, call_next):
     path = request.url.path or "/"
     with request_context(request.headers.get("x-request-id")) as request_id:
         try:
+            max_body_bytes = _max_request_body_bytes()
+            if await _cache_request_body_with_limit(request, max_body_bytes):
+                resp = JSONResponse(status_code=413, content={"detail": "Request body too large"})
+                status_code = int(resp.status_code or 0)
+                apply_security_headers(resp)
+                resp.headers["X-Request-ID"] = request_id
+                return resp
             if should_reject_cookie_csrf(request):
                 resp = JSONResponse(status_code=403, content={"detail": "CSRF origin rejected"})
             else:
@@ -132,6 +230,7 @@ def on_startup():
     if should_run_runtime_schema_migrations():
         create_db_and_tables()
     else:
+        require_database_schema_current(engine)
         logger.info("runtime schema migrations are disabled; run alembic before startup")
     ensure_seed_admin_users()
 

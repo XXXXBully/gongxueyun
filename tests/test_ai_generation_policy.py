@@ -1,5 +1,7 @@
 import socket
+import threading
 import unittest
+import importlib
 from unittest.mock import patch
 
 from server.coreApi.AiServiceClient import _ai_endpoint_detail, _validate_ai_endpoint_policy, generate_article
@@ -10,7 +12,7 @@ class FakeAIResponse:
         return None
 
     def json(self):
-        return {"choices": [{"message": {"content": "这是一段符合要求的实习日报内容。"}}]}
+        return {"choices": [{"message": {"content": "Generated weekly report content."}}]}
 
 
 class FakeConfig:
@@ -19,9 +21,16 @@ class FakeConfig:
             "config.ai.apikey": "test-key",
             "config.ai.apiUrl": "https://api.example.com",
             "config.ai.model": "test-model",
-            "userInfo.orgJson.majorName": "软件工程",
+            "userInfo.orgJson.majorName": "Computer Science",
         }
         return values.get(key)
+
+
+class BlockedModelConfig(FakeConfig):
+    def get_value(self, key):
+        if key == "config.ai.model":
+            return "blocked-model"
+        return super().get_value(key)
 
 
 class AIGenerationPolicyTest(unittest.TestCase):
@@ -54,17 +63,23 @@ class AIGenerationPolicyTest(unittest.TestCase):
         self.assertEqual(detail["host"], "127.0.0.1")
         self.assertNotIn("secret", str(detail))
 
-    def test_generate_article_pins_validated_dns_and_uses_short_timeout(self):
-        resolve_calls = []
+    def test_model_allowlist_blocks_unapproved_model(self):
+        with patch.dict(
+            "os.environ",
+            {"AI_ALLOWED_MODELS": "approved-model", "AI_ALLOWED_HOSTS": "", "ALLOW_PRIVATE_AI_ENDPOINTS": ""},
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                generate_article(BlockedModelConfig(), "weekly report", {"practiceCompanyEntity": {}}, count=50)
 
+    def test_generate_article_pins_validated_dns_and_uses_short_timeout(self):
         def fake_getaddrinfo(host, port, *args, **kwargs):
-            resolve_calls.append((host, port))
-            if len(resolve_calls) == 1:
-                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", int(port)))]
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port)))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", int(port)))]
 
         def fake_post(url, **kwargs):
+            self.assertEqual(url, "https://api.example.com/v1/chat/completions")
             self.assertLessEqual(kwargs["timeout"], 60)
+            self.assertIn("Prompt-Version:", kwargs["json"]["messages"][0]["content"])
             resolved = socket.getaddrinfo("api.example.com", 443, type=socket.SOCK_STREAM)
             self.assertEqual(resolved[0][4][0], "93.184.216.34")
             return FakeAIResponse()
@@ -74,9 +89,49 @@ class AIGenerationPolicyTest(unittest.TestCase):
             patch("server.coreApi.AiServiceClient.socket.getaddrinfo", side_effect=fake_getaddrinfo),
             patch("server.coreApi.AiServiceClient.requests.post", side_effect=fake_post),
         ):
-            content = generate_article(FakeConfig(), "日报", {"practiceCompanyEntity": {}}, count=50)
+            content = generate_article(FakeConfig(), "weekly report", {"practiceCompanyEntity": {}}, count=50)
 
-        self.assertIn("实习日报", content)
+        self.assertIn("Generated weekly report", content)
+
+    def test_dns_pin_does_not_leak_across_threads(self):
+        from server.coreApi import AiServiceClient as client_module
+
+        pinned_infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        fallback_infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.10", 443))]
+        barrier = threading.Barrier(2)
+        worker_ready = threading.Event()
+        worker_result = {}
+
+        def fake_original(host, port, *args, **kwargs):
+            return fallback_infos if host == "api.example.com" else []
+
+        def worker():
+            barrier.wait()
+            worker_result["infos"] = socket.getaddrinfo("api.example.com", 443, type=socket.SOCK_STREAM)
+            worker_ready.set()
+
+        with patch.object(client_module, "_ORIGINAL_GETADDRINFO", side_effect=fake_original):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            with client_module._pin_getaddrinfo("api.example.com", 443, pinned_infos):
+                barrier.wait()
+                main_result = socket.getaddrinfo("api.example.com", 443, type=socket.SOCK_STREAM)
+                self.assertTrue(worker_ready.wait(timeout=5))
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(main_result[0][4][0], "93.184.216.34")
+        self.assertEqual(worker_result["infos"][0][4][0], "198.51.100.10")
+
+    def test_import_does_not_patch_socket_getaddrinfo(self):
+        from server.coreApi import AiServiceClient as client_module
+
+        original = socket.getaddrinfo
+        try:
+            importlib.reload(client_module)
+            self.assertIs(socket.getaddrinfo, original)
+        finally:
+            socket.getaddrinfo = original
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import json
 import os
 import time
 import secrets
+import logging
 from functools import lru_cache
 from urllib.parse import quote
 from fastapi import Depends, HTTPException, Request
@@ -22,6 +23,7 @@ from server.security import (
 
 _bearer = HTTPBearer(auto_error=False)
 _SECRET_CACHE: bytes | None = None
+logger = logging.getLogger(__name__)
 ROLE_PERMISSIONS = {
     "admin": {
         "audit:read",
@@ -58,6 +60,37 @@ ROLE_PERMISSIONS = {
         "tasks:run",
     },
 }
+
+
+@lru_cache(maxsize=16)
+def _parsed_role_permissions_override(raw: str | None) -> dict[str, set[str]]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except Exception:
+        logger.warning("Ignoring invalid ROLE_PERMISSIONS_JSON override")
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring non-object ROLE_PERMISSIONS_JSON override")
+        return {}
+    override: dict[str, set[str]] = {}
+    for role, permissions in payload.items():
+        role_name = str(role or "").strip()
+        if not role_name:
+            continue
+        if not isinstance(permissions, (list, tuple, set)):
+            logger.warning("Ignoring ROLE_PERMISSIONS_JSON entry for role %s", role_name)
+            continue
+        normalized = {str(item or "").strip() for item in permissions if str(item or "").strip()}
+        if normalized:
+            override[role_name] = normalized
+    return override
+
+
+def _role_permissions_override() -> dict[str, set[str]]:
+    return _parsed_role_permissions_override(os.getenv("ROLE_PERMISSIONS_JSON"))
 
 def _b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
@@ -303,7 +336,11 @@ def require_roles(payload: dict, roles: list[str]) -> dict:
 
 
 def permissions_for_role(role: str) -> set[str]:
-    return set(ROLE_PERMISSIONS.get(str(role or ""), set()))
+    role_name = str(role or "")
+    override = _role_permissions_override().get(role_name)
+    if override is not None:
+        return set(override)
+    return set(ROLE_PERMISSIONS.get(role_name, set()))
 
 
 def permissions_for_payload(payload: dict | None) -> set[str]:

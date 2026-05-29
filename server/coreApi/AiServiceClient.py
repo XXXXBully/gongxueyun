@@ -1,9 +1,11 @@
-import logging
+import contextvars
+import fnmatch
 import os
 import time
 import ipaddress
 import logging
 import socket
+import threading
 from contextlib import contextmanager
 from typing import Dict, Any, Optional
 from urllib.parse import urljoin, urlparse
@@ -14,6 +16,50 @@ from requests.exceptions import RequestException
 from server.util.HelperFunctions import strip_markdown
 
 logger = logging.getLogger(__name__)
+DEFAULT_AI_PROMPT_VERSION = "2026-05-29.1"
+_ORIGINAL_GETADDRINFO = getattr(socket.getaddrinfo, "_automoguding_original", socket.getaddrinfo)
+_PINNED_GETADDRINFO_CONTEXT = contextvars.ContextVar("automoguding_ai_pinned_getaddrinfo", default=None)
+_GETADDRINFO_PATCH_LOCK = threading.RLock()
+_GETADDRINFO_PATCH_DEPTH = 0
+_GETADDRINFO_PATCH_PREVIOUS = None
+
+
+def _getaddrinfo_with_context_pin(query_host, query_port, *args, **kwargs):
+    pinned = _PINNED_GETADDRINFO_CONTEXT.get()
+    if pinned:
+        pinned_host, pinned_port, pinned_infos = pinned
+        try:
+            query_port_int = int(query_port or pinned_port)
+        except Exception:
+            query_port_int = pinned_port
+        if (
+            str(query_host or "").strip().lower() == pinned_host
+            and query_port_int == pinned_port
+            and pinned_infos
+        ):
+            return list(pinned_infos)
+    return _ORIGINAL_GETADDRINFO(query_host, query_port, *args, **kwargs)
+
+
+_getaddrinfo_with_context_pin._automoguding_original = _ORIGINAL_GETADDRINFO
+
+
+@contextmanager
+def _patched_getaddrinfo():
+    global _GETADDRINFO_PATCH_DEPTH, _GETADDRINFO_PATCH_PREVIOUS
+    with _GETADDRINFO_PATCH_LOCK:
+        if _GETADDRINFO_PATCH_DEPTH == 0:
+            _GETADDRINFO_PATCH_PREVIOUS = socket.getaddrinfo
+            socket.getaddrinfo = _getaddrinfo_with_context_pin
+        _GETADDRINFO_PATCH_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _GETADDRINFO_PATCH_LOCK:
+            _GETADDRINFO_PATCH_DEPTH = max(0, _GETADDRINFO_PATCH_DEPTH - 1)
+            if _GETADDRINFO_PATCH_DEPTH == 0 and _GETADDRINFO_PATCH_PREVIOUS is not None:
+                socket.getaddrinfo = _GETADDRINFO_PATCH_PREVIOUS
+                _GETADDRINFO_PATCH_PREVIOUS = None
 
 def _resolve_chat_completions_url(api_base_url: str) -> str:
     base = (api_base_url or "").strip().rstrip("/")
@@ -36,6 +82,23 @@ def _host_matches_allowlist(host: str, allowed_hosts: list[str]) -> bool:
     if "*" in allowed_hosts or host in allowed_hosts:
         return True
     return any(item.startswith(".") and host.endswith(item) for item in allowed_hosts)
+
+
+def get_ai_prompt_version() -> str:
+    return (os.getenv("AI_PROMPT_VERSION") or DEFAULT_AI_PROMPT_VERSION).strip() or DEFAULT_AI_PROMPT_VERSION
+
+
+def _validate_ai_model_policy(model: str) -> str:
+    model_name = str(model or "").strip()
+    if not model_name:
+        raise ValueError("AI model is required")
+    allowed_models = _split_env_list(os.getenv("AI_ALLOWED_MODELS") or "")
+    if not allowed_models:
+        return model_name
+    lowered = model_name.lower()
+    if any(item == "*" or fnmatch.fnmatchcase(lowered, item) for item in allowed_models):
+        return model_name
+    raise ValueError("AI model is not in AI_ALLOWED_MODELS")
 
 
 def _is_private_or_special_ip(value: str) -> bool:
@@ -77,24 +140,14 @@ def _resolve_host_for_endpoint_policy(host: str, port: int) -> tuple[bool, list]
 
 @contextmanager
 def _pin_getaddrinfo(host: str, port: int, infos: list):
-    original_getaddrinfo = socket.getaddrinfo
     normalized_host = (host or "").strip().lower()
     normalized_port = int(port)
-
-    def pinned_getaddrinfo(query_host, query_port, *args, **kwargs):
-        if (
-            (str(query_host or "").strip().lower() == normalized_host)
-            and int(query_port or normalized_port) == normalized_port
-            and infos
-        ):
-            return infos
-        return original_getaddrinfo(query_host, query_port, *args, **kwargs)
-
-    socket.getaddrinfo = pinned_getaddrinfo
+    token = _PINNED_GETADDRINFO_CONTEXT.set((normalized_host, normalized_port, list(infos or [])))
     try:
-        yield
+        with _patched_getaddrinfo():
+            yield
     finally:
-        socket.getaddrinfo = original_getaddrinfo
+        _PINNED_GETADDRINFO_CONTEXT.reset(token)
 
 
 def _ai_endpoint_detail(api_url: str) -> Dict[str, Any]:
@@ -158,6 +211,10 @@ def _ai_max_retries(value: Any) -> int:
     return _clamp_int(value, default=configured_max, min_value=1, max_value=configured_max)
 
 
+def _ai_max_output_tokens() -> int:
+    return _clamp_int(os.getenv("AI_MAX_OUTPUT_TOKENS"), default=1200, min_value=256, max_value=4000)
+
+
 def _submitted_report_prompts(submitted_reports: Optional[list]) -> str:
     if not isinstance(submitted_reports, list):
         return ""
@@ -210,7 +267,7 @@ def generate_article(
     # 获取所有配置，仅调用一次
     api_key = config.get_value("config.ai.apikey")
     api_base_url = config.get_value("config.ai.apiUrl")
-    api_model = config.get_value("config.ai.model")
+    api_model = _validate_ai_model_policy(config.get_value("config.ai.model"))
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -237,6 +294,7 @@ def generate_article(
         "遇到问题：\n\nxxxxxx\n\n自我评价：\n\nxxxxxx")
 
     # 提取公司信息，保证对象安全
+    system_prompt = f"Prompt-Version: {get_ai_prompt_version()}\n" + system_prompt
     company_info = job_info.get("practiceCompanyEntity", {}) or {}
     majorName = config.get_value('userInfo.orgJson.majorName')
     data = {
@@ -259,7 +317,7 @@ def generate_article(
                  f"公司所属行业：{company_info.get('tradeValue', '未提供')}"),
             },
         ],
-        "max_tokens": 1200,
+        "max_tokens": _ai_max_output_tokens(),
     }
     prompts = _submitted_report_prompts(submitted_reports)
     if prompts:

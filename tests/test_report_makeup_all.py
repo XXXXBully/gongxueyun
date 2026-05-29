@@ -33,6 +33,8 @@ class ReportMakeupAllTest(unittest.TestCase):
                     "meta": api._get_report_meta("daily"),
                     "content": "report-1",
                     "config_data": {"runtime": "first"},
+                    "submitted": {},
+                    "job_info": {},
                 },
                 {
                     "api_client": clients[1],
@@ -40,6 +42,8 @@ class ReportMakeupAllTest(unittest.TestCase):
                     "meta": api._get_report_meta("daily"),
                     "content": "report-2",
                     "config_data": {"runtime": "second"},
+                    "submitted": {},
+                    "job_info": {},
                 },
             ]
             build_report.side_effect = [
@@ -86,6 +90,8 @@ class ReportMakeupAllTest(unittest.TestCase):
                         "meta": api._get_report_meta(report_key),
                         "content": "report",
                         "config_data": {},
+                        "submitted": {},
+                        "job_info": {},
                     }
 
                     result, _, target_periods = api._makeup_all_reports_for_user(user, report_key)
@@ -192,6 +198,34 @@ class ReportMakeupAllTest(unittest.TestCase):
             )
 
         self.assertEqual(cm.exception.status_code, 400)
+
+    def test_build_report_info_uses_cached_context_when_available(self):
+        api_client = Mock()
+        api_client.get_submitted_reports_info.side_effect = AssertionError("should not refetch submitted reports")
+        api_client.get_job_info.side_effect = AssertionError("should not refetch job info")
+        api_client.get_from_info.return_value = []
+
+        report_info = api._build_report_info(
+            api_client=api_client,
+            config=ConfigManager(config={}),
+            meta=api._get_report_meta("daily"),
+            content="daily content",
+            target_period="2026-05-22",
+            submitted={
+                "flag": 2,
+                "data": [
+                    {
+                        "reportTime": "2026-05-21 12:00:00",
+                    }
+                ],
+            },
+            job_info={"jobId": "job-1"},
+        )
+
+        self.assertEqual(report_info["title"], "第3天日报")
+        api_client.get_submitted_reports_info.assert_not_called()
+        api_client.get_job_info.assert_not_called()
+        api_client.get_from_info.assert_called_once_with(7)
 
 
 if __name__ == "__main__":

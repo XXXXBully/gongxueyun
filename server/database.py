@@ -48,6 +48,41 @@ def should_run_runtime_schema_migrations() -> bool:
     return app_env not in {"prod", "production"}
 
 
+def _alembic_script_directory():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(PROJECT_ROOT / "server" / "migrations"))
+    return ScriptDirectory.from_config(config)
+
+
+def get_alembic_heads() -> set[str]:
+    return {str(head) for head in _alembic_script_directory().get_heads()}
+
+
+def get_database_alembic_heads(db_engine=None) -> set[str]:
+    from alembic.runtime.migration import MigrationContext
+
+    db = db_engine if db_engine is not None else engine
+    with db.connect() as connection:
+        context = MigrationContext.configure(connection)
+        return {str(head) for head in context.get_current_heads() if head is not None}
+
+
+def require_database_schema_current(db_engine=None) -> None:
+    expected_heads = get_alembic_heads()
+    current_heads = get_database_alembic_heads(db_engine)
+    if current_heads == expected_heads:
+        return
+    raise RuntimeError(
+        "Database schema is not at Alembic head; "
+        f"current={sorted(current_heads) or ['<none>']}, "
+        f"expected={sorted(expected_heads) or ['<none>']}. "
+        "Run `python -m alembic upgrade head` before startup."
+    )
+
+
 def _engine_options(database_url: str) -> dict:
     options = {"pool_pre_ping": True}
     if database_url.lower().startswith("mysql+pymysql://"):

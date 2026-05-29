@@ -65,3 +65,7 @@ Thumbs.db
 docs/*
 !docs/
 !docs/current-features.md
+!docs/api/
+!docs/api/openapi-contract.json
+!docs/ops/
+!docs/ops/runbook.md

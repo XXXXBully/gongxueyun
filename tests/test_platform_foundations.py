@@ -72,6 +72,24 @@ class PlatformFoundationsTest(unittest.TestCase):
         with patch.dict("os.environ", {"APP_ENV": "development"}, clear=False):
             self.assertTrue(should_run_runtime_schema_migrations())
 
+    def test_database_schema_must_be_current_when_runtime_migrations_are_disabled(self):
+        from server.database import require_database_schema_current
+
+        with self.assertRaises(RuntimeError):
+            require_database_schema_current(self.engine)
+
+    def test_startup_checks_schema_when_runtime_migrations_are_disabled(self):
+        from server import main
+
+        with patch("server.main.should_run_runtime_schema_migrations", return_value=False), \
+            patch("server.main.require_database_schema_current") as require_current, \
+            patch("server.main.ensure_seed_admin_users"), \
+            patch("server.main._should_auto_download_captcha_models", return_value=False), \
+            patch("server.main.should_start_background_services", return_value=False):
+            main.on_startup()
+
+        require_current.assert_called_once()
+
     def test_mysql_engine_uses_explicit_pool_settings(self):
         from server.database import _engine_options
 
@@ -346,6 +364,9 @@ class PlatformFoundationsTest(unittest.TestCase):
         self.assertIn("pip-audit", workflow)
         self.assertIn("npm audit", workflow)
         self.assertIn("aquasecurity/trivy-action", workflow)
+        self.assertIn("aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1", workflow)
+        self.assertNotIn("aquasecurity/setup-trivy@v0.2.1", workflow)
+        self.assertNotIn("aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2", workflow)
 
     def test_ci_generates_signed_supply_chain_artifacts(self):
         workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
@@ -364,7 +385,7 @@ class PlatformFoundationsTest(unittest.TestCase):
 
         self.assertIn("FROM node:20-alpine@", dockerfile)
         self.assertIn("FROM python:3.10-slim@", dockerfile)
-        self.assertIn("ACTIONS_ALLOW_UNPINNED", workflow)
+        self.assertNotIn("ACTIONS_ALLOW_UNPINNED", workflow)
         self.assertIn("Verify action pinning", workflow)
 
     def test_ci_runs_frontend_quality_gates(self):

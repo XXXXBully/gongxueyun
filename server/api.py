@@ -9,7 +9,14 @@ from server.task_runner import perform_clock_in_makeup, perform_clock_in_makeup_
 from server.clockin_backfill import build_missing_clockin_day_options, normalize_clockin_records, parse_clockin_date
 from server.util.Config import ConfigManager
 from server.coreApi.MainLogicApi import ApiClient
-from server.coreApi.AiServiceClient import generate_article, _ai_endpoint_detail
+from server.coreApi.AiServiceClient import generate_article, _ai_endpoint_detail, get_ai_prompt_version
+from server.ai_governance import check_ai_generation_quota
+from server.idempotency import (
+    build_idempotency_request_hash,
+    claim_idempotency_record,
+    finalize_idempotency_record,
+    peek_idempotency_response,
+)
 from typing import List, Any, Dict, Optional
 import datetime
 import hashlib
@@ -60,6 +67,14 @@ MAPCHAXUN_GEOCODE_URL = "https://www.mapchaxun.cn/api/getSolidAdress"
 NOTIFICATION_SETTINGS_KEY = "notifications"
 DEFAULT_REPORT_MAKEUP_BATCH_DELAY_SECONDS = 2.0
 MAX_REPORT_MAKEUP_BATCH_DELAY_SECONDS = 30.0
+IDEMPOTENCY_BATCH_RUN_SETTING_PREFIX = "idempotency:batch-run"
+IDEMPOTENCY_MANUAL_SETTING_PREFIX = "idempotency:manual"
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+IDEMPOTENCY_STATUS_PENDING = "pending"
+IDEMPOTENCY_STATUS_COMPLETED = "completed"
+IDEMPOTENCY_STATUS_FAILED = "failed"
+IDEMPOTENCY_TTL_SECONDS = 7 * 24 * 3600
 
 
 def _report_makeup_batch_delay_seconds() -> float:
@@ -71,6 +86,137 @@ def _report_makeup_batch_delay_seconds() -> float:
     if value < 0:
         return 0.0
     return min(value, MAX_REPORT_MAKEUP_BATCH_DELAY_SECONDS)
+
+
+def _normalize_idempotency_key(raw_key: Optional[str]) -> Optional[str]:
+    if raw_key is None:
+        return None
+    key = str(raw_key).strip()
+    if not key:
+        return None
+    if len(key) > IDEMPOTENCY_KEY_MAX_LENGTH or not IDEMPOTENCY_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key header")
+    return key
+
+
+def _batch_run_idempotency_storage_key(idempotency_key: str) -> str:
+    return f"{IDEMPOTENCY_BATCH_RUN_SETTING_PREFIX}:{idempotency_key}"
+
+
+def _manual_operation_idempotency_storage_key(operation: str, idempotency_key: str) -> str:
+    return f"{IDEMPOTENCY_MANUAL_SETTING_PREFIX}:{operation}:{idempotency_key}"
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _batch_run_request_hash(*, ids: List[int], concurrency: int, tenant_id: str, actor: str) -> str:
+    payload = {
+        "actor": str(actor or ""),
+        "concurrency": int(concurrency or 0),
+        "ids": [int(x) for x in ids],
+        "tenant_id": str(tenant_id or DEFAULT_TENANT_ID),
+    }
+    return build_idempotency_request_hash(payload)
+
+
+def _operation_request_hash(payload: Any) -> str:
+    return build_idempotency_request_hash(payload)
+
+
+def _batch_run_idempotency_value(
+    *,
+    request_hash: str,
+    status: str,
+    response: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "fingerprint": request_hash,
+        "status": status,
+        "updated_at": utc_now().isoformat(timespec="seconds"),
+    }
+    if response is not None:
+        value["response"] = response
+    if error:
+        value["error"] = str(error)[:500]
+    return value
+
+
+def _operation_idempotency_value(
+    *,
+    request_hash: str,
+    status: str,
+    response: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> dict[str, Any]:
+    return _batch_run_idempotency_value(
+        request_hash=request_hash,
+        status=status,
+        response=response,
+        error=error,
+    )
+
+
+def _batch_run_idempotency_record_expired(value: dict[str, Any]) -> bool:
+    try:
+        updated_at = datetime.datetime.fromisoformat(str(value.get("updated_at") or "").replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=datetime.timezone.utc)
+    ttl_seconds = int_env("IDEMPOTENCY_TTL_SECONDS", IDEMPOTENCY_TTL_SECONDS, min_value=300, max_value=30 * 24 * 3600)
+    return (utc_now() - updated_at).total_seconds() > ttl_seconds
+
+
+def _batch_run_idempotency_record(session: Session, tenant_id: str, idempotency_key: str) -> SystemSetting | None:
+    return get_setting(session, _batch_run_idempotency_storage_key(idempotency_key), tenant_id)
+
+
+def _manual_operation_idempotency_record(
+    session: Session,
+    *,
+    tenant_id: str,
+    operation: str,
+    idempotency_key: str,
+) -> SystemSetting | None:
+    return get_setting(session, _manual_operation_idempotency_storage_key(operation, idempotency_key), tenant_id)
+
+
+def _batch_run_existing_response(
+    session: Session,
+    *,
+    tenant_id: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> Optional[dict[str, Any]]:
+    return peek_idempotency_response(
+        db_engine=engine,
+        tenant_id=tenant_id,
+        logical_key=_batch_run_idempotency_storage_key(idempotency_key),
+        request_hash=request_hash,
+        conflict_detail="Idempotency key already used with different batch parameters",
+        pending_detail="Batch request is already being processed",
+    )
+
+
+def _manual_operation_existing_response(
+    session: Session,
+    *,
+    tenant_id: str,
+    operation: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> Optional[dict[str, Any]]:
+    return peek_idempotency_response(
+        db_engine=engine,
+        tenant_id=tenant_id,
+        logical_key=_manual_operation_idempotency_storage_key(operation, idempotency_key),
+        request_hash=request_hash,
+        conflict_detail="Idempotency key already used with different request parameters",
+        pending_detail="Request is already being processed",
+    )
 
 
 def _notification_settings_row(session: Session, tenant_id: str = DEFAULT_TENANT_ID) -> SystemSetting | None:
@@ -133,6 +279,7 @@ def _ai_audit_detail(config: ConfigManager, title: str, extra: Optional[Dict[str
         "title": title,
         "endpoint": _ai_endpoint_detail(str(ai_cfg.get("apiUrl") or "")),
         "model": str(ai_cfg.get("model") or ""),
+        "prompt_version": get_ai_prompt_version(),
     }
     if extra:
         detail.update(extra)
@@ -744,25 +891,27 @@ def _build_report_info(
     meta: Dict[str, Any],
     content: str,
     target_period: Optional[str],
+    submitted: Optional[Dict[str, Any]] = None,
+    job_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     report_type = meta["report_type"]
     current_time = _parse_report_target_for_api(report_type, target_period)
-    submitted = api_client.get_submitted_reports_info(report_type) or {}
-    submitted_reports = submitted.get("data", []) if isinstance(submitted, dict) else []
-    count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
+    submitted_data = submitted if isinstance(submitted, dict) else api_client.get_submitted_reports_info(report_type) or {}
+    submitted_reports = submitted_data.get("data", []) if isinstance(submitted_data, dict) else []
+    count = (submitted_data.get("flag", 0) if isinstance(submitted_data, dict) else 0) + 1
     title = f"第{count}天日报" if report_type == "day" else (f"第{count}周周报" if report_type == "week" else f"第{count}月月报")
     weeks_label = f"第{count}周"
     if isinstance(submitted_reports, list):
         for report in submitted_reports:
             if _same_api_report_period(report, report_type, current_time, weeks_label):
                 raise HTTPException(status_code=400, detail=f"该{meta['task_name']}周期已经提交过")
-    job_info = api_client.get_job_info()
+    job_data = job_info if isinstance(job_info, dict) else api_client.get_job_info()
     report_info = {
         "title": title,
         "content": content,
         "attachments": "",
         "reportType": report_type,
-        "jobId": job_info.get("jobId", None),
+        "jobId": job_data.get("jobId", None),
         "reportTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
         "formFieldDtoList": api_client.get_from_info(int(meta["form_type"])),
     }
@@ -783,19 +932,22 @@ def _generate_report_content_for_user(user: User, report_key: str, target_period
     config_data = user_to_config(user)
     config = ConfigManager(config=config_data)
     api_client = ApiClient(config)
-    _ensure_remote_runtime(api_client, config)
     report_type = meta["report_type"]
-    submitted = api_client.get_submitted_reports_info(report_type) or {}
-    count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
-    title = f"第{count}天日报" if report_type == "day" else (f"第{count}周周报" if report_type == "week" else f"第{count}月月报")
-    job_info = api_client.get_job_info()
-    content = ""
     if generate_content:
         ai_cfg = config.get_value("config.ai")
         if not isinstance(ai_cfg, dict):
             raise HTTPException(status_code=400, detail="未配置 AI 参数")
         if not (str(ai_cfg.get("apikey") or "").strip()) or not (str(ai_cfg.get("apiUrl") or "").strip()) or not (str(ai_cfg.get("model") or "").strip()):
             raise HTTPException(status_code=400, detail="请先在 AI 设置中填写 API URL、API Key 和 Model")
+        check_ai_generation_quota(tenant_id=user.tenant_id, user_id=user.id)
+
+    _ensure_remote_runtime(api_client, config)
+    submitted = api_client.get_submitted_reports_info(report_type) or {}
+    count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
+    title = f"第{count}天日报" if report_type == "day" else (f"第{count}周周报" if report_type == "week" else f"第{count}月月报")
+    job_info = api_client.get_job_info()
+    content = ""
+    if generate_content:
         content = generate_article(
             config,
             title,
@@ -803,7 +955,16 @@ def _generate_report_content_for_user(user: User, report_key: str, target_period
             config.get_value(meta["paper_num_key"]),
             (submitted.get("data", []) if isinstance(submitted, dict) else [])[:4],
         )
-    return {"config_data": config_data, "title": title, "content": content, "api_client": api_client, "config": config, "meta": meta}
+    return {
+        "config_data": config_data,
+        "title": title,
+        "content": content,
+        "api_client": api_client,
+        "config": config,
+        "meta": meta,
+        "submitted": submitted,
+        "job_info": job_info,
+    }
 
 
 def _makeup_all_reports_for_user(user: User, report_key: str) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
@@ -837,6 +998,8 @@ def _makeup_all_reports_for_user(user: User, report_key: str) -> tuple[Dict[str,
                 meta=generated["meta"],
                 content=generated["content"],
                 target_period=period,
+                submitted=generated["submitted"],
+                job_info=generated["job_info"],
             )
             generated["api_client"].submit_report(report_info)
             latest_config_data = generated["config_data"]
@@ -1341,20 +1504,78 @@ def app_clockin_makeup(
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
     client_ip = get_client_ip(request)
-    _rate_limit(f"app_clockin_makeup:{client_ip}:{user.id}", limit=3, per_seconds=60)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(payload)
+    request_hash = ""
     try:
         target_dates = _clockin_makeup_dates_from_request(req)
         target_type = _clockin_makeup_type_from_request(req)
+        tenant_id = tenant_id_from_payload(payload)
+        request_hash = _operation_request_hash(
+            {
+                "actor": str(payload.get("sub") or ""),
+                "operation": "app.clockin.makeup",
+                "target_dates": target_dates,
+                "target_type": target_type,
+                "tenant_id": tenant_id,
+                "user_id": int(user.id),
+            }
+        )
+        if idempotency_key:
+            existing_response = _manual_operation_existing_response(
+                session,
+                tenant_id=tenant_id,
+                operation="app.clockin.makeup",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if existing_response is not None:
+                return existing_response
+        _rate_limit(f"app_clockin_makeup:{client_ip}:{user.id}", limit=3, per_seconds=60)
+        if idempotency_key:
+            claimed_response = claim_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup", idempotency_key),
+                request_hash=request_hash,
+                conflict_detail="Idempotency key already used with different request parameters",
+                pending_detail="Request is already being processed",
+            )
+            if claimed_response is not None:
+                return claimed_response
         result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
         sync_runtime_fields_to_user(user, config_data)
+        response_payload = {"ok": result.get("status") != "fail", "result": result}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
         session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.clockin.makeup", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
-        return {"ok": result.get("status") != "fail", "result": result}
+        return response_payload
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e) or "补卡失败")
 
 
@@ -1369,19 +1590,76 @@ def app_clockin_makeup_all(
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
     client_ip = get_client_ip(request)
-    _rate_limit(f"app_clockin_makeup_all:{client_ip}:{user.id}", limit=2, per_seconds=60)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(payload)
+    request_hash = ""
     try:
         target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
+        tenant_id = tenant_id_from_payload(payload)
+        request_hash = _operation_request_hash(
+            {
+                "actor": str(payload.get("sub") or ""),
+                "operation": "app.clockin.makeup_all",
+                "target_type": target_type,
+                "tenant_id": tenant_id,
+                "user_id": int(user.id),
+            }
+        )
+        if idempotency_key:
+            existing_response = _manual_operation_existing_response(
+                session,
+                tenant_id=tenant_id,
+                operation="app.clockin.makeup_all",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if existing_response is not None:
+                return existing_response
+        _rate_limit(f"app_clockin_makeup_all:{client_ip}:{user.id}", limit=2, per_seconds=60)
+        if idempotency_key:
+            claimed_response = claim_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                conflict_detail="Idempotency key already used with different request parameters",
+                pending_detail="Request is already being processed",
+            )
+            if claimed_response is not None:
+                return claimed_response
         result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
         sync_runtime_fields_to_user(user, config_data)
+        response_payload = {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
         session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.clockin.makeup_all", target_user_id=user.id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
-        return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+        return response_payload
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("app.clockin.makeup_all", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e) or "全部补卡失败")
 
 
@@ -1458,6 +1736,8 @@ def app_submit_report(
             meta=generated["meta"],
             content=content,
             target_period=req.target_period,
+            submitted=generated["submitted"],
+            job_info=generated["job_info"],
         )
         generated["api_client"].submit_report(report_info)
         sync_runtime_fields_to_user(user, generated["config_data"])
@@ -1501,24 +1781,10 @@ def app_generate_daily_report(
 ):
     app_user = _get_authed_app_user(session=session, payload=payload)
     user = _get_bound_task_user(session=session, app_user=app_user)
-    config_data = user_to_config(user)
-    config = ConfigManager(config=config_data)
-    api_client = ApiClient(config)
-
-    ai_cfg = config.get_value("config.ai")
-    if not isinstance(ai_cfg, dict):
-        raise HTTPException(status_code=400, detail="未配置 AI 参数")
-    if not (str(ai_cfg.get("apikey") or "").strip()) or not (str(ai_cfg.get("apiUrl") or "").strip()) or not (str(ai_cfg.get("model") or "").strip()):
-        raise HTTPException(status_code=400, detail="请先在 AI 设置中填写 API URL、API Key 和 Model")
-
     try:
-        _ensure_remote_runtime(api_client, config)
-
-        submitted = api_client.get_submitted_reports_info("day") or {}
+        generated = _generate_report_content_for_user(user, "daily", None)
+        submitted = generated["submitted"]
         data = submitted.get("data", []) if isinstance(submitted, dict) else []
-        count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
-        title = f"第{count}天日报"
-
         already_submitted = False
         current_time = datetime.datetime.now()
         if isinstance(data, list) and data:
@@ -1532,9 +1798,7 @@ def app_generate_daily_report(
                 except (TypeError, ValueError):
                     logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
-        job_info = api_client.get_job_info()
-        content = generate_article(config, title, job_info, config.get_value("planInfo.planPaper.dayPaperNum"))
-        sync_runtime_fields_to_user(user, config_data)
+        sync_runtime_fields_to_user(user, generated["config_data"])
         session.add(user)
         session.add(
             AuditLog(
@@ -1542,11 +1806,11 @@ def app_generate_daily_report(
                 actor=str(payload.get("sub")),
                 action="app.report.daily.generate",
                 target_user_id=user.id,
-                detail=_ai_audit_detail(config, title, {"already_submitted": already_submitted}),
+                detail=_ai_audit_detail(generated["config"], generated["title"], {"already_submitted": already_submitted}),
             )
         )
         session.commit()
-        return {"ok": True, "title": title, "content": content, "already_submitted": already_submitted}
+        return {"ok": True, "title": generated["title"], "content": generated["content"], "already_submitted": already_submitted}
     except HTTPException:
         raise
     except Exception as e:
@@ -1566,14 +1830,9 @@ def app_submit_daily_report(
     if not content:
         raise HTTPException(status_code=400, detail="日报内容不能为空")
 
-    config_data = user_to_config(user)
-    config = ConfigManager(config=config_data)
-    api_client = ApiClient(config)
-
     try:
-        _ensure_remote_runtime(api_client, config)
-
-        submitted = api_client.get_submitted_reports_info("day") or {}
+        generated = _generate_report_content_for_user(user, "daily", None, generate_content=False)
+        submitted = generated["submitted"]
         data = submitted.get("data", []) if isinstance(submitted, dict) else []
         current_time = datetime.datetime.now()
         if isinstance(data, list) and data:
@@ -1589,20 +1848,18 @@ def app_submit_daily_report(
                 except (TypeError, ValueError):
                     logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
-        count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
-        title = f"第{count}天日报"
-        job_info = api_client.get_job_info()
+        title = generated["title"]
         report_info = {
             "title": title,
             "content": content,
             "attachments": "",
             "reportType": "day",
-            "jobId": job_info.get("jobId", None),
+            "jobId": generated["job_info"].get("jobId", None),
             "reportTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "formFieldDtoList": api_client.get_from_info(7),
+            "formFieldDtoList": generated["api_client"].get_from_info(7),
         }
-        api_client.submit_report(report_info)
-        sync_runtime_fields_to_user(user, config_data)
+        generated["api_client"].submit_report(report_info)
+        sync_runtime_fields_to_user(user, generated["config_data"])
         session.add(user)
         session.add(AuditLog(tenant_id=user.tenant_id, actor=str(payload.get("sub")), action="app.report.daily.submit", target_user_id=user.id, detail={"title": title}))
         session.commit()
@@ -2954,21 +3211,79 @@ def makeup_user_clockin(
     operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
-    _rate_limit(f"clockin_makeup:{client_ip}:{user_id}", limit=3, per_seconds=60)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(operator)
+    request_hash = ""
     user = _get_active_user_for_payload(session, user_id, operator)
     try:
         target_dates = _clockin_makeup_dates_from_request(req)
         target_type = _clockin_makeup_type_from_request(req)
+        tenant_id = tenant_id_from_payload(operator)
+        request_hash = _operation_request_hash(
+            {
+                "actor": str(operator.get("sub") or ""),
+                "operation": "user.clockin.makeup",
+                "target_dates": target_dates,
+                "target_type": target_type,
+                "tenant_id": tenant_id,
+                "user_id": int(user_id),
+            }
+        )
+        if idempotency_key:
+            existing_response = _manual_operation_existing_response(
+                session,
+                tenant_id=tenant_id,
+                operation="user.clockin.makeup",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if existing_response is not None:
+                return existing_response
+        _rate_limit(f"clockin_makeup:{client_ip}:{user_id}", limit=3, per_seconds=60)
+        if idempotency_key:
+            claimed_response = claim_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup", idempotency_key),
+                request_hash=request_hash,
+                conflict_detail="Idempotency key already used with different request parameters",
+                pending_detail="Request is already being processed",
+            )
+            if claimed_response is not None:
+                return claimed_response
         result, config_data = _makeup_clockin_for_user(user, target_dates, target_type)
         sync_runtime_fields_to_user(user, config_data)
+        response_payload = {"ok": result.get("status") != "fail", "result": result}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
         session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.clockin.makeup", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
-        return {"ok": result.get("status") != "fail", "result": result}
+        return response_payload
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e) or "补卡失败")
 
 
@@ -2982,20 +3297,77 @@ def makeup_all_user_clockin(
     operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
-    _rate_limit(f"clockin_makeup_all:{client_ip}:{user_id}", limit=2, per_seconds=60)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(operator)
+    request_hash = ""
     user = _get_active_user_for_payload(session, user_id, operator)
     try:
         target_type = _clockin_makeup_type_from_request(req or ClockInMakeupRequest())
+        tenant_id = tenant_id_from_payload(operator)
+        request_hash = _operation_request_hash(
+            {
+                "actor": str(operator.get("sub") or ""),
+                "operation": "user.clockin.makeup_all",
+                "target_type": target_type,
+                "tenant_id": tenant_id,
+                "user_id": int(user_id),
+            }
+        )
+        if idempotency_key:
+            existing_response = _manual_operation_existing_response(
+                session,
+                tenant_id=tenant_id,
+                operation="user.clockin.makeup_all",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if existing_response is not None:
+                return existing_response
+        _rate_limit(f"clockin_makeup_all:{client_ip}:{user_id}", limit=2, per_seconds=60)
+        if idempotency_key:
+            claimed_response = claim_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                conflict_detail="Idempotency key already used with different request parameters",
+                pending_detail="Request is already being processed",
+            )
+            if claimed_response is not None:
+                return claimed_response
         result, config_data, target_dates = _makeup_all_missing_clockin_for_user(user, target_type)
         sync_runtime_fields_to_user(user, config_data)
+        response_payload = {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
         session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.clockin.makeup_all", target_user_id=user_id, detail={"target_dates": target_dates, "target_type": target_type, "status": result.get("status")}))
         session.add(user)
         session.commit()
-        return {"ok": result.get("status") != "fail", "result": result, "target_dates": target_dates, "target_type": target_type}
+        return response_payload
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("user.clockin.makeup_all", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e) or "全部补卡失败")
 
 @router.patch("/users/{user_id}", response_model=UserRead)
@@ -3063,25 +3435,83 @@ def run_user_task(
     operator: dict = Depends(require_tasks_run),
 ):
     client_ip = get_client_ip(request)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(operator)
+    request_payload = {
+        "actor": str(operator.get("sub") or ""),
+        "force_report": bool(req.force_report) if req else False,
+        "operation": "user.run",
+        "target_period": req.target_period if req else None,
+        "task_type": req.task_type if req else None,
+        "tenant_id": tenant_id,
+        "user_id": int(user_id),
+    }
+    request_hash = _operation_request_hash(request_payload)
+    if idempotency_key:
+        existing_response = _manual_operation_existing_response(
+            session,
+            tenant_id=tenant_id,
+            operation="user.run",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if existing_response is not None:
+            return existing_response
     if _should_rate_limit_run_request(req):
         _rate_limit(f"run:{client_ip}:{user_id}", limit=2, per_seconds=60)
     user = _get_active_user_for_payload(session, user_id, operator)
+    if idempotency_key:
+        claimed_response = claim_idempotency_record(
+            db_engine=engine,
+            tenant_id=tenant_id,
+            logical_key=_manual_operation_idempotency_storage_key("user.run", idempotency_key),
+            request_hash=request_hash,
+            conflict_detail="Idempotency key already used with different request parameters",
+            pending_detail="Request is already being processed",
+        )
+        if claimed_response is not None:
+            return claimed_response
 
-    config_data = user_to_config(user)
-    specific_task_type = req.task_type if req else None
-    results = run_task_by_config(
-        config_data,
-        specific_task_type=specific_task_type,
-        force_report=bool(req.force_report) if req else False,
-        target_period=req.target_period if req else None,
-    )
-    status = apply_execution_results_to_user(user, results, config_data)
-
-    session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.run", target_user_id=user_id, detail={"status": status}))
-    session.add(user)
-    session.commit()
-
-    return {"results": results}
+    try:
+        config_data = user_to_config(user)
+        specific_task_type = req.task_type if req else None
+        results = run_task_by_config(
+            config_data,
+            specific_task_type=specific_task_type,
+            force_report=bool(req.force_report) if req else False,
+            target_period=req.target_period if req else None,
+        )
+        status = apply_execution_results_to_user(user, results, config_data)
+        response_payload = {"results": results}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.run", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
+        session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.run", target_user_id=user_id, detail={"status": status}))
+        session.add(user)
+        session.commit()
+        return response_payload
+    except Exception as e:
+        session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("user.run", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
+        raise
 
 class BatchRunRequest(BaseModel):
     ids: List[int]
@@ -3090,7 +3520,9 @@ class BatchRunRequest(BaseModel):
 @router.post("/users/run/batch")
 def run_users_batch(*, request: Request, req: BatchRunRequest, operator: dict = Depends(require_batch_manage)):
     client_ip = get_client_ip(request)
-    _rate_limit(f"run_batch:{client_ip}", limit=1, per_seconds=10)
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
     try:
         ids = [int(x) for x in (req.ids or []) if int(x) > 0]
     except Exception:
@@ -3105,30 +3537,78 @@ def run_users_batch(*, request: Request, req: BatchRunRequest, operator: dict = 
     max_concurrency = int(os.getenv("BATCH_JOB_MAX_CONCURRENCY") or "10")
     max_concurrency = max(1, min(max_concurrency, 50))
     concurrency = max(1, min(int(req.concurrency or 5), max_concurrency))
+    tenant_id = tenant_id_from_payload(operator)
+    actor = str(operator.get("sub") or "")
+    request_hash = _batch_run_request_hash(ids=ids, concurrency=concurrency, tenant_id=tenant_id, actor=actor)
+    if idempotency_key:
+        with Session(engine) as session:
+            existing_response = _batch_run_existing_response(
+                session,
+                tenant_id=tenant_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if existing_response is not None:
+                return existing_response
+    _rate_limit(f"run_batch:{client_ip}", limit=1, per_seconds=10)
+    if idempotency_key:
+        claimed_response = claim_idempotency_record(
+            db_engine=engine,
+            tenant_id=tenant_id,
+            logical_key=_batch_run_idempotency_storage_key(idempotency_key),
+            request_hash=request_hash,
+            conflict_detail="Idempotency key already used with different batch parameters",
+            pending_detail="Batch request is already being processed",
+        )
+        if claimed_response is not None:
+            return claimed_response
     with Session(engine) as session:
-        tenant_id = tenant_id_from_payload(operator)
-        active_limit = int_env("BATCH_TENANT_MAX_ACTIVE_JOBS", 5, min_value=1, max_value=100)
-        active_jobs = session.exec(
-            select(func.count())
-            .select_from(BatchJob)
-            .where(_tenant_filter(BatchJob.tenant_id, tenant_id) & (BatchJob.status.in_(["queued", "running", "paused"])))
-        ).one()
-        if int(active_jobs or 0) >= active_limit:
-            raise HTTPException(status_code=429, detail="Too many active batch jobs for this tenant")
-        valid_ids = session.exec(
-            select(User.id).where(_tenant_filter(User.tenant_id, tenant_id) & (User.deleted_at.is_(None)) & (User.id.in_(ids)))
-        ).all()
-        if len(valid_ids) != len(set(ids)):
-            raise HTTPException(status_code=404, detail="User not found")
-        job = BatchJob(tenant_id=tenant_id, created_by=operator.get("sub"), total=len(ids), concurrency=concurrency, user_ids=ids, status="queued")
-        session.add(job)
-        session.flush()
-        items = [BatchJobItem(tenant_id=tenant_id, job_id=job.id, user_id=uid, status="queued") for uid in ids]
-        session.add_all(items)
-        session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.enqueue", target_user_id=None, detail={"job_id": job.id, "total": len(ids), "concurrency": concurrency}))
-        session.commit()
-        job_id = job.id
-    return {"ok": True, "queued": len(ids), "concurrency": concurrency, "job_id": job_id}
+        try:
+            active_limit = int_env("BATCH_TENANT_MAX_ACTIVE_JOBS", 5, min_value=1, max_value=100)
+            active_jobs = session.exec(
+                select(func.count())
+                .select_from(BatchJob)
+                .where(_tenant_filter(BatchJob.tenant_id, tenant_id) & (BatchJob.status.in_(["queued", "running", "paused"])))
+            ).one()
+            if int(active_jobs or 0) >= active_limit:
+                raise HTTPException(status_code=429, detail="Too many active batch jobs for this tenant")
+            valid_ids = session.exec(
+                select(User.id).where(_tenant_filter(User.tenant_id, tenant_id) & (User.deleted_at.is_(None)) & (User.id.in_(ids)))
+            ).all()
+            if len(valid_ids) != len(set(ids)):
+                raise HTTPException(status_code=404, detail="User not found")
+            job = BatchJob(tenant_id=tenant_id, created_by=operator.get("sub"), total=len(ids), concurrency=concurrency, user_ids=ids, status="queued")
+            session.add(job)
+            session.flush()
+            items = [BatchJobItem(tenant_id=tenant_id, job_id=job.id, user_id=uid, status="queued") for uid in ids]
+            session.add_all(items)
+            response_payload = {"ok": True, "queued": len(ids), "concurrency": concurrency, "job_id": job.id}
+            if idempotency_key:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_batch_run_idempotency_storage_key(idempotency_key),
+                    request_hash=request_hash,
+                    response=response_payload,
+                )
+            session.add(AuditLog(tenant_id=tenant_id, actor=operator.get("sub"), action="batch.enqueue", target_user_id=None, detail={"job_id": job.id, "total": len(ids), "concurrency": concurrency}))
+            session.commit()
+            return response_payload
+        except Exception as exc:
+            session.rollback()
+            if idempotency_key:
+                try:
+                    finalize_idempotency_record(
+                        db_engine=engine,
+                        tenant_id=tenant_id,
+                        logical_key=_batch_run_idempotency_storage_key(idempotency_key),
+                        request_hash=request_hash,
+                        status=IDEMPOTENCY_STATUS_FAILED,
+                        error=str(exc),
+                    )
+                except Exception:
+                    logger.debug("failed to finalize idempotency state", exc_info=True)
+            raise
 
 @router.get("/batch-jobs/{job_id}")
 def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, viewer: dict = Depends(require_batch_read)):
@@ -3136,7 +3616,7 @@ def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, 
     job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    status_counts = get_batch_job_item_status_counts(session, job_id, ["running", "queued"])
+    status_counts = get_batch_job_item_status_counts(session, job_id, ["running", "queued", "fail"])
     last_errors = session.exec(
         select(BatchJobItem.user_id, BatchJobItem.error, BatchJobItem.finished_at)
         .where((BatchJobItem.job_id == job_id) & (BatchJobItem.status == "fail"))
@@ -3155,11 +3635,68 @@ def read_batch_job(*, session: Session = Depends(get_session), job_id: int = 0, 
         "concurrency": job.concurrency,
         "running": int(status_counts.get("running", 0)),
         "queued": int(status_counts.get("queued", 0)),
+        "failed": int(status_counts.get("fail", 0)),
         "last_errors": [
             {"user_id": row.user_id, "message": row.error or "Fail", "ts": (row.finished_at.isoformat() if row.finished_at else None)}
             for row in last_errors
         ],
     }
+
+
+@router.post("/batch-jobs/{job_id}/retry-failed")
+def retry_failed_batch_job_items(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(require_batch_manage)):
+    tenant_id = tenant_id_from_payload(operator)
+    job = session.exec(select(BatchJob).where((BatchJob.id == job_id) & _tenant_filter(BatchJob.tenant_id, tenant_id))).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.cancel_requested or str(job.status or "").lower() == "canceled":
+        raise HTTPException(status_code=409, detail="Canceled batch job cannot be retried")
+
+    failed_items = session.exec(
+        select(BatchJobItem).where((BatchJobItem.job_id == job_id) & (BatchJobItem.status == "fail"))
+    ).all()
+    if not failed_items:
+        return {"ok": True, "job_id": job.id, "requeued": 0, "status": job.status}
+
+    requeued = 0
+    for item in failed_items:
+        item.status = "queued"
+        item.attempts = 0
+        item.started_at = None
+        item.finished_at = None
+        item.error = None
+        item.next_run_at = None
+        item.locked_by = None
+        item.lock_token = None
+        item.lease_until = None
+        item.heartbeat_at = None
+        session.add(item)
+        requeued += 1
+
+    running_count = session.exec(
+        select(func.count()).select_from(BatchJobItem).where((BatchJobItem.job_id == job_id) & (BatchJobItem.status == "running"))
+    ).one()
+    job.completed = max(0, int(job.completed or 0) - requeued)
+    job.fail = max(0, int(job.fail or 0) - requeued)
+    job.finished_at = None
+    if job.paused:
+        job.status = "paused"
+    elif int(running_count or 0) > 0:
+        job.status = "running"
+    else:
+        job.status = "queued"
+    session.add(job)
+    session.add(
+        AuditLog(
+            tenant_id=tenant_id,
+            actor=operator.get("sub"),
+            action="batch.retry_failed",
+            target_user_id=None,
+            detail={"job_id": job_id, "requeued": requeued},
+        )
+    )
+    session.commit()
+    return {"ok": True, "job_id": job.id, "requeued": requeued, "status": job.status}
 
 @router.post("/batch-jobs/{job_id}/pause")
 def pause_batch_job(*, session: Session = Depends(get_session), job_id: int, operator: dict = Depends(require_batch_manage)):
@@ -3318,6 +3855,8 @@ def submit_report_manual(
             meta=generated["meta"],
             content=content,
             target_period=req.target_period,
+            submitted=generated["submitted"],
+            job_info=generated["job_info"],
         )
         generated["api_client"].submit_report(report_info)
         sync_runtime_fields_to_user(user, generated["config_data"])
@@ -3339,18 +3878,65 @@ def makeup_all_reports_manual(
     report_key: str,
     operator: dict = Depends(require_tasks_run),
 ):
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    )
+    tenant_id = tenant_id_from_payload(operator)
+    request_hash = ""
     user = _get_active_user_for_payload(session, user_id, operator)
     try:
+        tenant_id = tenant_id_from_payload(operator)
+        request_hash = _operation_request_hash(
+            {
+                "actor": str(operator.get("sub") or ""),
+                "operation": "user.report.makeup_all",
+                "report_key": report_key,
+                "tenant_id": tenant_id,
+                "user_id": int(user_id),
+            }
+        )
+        if idempotency_key:
+            claimed_response = claim_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.report.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                conflict_detail="Idempotency key already used with different request parameters",
+                pending_detail="Request is already being processed",
+            )
+            if claimed_response is not None:
+                return claimed_response
         result, config_data, target_periods = _makeup_all_reports_for_user(user, report_key)
         sync_runtime_fields_to_user(user, config_data)
+        response_payload = {"ok": result.get("status") != "fail", "result": result, "target_periods": target_periods, "report_key": report_key}
+        if idempotency_key:
+            finalize_idempotency_record(
+                db_engine=engine,
+                tenant_id=tenant_id,
+                logical_key=_manual_operation_idempotency_storage_key("user.report.makeup_all", idempotency_key),
+                request_hash=request_hash,
+                response=response_payload,
+            )
         session.add(AuditLog(tenant_id=user.tenant_id, actor=operator.get("sub"), action="user.report.makeup_all", target_user_id=user_id, detail={"report_key": report_key, "target_periods": target_periods, "status": result.get("status")}))
         session.add(user)
         session.commit()
-        return {"ok": result.get("status") != "fail", "result": result, "target_periods": target_periods, "report_key": report_key}
+        return response_payload
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        if idempotency_key:
+            try:
+                finalize_idempotency_record(
+                    db_engine=engine,
+                    tenant_id=tenant_id,
+                    logical_key=_manual_operation_idempotency_storage_key("user.report.makeup_all", idempotency_key),
+                    request_hash=request_hash,
+                    status=IDEMPOTENCY_STATUS_FAILED,
+                    error=str(e),
+                )
+            except Exception:
+                logger.debug("failed to finalize idempotency state", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e) or "全部补交报告失败")
 
 
@@ -3366,24 +3952,10 @@ def generate_daily_report(
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法生成日报")
 
-    config_data = user_to_config(user)
-    config = ConfigManager(config=config_data)
-    api_client = ApiClient(config)
-
-    ai_cfg = config.get_value("config.ai")
-    if not isinstance(ai_cfg, dict):
-        raise HTTPException(status_code=400, detail="未配置 AI 参数")
-    if not (str(ai_cfg.get("apikey") or "").strip()) or not (str(ai_cfg.get("apiUrl") or "").strip()) or not (str(ai_cfg.get("model") or "").strip()):
-        raise HTTPException(status_code=400, detail="请先在 AI 设置中填写 API URL、API Key 和 Model")
-
     try:
-        _ensure_remote_runtime(api_client, config)
-
-        submitted = api_client.get_submitted_reports_info("day") or {}
+        generated = _generate_report_content_for_user(user, "daily", None)
+        submitted = generated["submitted"]
         data = submitted.get("data", []) if isinstance(submitted, dict) else []
-        count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
-        title = f"第{count}天日报"
-
         already_submitted = False
         current_time = datetime.datetime.now()
         if isinstance(data, list) and data:
@@ -3397,9 +3969,7 @@ def generate_daily_report(
                 except (TypeError, ValueError):
                     logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
-        job_info = api_client.get_job_info()
-        content = generate_article(config, title, job_info, config.get_value("planInfo.planPaper.dayPaperNum"))
-        sync_runtime_fields_to_user(user, config_data)
+        sync_runtime_fields_to_user(user, generated["config_data"])
         session.add(user)
         session.add(
             AuditLog(
@@ -3407,11 +3977,11 @@ def generate_daily_report(
                 actor=operator.get("sub"),
                 action="user.report.daily.generate",
                 target_user_id=user_id,
-                detail=_ai_audit_detail(config, title, {"already_submitted": already_submitted}),
+                detail=_ai_audit_detail(generated["config"], generated["title"], {"already_submitted": already_submitted}),
             )
         )
         session.commit()
-        return {"ok": True, "title": title, "content": content, "already_submitted": already_submitted}
+        return {"ok": True, "title": generated["title"], "content": generated["content"], "already_submitted": already_submitted}
     except HTTPException:
         raise
     except Exception as e:
@@ -3435,14 +4005,9 @@ def submit_daily_report_manual(
     if not (str(user.phone or "").strip()) or not (str(user.password or "").strip()):
         raise HTTPException(status_code=400, detail="该用户未保存账号或密码，无法提交日报")
 
-    config_data = user_to_config(user)
-    config = ConfigManager(config=config_data)
-    api_client = ApiClient(config)
-
     try:
-        _ensure_remote_runtime(api_client, config)
-
-        submitted = api_client.get_submitted_reports_info("day") or {}
+        generated = _generate_report_content_for_user(user, "daily", None, generate_content=False)
+        submitted = generated["submitted"]
         data = submitted.get("data", []) if isinstance(submitted, dict) else []
         current_time = datetime.datetime.now()
         if isinstance(data, list) and data:
@@ -3458,20 +4023,18 @@ def submit_daily_report_manual(
                 except (TypeError, ValueError):
                     logger.debug("ignore invalid submitted daily report createTime: %r", ts)
 
-        count = (submitted.get("flag", 0) if isinstance(submitted, dict) else 0) + 1
-        title = f"第{count}天日报"
-        job_info = api_client.get_job_info()
+        title = generated["title"]
         report_info = {
             "title": title,
             "content": content,
             "attachments": "",
             "reportType": "day",
-            "jobId": job_info.get("jobId", None),
+            "jobId": generated["job_info"].get("jobId", None),
             "reportTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "formFieldDtoList": api_client.get_from_info(7),
+            "formFieldDtoList": generated["api_client"].get_from_info(7),
         }
-        api_client.submit_report(report_info)
-        sync_runtime_fields_to_user(user, config_data)
+        generated["api_client"].submit_report(report_info)
+        sync_runtime_fields_to_user(user, generated["config_data"])
         session.add(user)
         session.commit()
         return {"ok": True, "title": title, "submitted_at": report_info["reportTime"]}

@@ -174,7 +174,7 @@
                   <el-button
                     size="small"
                     type="success"
-                    :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily || aiDailyLoading || submitDailyLoading"
+                    :disabled="!isEdit || !isReportEnabled('daily') || !!reportRunLoading || !!reportMakeupAllLoading || !reportTargets.daily"
                     :loading="reportRunLoading === 'daily_report'"
                     @click="runReportNow('daily_report')"
                   >
@@ -397,8 +397,6 @@ const aiTestLoading = ref(false)
 const aiTestStatus = ref('')
 const aiTestLatencyMs = ref(null)
 const addrFillLoading = ref(false)
-const aiDailyLoading = ref(false)
-const submitDailyLoading = ref(false)
 const clockInPeriodLoading = ref(false)
 const clockInMakeupLoading = ref(false)
 const clockInMakeupAllLoading = ref(false)
@@ -878,49 +876,6 @@ const testAi = async () => {
     notifyError(resolveErrorMessage(e, 'AI 测试失败'))
   } finally {
     aiTestLoading.value = false
-  }
-}
-
-const generateDailyReport = async () => {
-  if (!isEdit.value) return
-  aiDailyLoading.value = true
-  try {
-    notifyInfo('正在生成日报内容')
-    await flushUiMessage()
-    const res = await http.post(`/users/${route.params.id}/reports/daily/generate`)
-    const content = res.data?.content
-    if (typeof content === 'string') {
-      reportPreview.daily = content
-    }
-    if (res.data?.already_submitted) {
-      notifyWarning('检测到今天可能已提交过日报，仅生成内容供参考')
-    } else {
-      notifySuccess('已生成日报内容')
-    }
-  } catch (e) {
-    notifyError(resolveErrorMessage(e, '生成失败'))
-  } finally {
-    aiDailyLoading.value = false
-  }
-}
-
-const submitDailyReport = async () => {
-  if (!isEdit.value) return
-  const content = String(reportPreview.daily || '').trim()
-  if (!content) {
-    notifyWarning('请先生成或填写日报内容')
-    return
-  }
-  submitDailyLoading.value = true
-  try {
-    notifyInfo('正在提交日报')
-    await flushUiMessage()
-    const res = await http.post(`/users/${route.params.id}/reports/daily/submit`, { content })
-    notifySuccess(`提交成功：${res.data?.title || '日报'}`)
-  } catch (e) {
-    notifyError(resolveErrorMessage(e, '提交失败'))
-  } finally {
-    submitDailyLoading.value = false
   }
 }
 

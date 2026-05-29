@@ -1,14 +1,17 @@
 import datetime
+import copy
 import logging
 import os
 import random
 import time
 from typing import Any, Optional
 
-from sqlalchemy import delete, func
+from sqlalchemy import delete, event, func
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session as OrmSession
 from sqlmodel import Session, select
 
-from server.models import DEFAULT_TENANT_ID, BatchJob, BatchJobItem, HttpRequestMetric, TaskExecutionEvent, TaskExecutionLock
+from server.models import DEFAULT_TENANT_ID, AuditLog, BatchJob, BatchJobItem, HttpRequestMetric, TaskExecutionEvent, TaskExecutionLock
 from server.request_context import get_request_id
 from server.time_utils import utc_now
 
@@ -16,8 +19,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_HTTP_METRIC_RETENTION_DAYS = 14
 DEFAULT_HTTP_METRIC_PURGE_INTERVAL_SECONDS = 3600
 DEFAULT_HTTP_METRIC_EXCLUDED_PREFIXES = ("/assets/", "/favicon", "/healthz", "/readyz")
+DEFAULT_RECENT_METRIC_WINDOW_SECONDS = 300
+DEFAULT_METRICS_CACHE_TTL_SECONDS = 5
 MAX_HTTP_METRIC_RETENTION_DAYS = 3650
 _last_http_metric_purge_at = 0.0
+_runtime_metrics_cache: dict[int, dict[str, Any]] = {}
 
 
 def _engine(db_engine=None):
@@ -59,6 +65,39 @@ def _http_metric_purge_interval_seconds() -> int:
         DEFAULT_HTTP_METRIC_PURGE_INTERVAL_SECONDS,
         minimum=0,
     )
+
+
+def _recent_metric_window_seconds() -> int:
+    return _int_env("RECENT_METRIC_WINDOW_SECONDS", DEFAULT_RECENT_METRIC_WINDOW_SECONDS, minimum=60, maximum=86400)
+
+
+def _metrics_cache_ttl_seconds() -> int:
+    return _int_env("METRICS_CACHE_TTL_SECONDS", DEFAULT_METRICS_CACHE_TTL_SECONDS, minimum=0, maximum=3600)
+
+
+def _clear_runtime_metrics_cache_for_bind(bind) -> None:
+    if bind is None:
+        _runtime_metrics_cache.clear()
+        return
+    engine = getattr(bind, "engine", None) if not isinstance(bind, Engine) else bind
+    if engine is None:
+        _runtime_metrics_cache.clear()
+        return
+    _runtime_metrics_cache.pop(id(engine), None)
+
+
+def invalidate_runtime_metrics_cache(db_engine=None) -> None:
+    _clear_runtime_metrics_cache_for_bind(_engine(db_engine))
+
+
+def _after_session_commit(session) -> None:
+    try:
+        _clear_runtime_metrics_cache_for_bind(session.get_bind())
+    except Exception:
+        logger.debug("runtime metrics cache invalidation failed", exc_info=True)
+
+
+event.listen(OrmSession, "after_commit", _after_session_commit)
 
 
 def _split_env_list(value: str) -> list[str]:
@@ -195,14 +234,32 @@ def _status_bucket(status_code: int) -> str:
     return f"{int(status_code / 100)}xx"
 
 
-def _http_request_metrics(session: Session) -> dict[str, Any]:
-    rows = session.exec(select(HttpRequestMetric.status_code, func.count()).group_by(HttpRequestMetric.status_code)).all()
+def _http_status_counts(session: Session, *, since: Optional[datetime.datetime] = None) -> tuple[int, dict[str, int]]:
+    query = select(HttpRequestMetric.status_code, func.count()).group_by(HttpRequestMetric.status_code)
+    if since is not None:
+        query = query.where(HttpRequestMetric.created_at >= since)
+    rows = session.exec(query).all()
     by_status: dict[str, int] = {}
     total = 0
     for status_code, count in rows:
         bucket = _status_bucket(int(status_code or 0))
         by_status[bucket] = by_status.get(bucket, 0) + int(count or 0)
         total += int(count or 0)
+    return total, by_status
+
+
+def _http_request_metrics(session: Session, *, now: Optional[datetime.datetime] = None) -> dict[str, Any]:
+    total, by_status = _http_status_counts(session)
+    recent_cutoff = (now or _now_utc()) - datetime.timedelta(seconds=_recent_metric_window_seconds())
+    recent_total, recent_by_status = _http_status_counts(session, since=recent_cutoff)
+
+    return_metrics: dict[str, Any] = {
+        "total": total,
+        "by_status": by_status,
+        "recent_total": recent_total,
+        "recent_by_status": recent_by_status,
+        "by_method": _counts(session, HttpRequestMetric, HttpRequestMetric.method),
+    }
 
     latency = session.exec(
         select(
@@ -218,20 +275,46 @@ def _http_request_metrics(session: Session) -> dict[str, Any]:
         .order_by(HttpRequestMetric.id.desc())
         .limit(1)
     ).first()
+    return_metrics.update(
+        {
+            "last_request_id": last_request_id,
+            "latency_ms": {
+                "min": int(min_latency or 0),
+                "max": int(max_latency or 0),
+                "avg": round(float(avg_latency or 0), 2),
+            },
+        }
+    )
+    return return_metrics
+
+
+def _auth_failure_counts(
+    session: Session,
+    *,
+    actions: tuple[str, ...],
+    since: Optional[datetime.datetime] = None,
+) -> dict[str, int]:
+    query = (
+        select(AuditLog.action, func.count())
+        .where(AuditLog.action.in_(actions))
+        .group_by(AuditLog.action)
+    )
+    if since is not None:
+        query = query.where(AuditLog.created_at >= since)
+    rows = session.exec(query).all()
+    return {str(action): int(count or 0) for action, count in rows if action is not None}
+
+
+def _auth_failure_metrics(session: Session, *, now: Optional[datetime.datetime] = None) -> dict[str, Any]:
+    actions = ("auth.login.failed", "app.login.failed", "auth.mfa.failed")
+    recent_cutoff = (now or _now_utc()) - datetime.timedelta(seconds=_recent_metric_window_seconds())
     return {
-        "total": total,
-        "by_status": by_status,
-        "by_method": _counts(session, HttpRequestMetric, HttpRequestMetric.method),
-        "last_request_id": last_request_id,
-        "latency_ms": {
-            "min": int(min_latency or 0),
-            "max": int(max_latency or 0),
-            "avg": round(float(avg_latency or 0), 2),
-        },
+        "by_action": _auth_failure_counts(session, actions=actions),
+        "recent_by_action": _auth_failure_counts(session, actions=actions, since=recent_cutoff),
     }
 
 
-def runtime_metrics(*, db_engine=None) -> dict[str, Any]:
+def _runtime_metrics_snapshot(*, db_engine=None) -> dict[str, Any]:
     now = _now_utc()
     with Session(_engine(db_engine)) as session:
         last_task_request_id = session.exec(
@@ -250,17 +333,44 @@ def runtime_metrics(*, db_engine=None) -> dict[str, Any]:
                 "by_source": _counts(session, TaskExecutionEvent, TaskExecutionEvent.source),
                 "last_request_id": last_task_request_id,
             },
+            "auth_failures": _auth_failure_metrics(session, now=now),
             "batch_jobs": {
                 "by_status": _counts(session, BatchJob, BatchJob.status),
             },
             "batch_items": {
                 "by_status": _counts(session, BatchJobItem, BatchJobItem.status),
             },
-            "http_requests": _http_request_metrics(session),
+            "http_requests": _http_request_metrics(session, now=now),
             "locks": {
                 "active": int(active_locks or 0),
             },
         }
+
+
+def runtime_metrics(*, db_engine=None) -> dict[str, Any]:
+    engine = _engine(db_engine)
+    ttl_seconds = _metrics_cache_ttl_seconds()
+    cache_key = id(engine)
+    now_monotonic = time.monotonic()
+    cache_entry = _runtime_metrics_cache.get(cache_key)
+    if (
+        ttl_seconds > 0
+        and cache_entry
+        and cache_entry.get("engine") is engine
+        and now_monotonic - float(cache_entry.get("cached_at") or 0) < ttl_seconds
+    ):
+        return copy.deepcopy(cache_entry["metrics"])
+
+    metrics = _runtime_metrics_snapshot(db_engine=engine)
+    if ttl_seconds > 0:
+        _runtime_metrics_cache[cache_key] = {
+            "engine": engine,
+            "cached_at": now_monotonic,
+            "metrics": copy.deepcopy(metrics),
+        }
+    else:
+        _runtime_metrics_cache.pop(cache_key, None)
+    return metrics
 
 
 def _prom_label_value(value: str) -> str:
@@ -277,8 +387,8 @@ def _append_metric(lines: list[str], name: str, value: int | float, labels: Opti
 def prometheus_metrics_text(*, db_engine=None) -> str:
     metrics = runtime_metrics(db_engine=db_engine)
     lines = [
-        "# HELP automoguding_task_events_total Task execution events grouped by status.",
-        "# TYPE automoguding_task_events_total counter",
+        "# HELP automoguding_task_events_total Task execution event snapshot grouped by status.",
+        "# TYPE automoguding_task_events_total gauge",
     ]
     for status, count in sorted(metrics.get("task_events", {}).get("by_status", {}).items()):
         _append_metric(lines, "automoguding_task_events_total", int(count), {"status": status})
@@ -286,11 +396,29 @@ def prometheus_metrics_text(*, db_engine=None) -> str:
     lines.extend(
         [
             "# HELP automoguding_task_events_by_source_total Task execution events grouped by source.",
-            "# TYPE automoguding_task_events_by_source_total counter",
+            "# TYPE automoguding_task_events_by_source_total gauge",
         ]
     )
     for source, count in sorted(metrics.get("task_events", {}).get("by_source", {}).items()):
         _append_metric(lines, "automoguding_task_events_by_source_total", int(count), {"source": source})
+
+    lines.extend(
+        [
+            "# HELP automoguding_auth_failures_total Authentication failures grouped by action.",
+            "# TYPE automoguding_auth_failures_total gauge",
+        ]
+    )
+    for action, count in sorted(metrics.get("auth_failures", {}).get("by_action", {}).items()):
+        _append_metric(lines, "automoguding_auth_failures_total", int(count), {"action": action})
+
+    lines.extend(
+        [
+            "# HELP automoguding_auth_failures_recent_total Authentication failures grouped by action over the recent metric window.",
+            "# TYPE automoguding_auth_failures_recent_total gauge",
+        ]
+    )
+    for action, count in sorted(metrics.get("auth_failures", {}).get("recent_by_action", {}).items()):
+        _append_metric(lines, "automoguding_auth_failures_recent_total", int(count), {"action": action})
 
     lines.extend(
         [
@@ -313,11 +441,20 @@ def prometheus_metrics_text(*, db_engine=None) -> str:
     lines.extend(
         [
             "# HELP automoguding_http_requests_total HTTP requests grouped by status class.",
-            "# TYPE automoguding_http_requests_total counter",
+            "# TYPE automoguding_http_requests_total gauge",
         ]
     )
     for status, count in sorted(metrics.get("http_requests", {}).get("by_status", {}).items()):
         _append_metric(lines, "automoguding_http_requests_total", int(count), {"status": status})
+
+    lines.extend(
+        [
+            "# HELP automoguding_http_requests_recent_total HTTP requests grouped by status class over the recent metric window.",
+            "# TYPE automoguding_http_requests_recent_total gauge",
+        ]
+    )
+    for status, count in sorted(metrics.get("http_requests", {}).get("recent_by_status", {}).items()):
+        _append_metric(lines, "automoguding_http_requests_recent_total", int(count), {"status": status})
 
     lines.extend(
         [
