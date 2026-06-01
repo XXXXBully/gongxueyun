@@ -13,6 +13,16 @@ AUTH_COOKIE_NAMES = {"admin_auth_token", "app_auth_token"}
 CSRF_COOKIE_NAME = "csrf_token"
 CSRF_HEADER_NAME = "x-csrf-token"
 INVALID_CSRF_ORIGIN = "invalid-csrf-origin"
+AUTH_BOOTSTRAP_PATHS = {
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/app/auth/login",
+    "/api/app/auth/register",
+    "/auth/login",
+    "/auth/register",
+    "/app/auth/login",
+    "/app/auth/register",
+}
 DEFAULT_CSP = (
     "default-src 'self'; "
     "img-src 'self' data: blob:; "
@@ -256,6 +266,16 @@ def _csrf_token_matches(cookies, headers) -> bool:
 def should_reject_cookie_csrf(request) -> bool:
     if (getattr(request, "method", "") or "").upper() in SAFE_CSRF_METHODS:
         return False
+
+    request_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    if request_path in AUTH_BOOTSTRAP_PATHS:
+        source_origin = _request_source_origin(request)
+        if not source_origin:
+            return False
+        target_origin = _request_target_origin(request)
+        if source_origin == target_origin:
+            return False
+        return source_origin not in _configured_frontend_origins()
 
     cookies = getattr(request, "cookies", {}) or {}
     if not any(cookies.get(name) for name in AUTH_COOKIE_NAMES):

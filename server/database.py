@@ -116,6 +116,7 @@ def ensure_user_runtime_columns(db_engine) -> None:
         if column_name not in existing_columns
     ]
     if not missing_columns:
+        _ensure_user_deleted_by_is_indexable(db_engine, inspector)
         return
 
     with db_engine.begin() as conn:
@@ -124,8 +125,30 @@ def ensure_user_runtime_columns(db_engine) -> None:
                 conn.execute(text(f"ALTER TABLE `user` ADD COLUMN `{column_name}` JSON NULL"))
             elif column_name == "deleted_at":
                 conn.execute(text("ALTER TABLE `user` ADD COLUMN `deleted_at` DATETIME NULL"))
+            elif column_name == "deleted_by":
+                conn.execute(text("ALTER TABLE `user` ADD COLUMN `deleted_by` VARCHAR(255) NULL"))
             else:
                 conn.execute(text(f"ALTER TABLE `user` ADD COLUMN `{column_name}` TEXT NULL"))
+
+    _ensure_user_deleted_by_is_indexable(db_engine, inspector)
+
+
+def _ensure_user_deleted_by_is_indexable(db_engine, inspector) -> None:
+    if getattr(getattr(db_engine, "dialect", None), "name", "") != "mysql":
+        return
+
+    existing_columns = {column.get("name"): column for column in inspector.get_columns("user")}
+    deleted_by = existing_columns.get("deleted_by")
+    if not deleted_by:
+        return
+
+    column_type = deleted_by.get("type")
+    column_type_name = column_type.__class__.__name__.lower() if column_type is not None else ""
+    if not column_type_name.endswith("text"):
+        return
+
+    with db_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE `user` MODIFY COLUMN `deleted_by` VARCHAR(255) NULL"))
 
 
 def ensure_runtime_tracking_columns(db_engine) -> None:
@@ -154,9 +177,6 @@ def ensure_auth_token_version_columns(db_engine) -> None:
             "token_version": "INTEGER NOT NULL DEFAULT 0",
             "failed_login_count": "INTEGER NOT NULL DEFAULT 0",
             "locked_until": "DATETIME NULL",
-            "mfa_enabled": "BOOLEAN NOT NULL DEFAULT 0",
-            "mfa_totp_secret": "TEXT NULL",
-            "mfa_confirmed_at": "DATETIME NULL",
         },
         "appuser": {
             "token_version": "INTEGER NOT NULL DEFAULT 0",
@@ -173,6 +193,61 @@ def ensure_auth_token_version_columns(db_engine) -> None:
                 if column_name in existing_columns:
                     continue
                 conn.execute(text(f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {ddl}"))
+
+
+def ensure_batch_job_runtime_columns(db_engine) -> None:
+    inspector = inspect(db_engine)
+    table_names = set(inspector.get_table_names())
+    column_specs = {
+        "batchjob": {
+            "cancel_requested": "BOOLEAN NOT NULL DEFAULT 0",
+            "paused": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "batchjobitem": {
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "max_attempts": "INTEGER NOT NULL DEFAULT 3",
+            "next_run_at": "DATETIME NULL",
+            "locked_by": "VARCHAR(255) NULL",
+            "lock_token": "VARCHAR(255) NULL",
+            "lease_until": "DATETIME NULL",
+            "heartbeat_at": "DATETIME NULL",
+        },
+    }
+    with db_engine.begin() as conn:
+        for table_name, specs in column_specs.items():
+            if table_name not in table_names:
+                continue
+            existing_columns = {column.get("name") for column in inspector.get_columns(table_name)}
+            for column_name, ddl in specs.items():
+                if column_name in existing_columns:
+                    continue
+                conn.execute(text(f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {ddl}"))
+
+
+def ensure_legacy_admin_mfa_removed(db_engine) -> None:
+    inspector = inspect(db_engine)
+    table_names = set(inspector.get_table_names())
+    if "adminuser" not in table_names:
+        return
+
+    legacy_columns = ("mfa_enabled", "mfa_totp_secret", "mfa_confirmed_at")
+    legacy_indexes = ("ix_adminuser_mfa_enabled", "ix_adminuser_mfa_confirmed_at")
+    existing_columns = {column.get("name") for column in inspector.get_columns("adminuser")}
+    existing_indexes = {str(index.get("name") or "") for index in inspector.get_indexes("adminuser")}
+    columns_to_drop = [column for column in legacy_columns if column in existing_columns]
+    indexes_to_drop = [index for index in legacy_indexes if index in existing_indexes]
+    if not columns_to_drop and not indexes_to_drop:
+        return
+
+    dialect_name = getattr(getattr(db_engine, "dialect", None), "name", "")
+    with db_engine.begin() as conn:
+        for index_name in indexes_to_drop:
+            if dialect_name == "mysql":
+                conn.execute(text(f"DROP INDEX `{index_name}` ON `adminuser`"))
+            else:
+                conn.execute(text(f"DROP INDEX `{index_name}`"))
+        for column_name in columns_to_drop:
+            conn.execute(text(f"ALTER TABLE `adminuser` DROP COLUMN `{column_name}`"))
 
 
 def ensure_tenant_columns(db_engine) -> None:
@@ -240,8 +315,6 @@ def ensure_runtime_indexes(db_engine) -> None:
             "ix_adminuser_token_version": ["token_version"],
             "ix_adminuser_failed_login_count": ["failed_login_count"],
             "ix_adminuser_locked_until": ["locked_until"],
-            "ix_adminuser_mfa_enabled": ["mfa_enabled"],
-            "ix_adminuser_mfa_confirmed_at": ["mfa_confirmed_at"],
         },
         "appuser": {
             "ix_appuser_tenant_id": ["tenant_id"],
@@ -286,12 +359,15 @@ def ensure_runtime_indexes(db_engine) -> None:
         for table_name, specs in index_specs.items():
             if table_name not in table_names:
                 continue
+            existing_columns = {column.get("name") for column in inspector.get_columns(table_name)}
             existing_indexes = {
                 str(item.get("name") or "").lower()
                 for item in inspector.get_indexes(table_name)
             }
             for index_name, columns in specs.items():
                 if index_name.lower() in existing_indexes:
+                    continue
+                if any(column not in existing_columns for column in columns):
                     continue
                 columns_sql = ", ".join(f"`{column}`" for column in columns)
                 conn.execute(text(f"CREATE INDEX `{index_name}` ON `{table_name}` ({columns_sql})"))
@@ -303,6 +379,8 @@ def create_db_and_tables():
     ensure_user_runtime_columns(engine)
     ensure_runtime_tracking_columns(engine)
     ensure_auth_token_version_columns(engine)
+    ensure_batch_job_runtime_columns(engine)
+    ensure_legacy_admin_mfa_removed(engine)
     ensure_runtime_indexes(engine)
     ensure_default_tenant(engine)
 

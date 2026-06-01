@@ -4,12 +4,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from server.batch_jobs import count_batch_job_items_by_status, get_batch_job_item_status_counts
 from server.clockin_backfill import build_missing_clockin_day_options
 from server.coreApi.MainLogicApi import ApiClient, _clear_ip_restriction_state
-from server.models import BatchJobItem
+from server.models import BatchJobItem, SystemSetting
 from server import task_runner
 from server import api
 from server.task_runner import _submit_report_common
@@ -310,6 +311,62 @@ class MapchaxunGeocodeProviderTest(unittest.TestCase):
         self.assertEqual(result["results"][0]["x"], 111.990776)
         post.assert_called_once()
 
+    def test_shared_geocode_search_route_allows_app_users(self):
+        from server.main import app
+
+        paths = {getattr(route, "path", "") for route in app.routes}
+        self.assertIn("/api/geocode/search", paths)
+        self.assertNotIn("/api/app/geocode/search", paths)
+        self.assertNotIn("/api/app/geocode/reverse", paths)
+
+        payload = {
+            "status": 10000,
+            "message": "Success",
+            "result": {
+                "title": "成都",
+                "location": {"lng": 104.0668, "lat": 30.5728},
+            },
+            "adress": "成都",
+        }
+        app.dependency_overrides[api.get_auth_payload] = lambda: {"sub": "app:1", "role": "user", "tenant_id": "default"}
+        try:
+            with (
+                patch.dict("os.environ", {"GEOCODE_SEARCH_PROVIDER": "mapchaxun"}, clear=False),
+                patch("server.api.requests.post", return_value=FakeMogudingResponse(payload)) as post,
+            ):
+                response = TestClient(app).get("/api/geocode/search", params={"q": "成都"})
+        finally:
+            app.dependency_overrides.pop(api.get_auth_payload, None)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"][0]["x"], 104.0668)
+        post.assert_called_once()
+
+    def test_mapchaxun_geocode_search_falls_back_to_osm(self):
+        mapchaxun_payload = {"status": 50000, "message": "provider unavailable"}
+        osm_payload = [
+            {
+                "lat": "30.5728",
+                "lon": "104.0668",
+                "display_name": "Chengdu, Sichuan, China",
+                "boundingbox": ["30.0", "31.0", "103.0", "105.0"],
+            }
+        ]
+
+        with (
+            patch.dict("os.environ", {"GEOCODE_SEARCH_PROVIDER": "mapchaxun"}, clear=False),
+            patch("server.api.requests.post", return_value=FakeMogudingResponse(mapchaxun_payload)) as post,
+            patch("server.api.requests.get", return_value=FakeMogudingResponse(osm_payload)) as get,
+            patch("server.api.time.sleep"),
+        ):
+            result = api.geocode_search(q="Chengdu")
+
+        self.assertEqual(result["results"][0]["x"], 104.0668)
+        self.assertEqual(result["results"][0]["y"], 30.5728)
+        self.assertEqual(result["results"][0]["label"], "Chengdu, Sichuan, China")
+        post.assert_called_once()
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], "https://nominatim.openstreetmap.org/search")
 
 class AuditLogMaintenanceTest(unittest.TestCase):
     def test_admin_can_clear_all_audit_logs_when_explicitly_enabled(self):
@@ -404,6 +461,54 @@ class ApiClientIPRestrictionTest(unittest.TestCase):
 
 
 class TaskRunnerIPRestrictionTest(unittest.TestCase):
+    def test_run_task_injects_global_ai_settings_before_report_task(self):
+        engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add(
+                SystemSetting(
+                    key="ai",
+                    tenant_id="default",
+                    value={
+                        "ai": {
+                            "apiUrl": "https://api.example.com/v1",
+                            "apikey": "secret-key",
+                            "model": "global-model",
+                        }
+                    },
+                )
+            )
+            session.commit()
+
+        config_data = {
+            "tenant_id": "default",
+            "config": {
+                "pushNotifications": [],
+                "reportSettings": {"daily": {"enabled": True}},
+            },
+            "userInfo": {"token": "token", "expiredTime": "1893456000", "userType": "student", "userId": "u-1"},
+            "planInfo": {"planId": "plan-1"},
+        }
+        observed = {}
+
+        def fake_daily(_api_client, config, **_kwargs):
+            observed["ai"] = config.get_value("config.ai")
+            return {"status": "success", "task_type": "日报提交"}
+
+        with (
+            patch.object(task_runner, "engine", engine),
+            patch.object(task_runner, "ApiClient"),
+            patch.object(task_runner, "MessagePusher"),
+            patch.object(task_runner, "_load_global_smtp_settings", return_value={}),
+            patch.object(task_runner, "submit_daily_report", side_effect=fake_daily),
+        ):
+            results = task_runner.run_task_by_config(config_data, specific_task_type="daily_report")
+
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(observed["ai"]["model"], "global-model")
+        self.assertEqual(observed["ai"]["apiUrl"], "https://api.example.com/v1")
+        self.assertEqual(observed["ai"]["apikey"], "secret-key")
+
     def test_run_task_stops_remaining_moguding_tasks_after_ip_restriction(self):
         config_data = {
             "config": {

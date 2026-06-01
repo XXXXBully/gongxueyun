@@ -10,9 +10,7 @@
         <div class="header-actions">
           <template v-if="!isMobile">
             <el-button v-if="isAuthed" @click="go('/')">用户</el-button>
-            <el-button v-if="isAuthed && canReadTenants" @click="go('/tenants')">租户</el-button>
             <el-button v-if="isAuthed && canReadAudit" @click="go('/audit')">审计日志</el-button>
-            <el-button v-if="isAuthed && canReadAudit" @click="go('/security')">账号安全</el-button>
             <el-button v-if="isAuthed && canManageSettings" @click="go('/settings')">系统设置</el-button>
             <el-switch
               v-model="isDark"
@@ -46,9 +44,7 @@
 
         <div class="drawer-actions">
           <el-button v-if="isAuthed" style="width: 100%" @click="navTo('/')">用户</el-button>
-          <el-button v-if="isAuthed && canReadTenants" style="width: 100%" @click="navTo('/tenants')">租户</el-button>
           <el-button v-if="isAuthed && canReadAudit" style="width: 100%" @click="navTo('/audit')">审计日志</el-button>
-          <el-button v-if="isAuthed && canReadAudit" style="width: 100%" @click="navTo('/security')">账号安全</el-button>
           <el-button v-if="isAuthed && canManageSettings" style="width: 100%" @click="navTo('/settings')">系统设置</el-button>
         </div>
 
@@ -78,8 +74,6 @@ const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 const isAuthed = computed(() => auth.isAuthed)
-const isAdmin = computed(() => auth.isAdmin)
-const canReadTenants = computed(() => auth.can('tenants:read'))
 const canReadAudit = computed(() => auth.can('audit:read'))
 const canManageSettings = computed(() => auth.can('settings:manage'))
 const username = computed(() => auth.username)

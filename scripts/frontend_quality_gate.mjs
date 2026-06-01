@@ -23,6 +23,7 @@ const sourceFiles = (dir) => {
 const rel = (file) => path.relative(ROOT, file).replaceAll(path.sep, '/')
 
 const read = (file) => fs.readFileSync(file, 'utf8')
+const removedMfaPattern = /\bmfa_code\b|\bmfa_enabled\b|\bmfa_totp_secret\b|\bmfa_confirmed_at\b|\/auth\/mfa\b|\bone-time-code\b|SecuritySettings|账号安全|\bTOTP\b|\bMFA\b/i
 
 for (const file of sourceFiles(WEB_SRC)) {
   const text = read(file)
@@ -43,16 +44,23 @@ for (const file of sourceFiles(WEB_SRC)) {
   if (/(invite|invitation|邀请)/i.test(text)) {
     failures.push(`${relative} introduces user invitation surface`)
   }
+  if (removedMfaPattern.test(text)) {
+    failures.push(`${relative} must not reintroduce removed MFA surface`)
+  }
 }
 
 const login = read(path.join(WEB_SRC, 'views', 'Login.vue'))
-if (!login.includes('mfa_code: form.mfa_code || undefined')) {
-  failures.push('web/src/views/Login.vue must submit optional MFA code')
+if (removedMfaPattern.test(login)) {
+  failures.push('web/src/views/Login.vue must not expose removed MFA fields')
 }
 
 const router = read(path.join(WEB_SRC, 'router', 'index.js'))
-if (!router.includes('SecuritySettings.vue') || !router.includes('/security')) {
-  failures.push('web/src/router/index.js must expose security settings route')
+if (router.includes('SecuritySettings.vue') || router.includes('/security')) {
+  failures.push('web/src/router/index.js must not expose removed MFA security route')
+}
+
+if (fs.existsSync(path.join(WEB_SRC, 'views', 'SecuritySettings.vue'))) {
+  failures.push('web/src/views/SecuritySettings.vue must be removed with the MFA surface')
 }
 
 const http = read(path.join(WEB_SRC, 'api', 'http.js'))

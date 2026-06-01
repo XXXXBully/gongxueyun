@@ -24,8 +24,6 @@ const routes = [
   },
   { path: '/', component: () => import('../views/UserList.vue'), meta: { permissions: ['users:read'] } },
   { path: '/audit', component: () => import('../views/AuditLogs.vue'), meta: { permissions: ['audit:read'] } },
-  { path: '/tenants', component: () => import('../views/TenantManagement.vue'), meta: { permissions: ['tenants:read'] } },
-  { path: '/security', component: () => import('../views/SecuritySettings.vue'), meta: { permissions: ['audit:read'] } },
   { path: '/settings', component: () => import('../views/NotificationSettings.vue'), meta: { permissions: ['settings:manage'] } },
   { path: '/settings/notifications', component: () => import('../views/NotificationSettings.vue'), meta: { permissions: ['settings:manage'] } },
   { path: '/create', component: () => import('../views/UserEdit.vue'), meta: { permissions: ['users:write'] } },
@@ -39,40 +37,51 @@ const router = createRouter({
 
 const isUserRoute = (path) => path === '/u' || path.startsWith('/u/')
 const isUserPublicRoute = (path) => path === '/u/login' || path === '/u/register'
+const isRootRoute = (path) => path === '/'
+const validateAdminSessionInBackground = (auth) => {
+  if (auth.sessionChecked || !auth.isAuthed) return
+  void auth.validateSession()
+}
+
+const validateUserSessionInBackground = (userAuth) => {
+  if (userAuth.sessionChecked || !userAuth.isAuthed) return
+  void userAuth.validateSession()
+}
 
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   const userAuth = useUserAuthStore()
 
   if (isUserRoute(to.path)) {
-    if (!userAuth.sessionChecked) {
-      await userAuth.validateSession()
-    }
     if (isUserPublicRoute(to.path)) {
-      if (userAuth.isAuthed) return '/u'
+      if (userAuth.sessionChecked && userAuth.isAuthed) return '/u'
+      validateUserSessionInBackground(userAuth)
       return true
-    }
-    if (!userAuth.isAuthed) {
-      return { path: '/u/login', query: { redirect: to.fullPath } }
     }
     if (!userAuth.sessionChecked && !(await userAuth.validateSession())) {
       return { path: '/u/login', query: { redirect: to.fullPath } }
     }
+    if (!userAuth.isAuthed) {
+      return { path: '/u/login', query: { redirect: to.fullPath } }
+    }
     return true
   }
 
-  if (!auth.sessionChecked) {
-    await auth.validateSession()
+  if (isRootRoute(to.path)) {
+    if ((!auth.sessionChecked && await auth.validateSession()) || auth.isAuthed) return true
+    if ((!userAuth.sessionChecked && await userAuth.validateSession()) || userAuth.isAuthed) return '/u'
+    return { path: '/u/login', query: { redirect: '/u' } }
   }
 
   if (to.meta.public) {
-    if (auth.isAuthed && to.path === '/login') return '/'
+    if (auth.sessionChecked && auth.isAuthed && to.path === '/login') return '/'
+    validateAdminSessionInBackground(auth)
     return true
   }
-  if (!auth.isAuthed) return { path: '/login', query: { redirect: to.fullPath } }
   if (!auth.sessionChecked && !(await auth.validateSession())) {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
+  if (!auth.isAuthed) return { path: '/login', query: { redirect: to.fullPath } }
   const permissions = Array.isArray(to.meta.permissions) ? to.meta.permissions : []
   if (permissions.length > 0) {
     if (permissions.every((permission) => auth.can(permission))) return true

@@ -1,6 +1,17 @@
 import { defineStore } from 'pinia'
 
 const META_KEY = 'auth_meta'
+const SESSION_VALIDATE_TIMEOUT_MS = 5000
+
+const fetchWithTimeout = async (url, options = {}) => {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), SESSION_VALIDATE_TIMEOUT_MS)
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
 
 const readMeta = () => {
   try {
@@ -17,7 +28,6 @@ export const useAuthStore = defineStore('auth', {
       authed: meta.authed === true,
       username: meta.username || '',
       role: meta.role || '',
-      tenantId: meta.tenantId || 'default',
       permissions: Array.isArray(meta.permissions) ? meta.permissions : [],
       sessionChecked: false,
     }
@@ -29,11 +39,10 @@ export const useAuthStore = defineStore('auth', {
     can: (s) => (permission) => Array.isArray(s.permissions) && s.permissions.includes(permission),
   },
   actions: {
-    setAuth(_token, username, role, tenantId = 'default', permissions = []) {
+    setAuth(_token, username, role, permissions = []) {
       this.authed = !!(_token || role)
       this.username = username || ''
       this.role = role || ''
-      this.tenantId = tenantId || 'default'
       this.permissions = Array.isArray(permissions) ? permissions : []
       this.sessionChecked = false
       if (this.authed) {
@@ -41,7 +50,6 @@ export const useAuthStore = defineStore('auth', {
           authed: true,
           username: this.username,
           role: this.role,
-          tenantId: this.tenantId,
           permissions: this.permissions,
         }))
       } else {
@@ -52,27 +60,24 @@ export const useAuthStore = defineStore('auth', {
       this.authed = false
       this.username = ''
       this.role = ''
-      this.tenantId = 'default'
       this.permissions = []
       this.sessionChecked = false
       sessionStorage.removeItem(META_KEY)
     },
     async validateSession() {
       try {
-        const response = await fetch('/api/auth/me', { credentials: 'include' })
+        const response = await fetchWithTimeout('/api/auth/me', { credentials: 'include' })
         if (!response.ok) throw new Error('session invalid')
         const data = await response.json()
         this.authed = true
         this.username = data.username || ''
         this.role = data.role || ''
-        this.tenantId = data.tenant_id || 'default'
         this.permissions = Array.isArray(data.permissions) ? data.permissions : []
         this.sessionChecked = true
         sessionStorage.setItem(META_KEY, JSON.stringify({
           authed: true,
           username: this.username,
           role: this.role,
-          tenantId: this.tenantId,
           permissions: this.permissions,
         }))
         return true
@@ -80,7 +85,6 @@ export const useAuthStore = defineStore('auth', {
         this.authed = false
         this.username = ''
         this.role = ''
-        this.tenantId = 'default'
         this.permissions = []
         this.sessionChecked = true
         sessionStorage.removeItem(META_KEY)

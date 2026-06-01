@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any, Callable
 from server.coreApi.MainLogicApi import ApiClient
 from server.coreApi.AiServiceClient import generate_article
 from server.ai_governance import check_ai_generation_quota
+from server.ai_settings import load_global_ai_settings
 from server.clockin_backfill import (
     CLOCKIN_TYPE_LABELS,
     combine_date_time,
@@ -269,6 +270,23 @@ def _load_global_smtp_settings(tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, 
             row = get_setting(session, "notifications", DEFAULT_TENANT_ID)
         value = row.value if row and isinstance(row.value, dict) else {}
     return normalize_smtp_settings((value or {}).get("smtp"))
+
+
+def _load_global_ai_settings(tenant_id: str = DEFAULT_TENANT_ID) -> Dict[str, Any]:
+    with Session(engine) as session:
+        return load_global_ai_settings(session, tenant_id)
+
+
+def _apply_global_ai_settings(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    ai_settings = _load_global_ai_settings(_tenant_id_from_config(config_data))
+    if (
+        str(ai_settings.get("apiUrl") or "").strip()
+        or str(ai_settings.get("apikey") or "").strip()
+        or str(ai_settings.get("model") or "").strip()
+    ):
+        config_data.setdefault("config", {})["ai"] = ai_settings
+    return config_data
+
 
 def perform_clock_in(
     api_client: ApiClient,
@@ -904,6 +922,7 @@ def run_task_by_config(
     target_period: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """根据配置字典执行任务"""
+    config_data = _apply_global_ai_settings(config_data)
     config = ConfigManager(config=config_data)
     
     # 设置日志上下文

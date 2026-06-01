@@ -131,9 +131,9 @@ AMAP_KEY=your-amap-key
 - `ALLOW_RUNTIME_SCHEMA_MIGRATIONS` 控制启动时是否允许应用进程自动建表、补列和建索引。生产环境默认关闭，发布前必须执行 Alembic 迁移；本地开发可设为 `true`。
 - 登录态默认写入 HttpOnly Cookie，前端不再使用 `localStorage` 保存 token。生产环境默认启用 Secure Cookie，并通过 `csrf_token` Cookie + `X-CSRF-Token` 请求头做双提交 CSRF 校验；本地 HTTP 调试时才设置 `AUTH_COOKIE_SECURE=false`。跨域部署前端时必须配置 `FRONTEND_ORIGINS` 或 `CORS_ORIGINS`；生产环境默认拒绝 `*` 通配 CORS，除非显式设置 `ALLOW_WILDCARD_CORS=true`；需要兼容外部脚本取 Bearer token 时才打开 `RETURN_AUTH_TOKEN=true`。`ALLOW_LEGACY_TOKENS=true` 只用于短迁移窗口兼容旧版无版本 token，生产默认拒绝。
 - 生产环境必须配置 `TRUSTED_HOSTS`，或通过 `FRONTEND_ORIGINS` / `CORS_ORIGINS` 自动推导 Host 白名单；如果三者都为空，后端会拒绝启动。只有明确接受 Host 校验缺失风险时才设置 `ALLOW_MISSING_TRUSTED_HOSTS=true`。`MAX_REQUEST_BODY_BYTES` 控制非 GET 请求体上限，生产默认 8 MiB，最高 10 MiB，包含无 `Content-Length` 的分块请求，避免异常大包长期占用 API worker。
-- 停用租户会阻断管理端登录、用户端登录、现有 token 继续访问、定时调度加载、残留调度执行和批量队列执行。
-- 租户管理接口只允许默认租户 `default` 的管理员访问；非默认租户管理员即使角色为 `admin`，也不会获得 `tenants:read` / `tenants:manage` 权限。需要做临时权限灰度或租户差异化时，可用 `ROLE_PERMISSIONS_JSON` 覆盖角色权限映射。
-- `APP_REGISTRATION_ENABLED` 控制用户端自助注册，生产默认关闭；租户 `settings.registration_enabled=false` 也会禁用该租户自助注册。后端没有提供用户邀请入口。
+- 前端按单租户产品运行，登录 / 注册页不再提交租户 ID，后台导航也不再提供租户管理入口。数据库和后端内部仍保留 `tenant_id=default` 作为旧库、迁移和历史索引兼容层，不再作为产品功能暴露。
+- `ROLE_PERMISSIONS_JSON` 可用于临时权限灰度，但默认内置权限不再包含 `tenants:read` / `tenants:manage`。
+- `APP_REGISTRATION_ENABLED` 控制用户端自助注册，生产默认关闭。后端没有提供用户邀请入口。
 - `USER_PASSWORD_MIN_LENGTH` 控制用户端密码最小长度，默认 10；管理端重置管理员密码按更高标准校验。
 - `EXPOSE_API_DOCS` 控制 `/docs`、`/redoc` 和 `/openapi.json`，生产默认关闭，本地开发默认开启。接口契约快照放在 `docs/api/openapi-contract.json`，变更 API 路径、请求体或响应模型后必须运行 `python scripts/openapi_contract.py --write` 并让 `python scripts/openapi_contract.py` 通过。
 - 默认启用安全响应头和 CSP，内置 `frame-src 'self' https://www.mapchaxun.cn` 以兼容经纬度核对页；生产环境默认启用 HSTS，只有显式设置 `ENABLE_HSTS=false` 才关闭。只有前端资源策略冲突时才临时关闭或覆盖 CSP。
@@ -141,8 +141,8 @@ AMAP_KEY=your-amap-key
 - 删除用户为软删除，会停用打卡和用户端绑定账号，但保留历史记录用于追溯和恢复。
 - `TASK_LOCK_TTL_SECONDS` 控制定时任务分布式锁过期时间，用于防止多个 worker 重复执行同一任务。
 - `BATCH_RUNNING_ITEM_TIMEOUT_SECONDS` 控制批量队列 running 项 lease 超时回收时间，默认 1800 秒。队列认领会写入 worker owner 和 lease token；超时后仍有重试次数的项目会重新排队，次数耗尽的项目会标记失败并推进批量任务进度，过期线程不能再覆盖新状态。
-- `BATCH_JOB_MAX_USERS` 限制单个批量任务的用户数量，`BATCH_TENANT_MAX_ACTIVE_JOBS` 限制单租户同时处于 queued/running/paused 的批量任务数。批量运行接口支持 `Idempotency-Key` / `X-Idempotency-Key`，相同租户、操作者、用户列表和并发参数会回放同一 `job_id`；一键补卡、批量补卡、手动运行和批量补报告也会按同样的幂等键逻辑去重；批量任务详情支持失败项重试；`IDEMPOTENCY_TTL_SECONDS=604800` 控制记录保留窗口。
-- `AI_ALLOWED_HOSTS` 可选限制正式 AI 生成链路 host。默认只允许解析到公网地址的 HTTPS 端点；本机、内网、链路本地和特殊地址会被拒绝，并会把已校验的 DNS 解析结果固定到本次请求，避免校验后解析漂移。确需接入内网模型服务时，必须同时设置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和明确的 `AI_ALLOWED_HOSTS` 白名单。`AI_ALLOWED_MODELS` 可以锁定模型白名单，`AI_MAX_OUTPUT_TOKENS` 控制输出长度上限，`AI_PROMPT_VERSION` 记录提示词版本。`AI_TENANT_DAILY_LIMIT`、`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制 AI 生成的租户级和用户级配额，避免循环任务或滥用把外部模型费用打穿。`AI_REQUEST_MAX_TIMEOUT_SECONDS`、`AI_REQUEST_MAX_RETRIES`、`AI_SUBMITTED_REPORT_HISTORY_LIMIT` 和 `AI_SUBMITTED_REPORT_HISTORY_CHARS` 控制 AI 请求超时、重试和历史报告注入规模。
+- `BATCH_JOB_MAX_USERS` 限制单个批量任务的用户数量，`BATCH_TENANT_MAX_ACTIVE_JOBS` 保留为兼容配置并按默认桶统计 queued/running/paused 批量任务数。批量运行接口支持 `Idempotency-Key` / `X-Idempotency-Key`，相同操作者、用户列表和并发参数会回放同一 `job_id`；一键补卡、批量补卡、手动运行和批量补报告也会按同样的幂等键逻辑去重；批量任务详情支持失败项重试；`IDEMPOTENCY_TTL_SECONDS=604800` 控制记录保留窗口。
+- AI URL / API Key / Model 由管理端“系统设置 -> AI 设置”统一保存到全局系统配置，读取接口只返回 `hasApiKey`，不会回显密钥。`AI_ALLOWED_HOSTS` 可选限制正式 AI 生成链路 host。默认只允许解析到公网地址的 HTTPS 端点；本机、内网、链路本地和特殊地址会被拒绝，并会把已校验的 DNS 解析结果固定到本次请求，避免校验后解析漂移。确需接入内网模型服务时，必须同时设置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和明确的 `AI_ALLOWED_HOSTS` 白名单。`AI_ALLOWED_MODELS` 可以锁定模型白名单，`AI_MAX_OUTPUT_TOKENS` 控制输出长度上限，`AI_PROMPT_VERSION` 记录提示词版本。`AI_TENANT_DAILY_LIMIT` 保留为兼容命名并作为全局每日配额，`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制用户级配额与窗口，避免循环任务或滥用把外部模型费用打穿。`AI_REQUEST_MAX_TIMEOUT_SECONDS`、`AI_REQUEST_MAX_RETRIES`、`AI_SUBMITTED_REPORT_HISTORY_LIMIT` 和 `AI_SUBMITTED_REPORT_HISTORY_CHARS` 控制 AI 请求超时、重试和历史报告注入规模。
 - 生产环境访问 `/metrics` 和 `/metrics.prom` 需要配置 `METRICS_AUTH_TOKEN`，并通过 `X-Metrics-Token` 或 Bearer token 携带。指标包含认证失败、任务事件、批量队列、活动锁和 HTTP 状态 / 延迟；指标快照默认缓存 `METRICS_CACHE_TTL_SECONDS=5` 秒，并会在相关写入提交后失效，避免抓取端高频请求时每次重新扫业务库又不至于长期返回旧数据；HTTP 请求明细默认保留 14 天，并按小时节流清理；静态资源和健康检查默认不写入明细，可用 `HTTP_METRIC_SAMPLE_RATE` 与 `HTTP_METRIC_EXCLUDE_PATH_PREFIXES` 控制采样和排除前缀，`RECENT_METRIC_WINDOW_SECONDS=300` 控制最近窗口。Prometheus 告警规则放在 `monitoring/prometheus/alerts.yml`，排障步骤见 `docs/ops/runbook.md`。
 - 备份导出支持 `--encryption-key` 或 `BACKUP_ENCRYPTION_KEY` 加密封装，导入加密备份时必须提供相同密钥；生产环境未提供密钥会拒绝导出，只有显式设置 `ALLOW_PLAINTEXT_BACKUP=true` 才允许明文 JSON。
 - `CAPTCHA_MODEL_AUTO_DOWNLOAD` 控制启动时是否自动下载验证码 ONNX 模型。生产环境默认关闭，避免 API 启动被外网模型下载拖死；本地开发未配置时仍会自动检查下载。
@@ -162,7 +162,7 @@ AMAP_KEY=your-amap-key
 - `MOGUDING_PROXY_TTL_SECONDS` 控制动态代理缓存时长，默认 `55` 秒。
 - `MOGUDING_PROXY_API_TIMEOUT_SECONDS` 控制动态代理接口请求超时。
 - `MOGUDING_PROXY_URLS` 控制静态工学云补卡代理池，多个代理用逗号、分号或换行分隔。如果同时配置动态代理接口，会优先使用动态代理接口。代理只在手动补卡执行阶段启用；正常登录、定时打卡、报告提交和缺卡查询不会使用该代理。
-- 补卡代理也可以在管理端 Web 的「系统设置」中按租户保存。环境变量中的代理配置优先级高于 Web 配置；非默认租户的 Web 配置不会覆盖 `default` 租户。
+- 补卡代理也可以在管理端 Web 的「系统设置」中保存。环境变量中的代理配置优先级高于 Web 配置。
 - `REPORT_MAKEUP_BATCH_DELAY_SECONDS` 控制日报 / 周报 / 月报一键补交的批量间隔，未配置时会回退到补卡间隔。
 - Docker 容器内的 `127.0.0.1` 指向容器自身。容器连接宿主机 MySQL 时，请使用宿主机 IP 或 `host.docker.internal`。
 
@@ -218,11 +218,10 @@ server/
 管理端接口面向 `admin`、`operator`、`viewer` 等角色，负责：
 
 - 用户管理
-- 租户管理
 - 批量执行
 - 审计日志查询和清空
+- AI 配置和测试
 - 通知配置
-- AI 测试
 - 地理编码
 - 缺卡查询和补卡
 - 报告生成和提交
@@ -246,6 +245,8 @@ POST /users/{user_id}/clock-in/makeup-all
 - 查看执行记录
 - 缺卡查询和补卡
 - 日报、周报、月报生成和提交，以及当前类型下一键补全部待补周期
+
+管理端创建的用户如果没有单独写入 `app_password_hash`，用户端登录会使用该用户保存的工学云账号密码作为默认登录凭据，并在首次登录时自动生成绑定的 `AppUser`。自助注册用户仍使用独立的用户端账号，绑定工学云账号后才能执行打卡和报告任务。
 
 补卡相关接口：
 
@@ -343,7 +344,7 @@ attendence/attendanceReplace/v4/save
 
 定时任务执行前会写入 `TaskExecutionLock`，同一个用户、同一种定时任务在锁过期前不会被多个 worker 重复执行。批量队列认领使用数据库状态更新，避免同一队列项被重复提交给线程池。运行事件记录在 `TaskExecutionEvent`，HTTP 请求统计记录在 `HttpRequestMetric`，并会携带请求 ID 方便串联入口、任务和告警链路；`/metrics` 和 `/metrics.prom` 会返回任务、批量、锁、请求状态码分布和延迟统计，并通过短 TTL 快照缓存降低重复抓取的数据库压力。
 
-核心业务表已带 `tenant_id`，默认租户为 `default`。管理端用户读写、补卡和报告接口会按登录租户过滤，历史数据迁移时会自动补列并按默认租户兼容 `NULL` 旧值。租户列表、创建和停用属于默认租户平台管理员能力，不对非默认租户管理员开放。
+核心业务表保留 `tenant_id`，默认值固定为 `default`。它现在只是旧库、迁移和历史索引兼容字段；前端不再暴露租户选择、租户菜单或租户管理页，公开 API 文档也不再展示租户管理接口。
 
 数据库 JSON 备份工具：
 
@@ -362,6 +363,7 @@ python -m server.backup_cli import backup.json --replace-existing
 python -m unittest discover -s tests
 python -m alembic upgrade head
 python scripts/quality_gate.py
+python scripts/verify_supply_chain_policy.py
 ```
 
 语法编译检查：
@@ -376,4 +378,4 @@ python -m compileall server
 git diff --check
 ```
 
-当前项目已提供轻量质量门禁 `scripts/quality_gate.py`，用于防止重新引入 `utcnow()`、前端 token localStorage 存储、服务器端 `print`、裸 `except/pass`、不带租户上下文的用户读取和用户邀请入口。前端构建验证见 `web/README.md`。
+当前项目已提供轻量质量门禁 `scripts/quality_gate.py`，用于防止重新引入 `utcnow()`、前端 token localStorage 存储、服务器端 `print`、裸 `except/pass`、不带内部隔离上下文的用户读取和用户邀请入口。`scripts/verify_supply_chain_policy.py` 用于检查 GitHub Actions 是否使用完整 commit SHA、Docker 基础镜像是否使用 digest 钉死。CI 还会执行 `pip-audit` 检查后端依赖漏洞；前端构建与静态质量门禁见 `web/README.md`。

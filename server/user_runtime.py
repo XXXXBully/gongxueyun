@@ -177,7 +177,7 @@ def user_to_config(
             "user": {"phone": getattr(user, "phone", ""), "password": password},
             "clockIn": _json_copy(getattr(user, "clockIn", {}) or {}),
             "reportSettings": _json_copy(getattr(user, "reportSettings", {}) or {}),
-            "ai": _json_copy(getattr(user, "ai", {}) or {}),
+            "ai": {},
             "pushNotifications": normalize_push_notifications(getattr(user, "pushNotifications", []) or []),
             "device": getattr(user, "device", ""),
         },

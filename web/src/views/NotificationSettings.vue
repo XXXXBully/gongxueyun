@@ -41,6 +41,38 @@
         </el-form>
       </el-tab-pane>
 
+      <el-tab-pane label="AI 设置" name="ai">
+        <el-form :model="aiForm" label-width="140px" v-loading="aiLoading">
+          <el-form-item label="Model">
+            <el-input v-model="aiForm.model" placeholder="gpt-4o-mini" />
+          </el-form-item>
+          <el-form-item label="API URL">
+            <el-input v-model="aiForm.apiUrl" placeholder="https://api.openai.com/ 或 https://api-inference.modelscope.cn/v1" />
+          </el-form-item>
+          <el-form-item label="API Key">
+            <el-input
+              v-model="aiForm.apikey"
+              type="password"
+              show-password
+              clearable
+              :placeholder="aiForm.hasApiKey ? '已保存，留空则沿用旧 Key' : '请输入 API Key'"
+            />
+          </el-form-item>
+
+          <el-form-item>
+            <div class="settings-actions">
+              <el-button type="primary" :loading="aiSaving" @click="saveAiSettings">保存</el-button>
+              <el-button :loading="aiTesting" @click="testAiSettings">测试 AI</el-button>
+              <el-button @click="applyModelScopePreset">魔搭预设</el-button>
+              <el-tag v-if="aiTestStatus" size="small" :type="aiTestStatus === 'ok' ? 'success' : 'danger'">
+                {{ aiTestStatus === 'ok' ? '可用' : '不可用' }}
+              </el-tag>
+              <span v-if="aiTestLatencyMs !== null" class="ai-test-meta">延迟：{{ aiTestLatencyMs }}ms</span>
+            </div>
+          </el-form-item>
+        </el-form>
+      </el-tab-pane>
+
       <el-tab-pane label="工学云代理" name="proxy">
         <el-form :model="proxyForm" label-width="140px" v-loading="proxyLoading">
           <el-alert
@@ -100,6 +132,11 @@ const activeTab = ref('notifications')
 const notificationLoading = ref(false)
 const notificationSaving = ref(false)
 const smtpTesting = ref(false)
+const aiLoading = ref(false)
+const aiSaving = ref(false)
+const aiTesting = ref(false)
+const aiTestStatus = ref('')
+const aiTestLatencyMs = ref(null)
 const proxyLoading = ref(false)
 const proxySaving = ref(false)
 
@@ -116,6 +153,13 @@ const proxyForm = reactive({
   ttlSeconds: 55,
   apiTimeoutSeconds: 10,
   proxyUrls: '',
+})
+
+const aiForm = reactive({
+  apiUrl: 'https://api.openai.com/',
+  apikey: '',
+  model: 'gpt-4o-mini',
+  hasApiKey: false,
 })
 
 const loadNotificationSettings = async () => {
@@ -151,6 +195,24 @@ const loadProxySettings = async () => {
   }
 }
 
+const loadAiSettings = async () => {
+  aiLoading.value = true
+  try {
+    const res = await http.get('/settings/ai')
+    const ai = res.data?.ai || {}
+    aiForm.apiUrl = String(ai.apiUrl || 'https://api.openai.com/')
+    aiForm.apikey = ''
+    aiForm.model = String(ai.model || 'gpt-4o-mini')
+    aiForm.hasApiKey = !!ai.hasApiKey
+    aiTestStatus.value = ''
+    aiTestLatencyMs.value = null
+  } catch (error) {
+    notifyError(`加载 AI 设置失败：${resolveErrorMessage(error, '请求失败')}`)
+  } finally {
+    aiLoading.value = false
+  }
+}
+
 const buildNotificationPayload = () => ({
   smtp: {
     enabled: !!smtpForm.enabled,
@@ -167,6 +229,14 @@ const buildProxyPayload = () => ({
     ttlSeconds: Number(proxyForm.ttlSeconds || 0),
     apiTimeoutSeconds: Number(proxyForm.apiTimeoutSeconds || 0),
     proxyUrls: String(proxyForm.proxyUrls || '').trim(),
+  },
+})
+
+const buildAiPayload = () => ({
+  ai: {
+    apiUrl: String(aiForm.apiUrl || '').trim(),
+    apikey: String(aiForm.apikey || '').trim(),
+    model: String(aiForm.model || '').trim(),
   },
 })
 
@@ -191,6 +261,22 @@ const validateProxy = () => {
   if (String(proxyForm.apiUrl || '').trim() || String(proxyForm.proxyUrls || '').trim()) return true
   notifyWarning('启用代理时请填写动态代理接口或静态代理列表')
   return false
+}
+
+const validateAiSettings = () => {
+  if (!String(aiForm.apiUrl || '').trim()) {
+    notifyWarning('请先填写 AI API URL')
+    return false
+  }
+  if (!String(aiForm.model || '').trim()) {
+    notifyWarning('请先填写 AI Model')
+    return false
+  }
+  if (!aiForm.hasApiKey && !String(aiForm.apikey || '').trim()) {
+    notifyWarning('请先填写 AI API Key')
+    return false
+  }
+  return true
 }
 
 const flushUiMessage = async () => {
@@ -234,6 +320,50 @@ const saveProxy = async () => {
   }
 }
 
+const saveAiSettings = async () => {
+  if (!validateAiSettings()) return
+  aiSaving.value = true
+  try {
+    notifyInfo('正在保存 AI 设置')
+    await flushUiMessage()
+    await http.patch('/settings/ai', buildAiPayload())
+    notifySuccess('保存成功')
+    await loadAiSettings()
+  } catch (error) {
+    notifyError(`保存失败：${resolveErrorMessage(error, '请求失败')}`)
+  } finally {
+    aiSaving.value = false
+  }
+}
+
+const testAiSettings = async () => {
+  if (!validateAiSettings()) return
+  aiTesting.value = true
+  aiTestStatus.value = ''
+  aiTestLatencyMs.value = null
+  try {
+    notifyInfo('正在测试 AI')
+    await flushUiMessage()
+    const res = await http.post('/settings/ai/test', buildAiPayload())
+    aiTestStatus.value = res.data?.ok ? 'ok' : 'fail'
+    aiTestLatencyMs.value = typeof res.data?.latency_ms === 'number' ? res.data.latency_ms : null
+    notifySuccess('AI 可用')
+  } catch (error) {
+    aiTestStatus.value = 'fail'
+    notifyError(resolveErrorMessage(error, 'AI 测试失败'))
+  } finally {
+    aiTesting.value = false
+  }
+}
+
+const applyModelScopePreset = () => {
+  aiForm.apiUrl = 'https://api-inference.modelscope.cn/v1'
+  aiForm.model = 'Qwen/Qwen3-Next-80B-A3B-Instruct'
+  aiTestStatus.value = ''
+  aiTestLatencyMs.value = null
+  notifySuccess('已填入魔搭预设')
+}
+
 const testSmtp = async () => {
   if (!validateForTest()) return
   smtpTesting.value = true
@@ -250,7 +380,7 @@ const testSmtp = async () => {
 }
 
 onMounted(async () => {
-  await Promise.all([loadNotificationSettings(), loadProxySettings()])
+  await Promise.all([loadNotificationSettings(), loadAiSettings(), loadProxySettings()])
 })
 </script>
 
@@ -259,5 +389,10 @@ onMounted(async () => {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
+}
+.ai-test-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 </style>

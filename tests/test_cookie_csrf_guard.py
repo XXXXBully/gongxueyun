@@ -4,10 +4,11 @@ from unittest.mock import patch
 
 
 class FakeURL:
-    def __init__(self, scheme="https", hostname="app.example.com", port=None):
+    def __init__(self, scheme="https", hostname="app.example.com", port=None, path="/api/users"):
         self.scheme = scheme
         self.hostname = hostname
         self.port = port
+        self.path = path
 
 
 class FakeRequest:
@@ -20,9 +21,10 @@ class FakeRequest:
         authorization="",
         cookies=None,
         csrf_header="",
+        path="/api/users",
     ):
         self.method = method
-        self.url = FakeURL()
+        self.url = FakeURL(path=path)
         self.headers = {}
         if origin:
             self.headers["origin"] = origin
@@ -64,6 +66,30 @@ class CookieCsrfGuardTest(unittest.TestCase):
         self.assertTrue(should_reject_cookie_csrf(missing_header))
         self.assertTrue(should_reject_cookie_csrf(mismatch))
         self.assertTrue(should_reject_cookie_csrf(missing_cookie))
+
+    def test_auth_bootstrap_endpoint_allows_stale_auth_cookie_without_csrf_token(self):
+        from server.security import should_reject_cookie_csrf
+
+        request = FakeRequest(
+            origin="https://app.example.com",
+            csrf_header="",
+            cookies={"app_auth_token": "stale-token"},
+            path="/api/app/auth/login",
+        )
+
+        self.assertFalse(should_reject_cookie_csrf(request))
+
+    def test_auth_bootstrap_endpoint_still_rejects_cross_site_origin(self):
+        from server.security import should_reject_cookie_csrf
+
+        request = FakeRequest(
+            origin="https://evil.example.net",
+            csrf_header="",
+            cookies={"app_auth_token": "stale-token"},
+            path="/api/app/auth/login",
+        )
+
+        self.assertTrue(should_reject_cookie_csrf(request))
 
     def test_cookie_authenticated_post_without_origin_still_requires_csrf_token(self):
         from server.security import should_reject_cookie_csrf

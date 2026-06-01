@@ -14,44 +14,80 @@ down_revision = None
 branch_labels = None
 depends_on = None
 
+_SCHEMA_CACHE = {
+    "tables": None,
+    "columns": {},
+    "indexes": {},
+    "unique_constraints": {},
+}
+
+
+def _reset_schema_cache() -> None:
+    _SCHEMA_CACHE["tables"] = None
+    _SCHEMA_CACHE["columns"] = {}
+    _SCHEMA_CACHE["indexes"] = {}
+    _SCHEMA_CACHE["unique_constraints"] = {}
+
+
+def _create_table(*args, **kwargs) -> None:
+    op.create_table(*args, **kwargs)
+    _reset_schema_cache()
+
 
 def _existing_tables() -> set[str]:
-    return set(sa.inspect(op.get_bind()).get_table_names())
+    tables = _SCHEMA_CACHE["tables"]
+    if tables is None:
+        tables = set(sa.inspect(op.get_bind()).get_table_names())
+        _SCHEMA_CACHE["tables"] = tables
+    return set(tables)
 
 
 def _existing_indexes(table_name: str) -> set[str]:
     if table_name not in _existing_tables():
         return set()
-    return {
-        str(item.get("name") or "")
-        for item in sa.inspect(op.get_bind()).get_indexes(table_name)
-    }
+    indexes_by_table = _SCHEMA_CACHE["indexes"]
+    if table_name not in indexes_by_table:
+        indexes_by_table[table_name] = {
+            str(item.get("name") or "")
+            for item in sa.inspect(op.get_bind()).get_indexes(table_name)
+        }
+    return set(indexes_by_table[table_name])
 
 
 def _existing_unique_constraints(table_name: str) -> set[str]:
     if table_name not in _existing_tables():
         return set()
-    return {
-        str(item.get("name") or "")
-        for item in sa.inspect(op.get_bind()).get_unique_constraints(table_name)
-    }
+    unique_constraints_by_table = _SCHEMA_CACHE["unique_constraints"]
+    if table_name not in unique_constraints_by_table:
+        unique_constraints_by_table[table_name] = {
+            str(item.get("name") or "")
+            for item in sa.inspect(op.get_bind()).get_unique_constraints(table_name)
+        }
+    return set(unique_constraints_by_table[table_name])
 
 
 def _existing_columns(table_name: str) -> set[str]:
     if table_name not in _existing_tables():
         return set()
-    return {
-        str(item.get("name") or "")
-        for item in sa.inspect(op.get_bind()).get_columns(table_name)
-    }
+    columns_by_table = _SCHEMA_CACHE["columns"]
+    if table_name not in columns_by_table:
+        columns_by_table[table_name] = {
+            str(item.get("name") or "")
+            for item in sa.inspect(op.get_bind()).get_columns(table_name)
+        }
+    return set(columns_by_table[table_name])
 
 
 def _add_column_if_missing(table_name: str, column: sa.Column) -> None:
     if table_name not in _existing_tables():
         return
-    if column.name in _existing_columns(table_name):
+    existing_columns = _existing_columns(table_name)
+    column_name = str(column.name)
+    if column_name in existing_columns:
         return
     op.add_column(table_name, column)
+    existing_columns.add(column_name)
+    _SCHEMA_CACHE["columns"][table_name] = existing_columns
 
 
 def _create_index_if_missing(name: str, table_name: str, columns: list[str]) -> None:
@@ -63,6 +99,9 @@ def _create_index_if_missing(name: str, table_name: str, columns: list[str]) -> 
     if name in _existing_indexes(table_name):
         return
     op.create_index(name, table_name, columns)
+    existing_indexes = _existing_indexes(table_name)
+    existing_indexes.add(name)
+    _SCHEMA_CACHE["indexes"][table_name] = existing_indexes
 
 
 def _drop_unique_if_exists(name: str, table_name: str) -> None:
@@ -71,6 +110,9 @@ def _drop_unique_if_exists(name: str, table_name: str) -> None:
     if op.get_bind().dialect.name == "sqlite":
         return
     op.drop_constraint(name, table_name, type_="unique")
+    existing_constraints = _existing_unique_constraints(table_name)
+    existing_constraints.discard(name)
+    _SCHEMA_CACHE["unique_constraints"][table_name] = existing_constraints
 
 
 def _create_unique_if_missing(name: str, table_name: str, columns: list[str]) -> None:
@@ -84,6 +126,9 @@ def _create_unique_if_missing(name: str, table_name: str, columns: list[str]) ->
     if op.get_bind().dialect.name == "sqlite":
         return
     op.create_unique_constraint(name, table_name, columns)
+    existing_constraints = _existing_unique_constraints(table_name)
+    existing_constraints.add(name)
+    _SCHEMA_CACHE["unique_constraints"][table_name] = existing_constraints
 
 
 def _ensure_existing_table_columns() -> None:
@@ -162,7 +207,7 @@ def _seed_default_tenant() -> None:
 def upgrade() -> None:
     existing = _existing_tables()
     if "tenant" not in existing:
-        op.create_table(
+        _create_table(
             "tenant",
             sa.Column("id", sa.String(length=255), primary_key=True),
             sa.Column("name", sa.String(length=255), nullable=False),
@@ -172,7 +217,7 @@ def upgrade() -> None:
         )
 
     if "user" not in existing:
-        op.create_table(
+        _create_table(
             "user",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -200,7 +245,7 @@ def upgrade() -> None:
         )
 
     if "auditlog" not in existing:
-        op.create_table(
+        _create_table(
             "auditlog",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -212,7 +257,7 @@ def upgrade() -> None:
         )
 
     if "batchjob" not in existing:
-        op.create_table(
+        _create_table(
             "batchjob",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -233,7 +278,7 @@ def upgrade() -> None:
         )
 
     if "batchjobitem" not in existing:
-        op.create_table(
+        _create_table(
             "batchjobitem",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -254,7 +299,7 @@ def upgrade() -> None:
         )
 
     if "adminuser" not in existing:
-        op.create_table(
+        _create_table(
             "adminuser",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -273,7 +318,7 @@ def upgrade() -> None:
         )
 
     if "appuser" not in existing:
-        op.create_table(
+        _create_table(
             "appuser",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -289,7 +334,7 @@ def upgrade() -> None:
         )
 
     if "systemsetting" not in existing:
-        op.create_table(
+        _create_table(
             "systemsetting",
             sa.Column("key", sa.String(length=255), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -297,7 +342,7 @@ def upgrade() -> None:
         )
 
     if "ratelimitevent" not in existing:
-        op.create_table(
+        _create_table(
             "ratelimitevent",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("bucket_key", sa.String(length=255), nullable=False),
@@ -305,7 +350,7 @@ def upgrade() -> None:
         )
 
     if "ratelimitbucket" not in existing:
-        op.create_table(
+        _create_table(
             "ratelimitbucket",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("bucket_key", sa.String(length=255), nullable=False),
@@ -316,7 +361,7 @@ def upgrade() -> None:
         )
 
     if "taskexecutionlock" not in existing:
-        op.create_table(
+        _create_table(
             "taskexecutionlock",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -329,7 +374,7 @@ def upgrade() -> None:
         )
 
     if "taskexecutionevent" not in existing:
-        op.create_table(
+        _create_table(
             "taskexecutionevent",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),
@@ -346,7 +391,7 @@ def upgrade() -> None:
         )
 
     if "httprequestmetric" not in existing:
-        op.create_table(
+        _create_table(
             "httprequestmetric",
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("tenant_id", sa.String(length=255), nullable=False, server_default="default"),

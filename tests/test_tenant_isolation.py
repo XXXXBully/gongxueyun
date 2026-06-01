@@ -4,7 +4,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from server.models import AdminUser, AppUser, AuditLog, Tenant, User, UserCreate
+from server.models import AdminUser, AppUser, AuditLog, User, UserCreate
 
 
 class TenantIsolationTest(unittest.TestCase):
@@ -165,28 +165,23 @@ class TenantIsolationTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertTrue(acme_admin.enabled)
 
-    def test_non_default_admin_cannot_manage_tenants_even_by_direct_call(self):
+    def test_tenant_management_api_surface_is_removed(self):
         from server import api
 
-        with Session(self.engine) as session:
-            session.add(Tenant(id="acme", name="Acme", status="active"))
-            session.commit()
+        for name in [
+            "read_tenants_page",
+            "create_tenant",
+            "update_tenant",
+            "TenantCreateRequest",
+            "TenantUpdateRequest",
+            "TenantPageResponse",
+        ]:
+            self.assertFalse(hasattr(api, name), name)
 
-            with self.assertRaises(HTTPException) as read_ctx:
-                api.read_tenants_page(
-                    session=session,
-                    admin={"sub": "root", "role": "admin", "tenant_id": "acme"},
-                )
-            with self.assertRaises(HTTPException) as update_ctx:
-                api.update_tenant(
-                    session=session,
-                    admin={"sub": "root", "role": "admin", "tenant_id": "acme"},
-                    tenant_id="acme",
-                    req=api.TenantUpdateRequest(name="Hijacked"),
-                )
-
-        self.assertEqual(read_ctx.exception.status_code, 403)
-        self.assertEqual(update_ctx.exception.status_code, 403)
+        paths = {getattr(route, "path", "") for route in api.router.routes}
+        self.assertNotIn("/tenants/page", paths)
+        self.assertNotIn("/tenants", paths)
+        self.assertNotIn("/tenants/{tenant_id}", paths)
 
 
 if __name__ == "__main__":

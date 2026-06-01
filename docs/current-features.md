@@ -6,8 +6,8 @@
 
 AutoMoGuDing SaaS 当前包含两套 Web 界面：
 
-- **管理端：** 用户管理、租户管理、批量任务、审计日志查询、通知配置、AI 测试、地理编码、缺卡查询和补卡。审计清空默认禁用，用户删除为软删除。
-- **用户端：** 注册 / 登录、绑定工学云账号、个人配置、手动执行、执行记录、日报生成 / 提交、缺卡查询和补卡。
+- **管理端：** 用户管理、批量任务、审计日志查询、全局 AI 配置、通知基础配置、单用户推送配置、AI 测试、地理编码、缺卡查询和补卡。审计清空默认禁用，用户删除为软删除。
+- **用户端：** 注册 / 登录、绑定工学云账号、个人打卡 / 报告 / 推送配置、手动执行、执行记录、日报生成 / 提交、缺卡查询和补卡。
 
 后端任务执行链路集中在：
 
@@ -213,20 +213,18 @@ POST /users/{user_id}/clock-in/makeup-all
 - 默认响应安全头和 CSP；生产环境默认启用 HSTS。
 - 审计日志默认不可清空；用户删除为软删除，会停用打卡和用户端绑定账号并保留历史记录。
 - 生产环境必须配置 `USER_PASSWORD_KEY` 或 `FERNET_KEY` 才允许保存新的工学云密码、SMTP 授权码和代理接口密钥；本地开发保留历史明文兼容。
-- 核心表具备默认租户 `default` 和 `tenant_id` 字段，旧数据迁移时兼容 `NULL` 默认租户值。
-- 管理端提供租户列表、创建和停用页面及接口，并为租户变更写入审计日志；租户管理仅对默认租户 `default` 的平台管理员开放。管理端和用户端登录/注册页提交租户 ID，用户详情、执行、编辑、补卡和报告接口按登录租户过滤。
-- 停用租户会阻断登录、现有 token、定时任务加载、残留调度执行和批量队列执行。
+- 前端按单租户产品运行，不再展示租户输入、租户菜单和租户管理页。核心表中保留 `tenant_id` / 默认值 `default` 只是为了兼容旧库、迁移和已有索引。
 - 管理端权限从纯角色判断推进到权限点依赖，用户、任务、批量、设置和审计接口按动作权限校验。
-- `/ai/test` 默认只允许公网 HTTPS 地址；正式 AI 生成链路默认也拒绝本机、内网和特殊地址，确需接入内网模型服务时必须同时配置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和 `AI_ALLOWED_HOSTS`。AI 生成还受 `AI_TENANT_DAILY_LIMIT`、`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制，避免循环任务或滥用打穿模型费用。
+- AI URL / API Key / Model 由全局系统设置统一管理，接口为 `/settings/ai` 和 `/settings/ai/test`；用户编辑页和用户端设置页不再保存用户级 AI 参数。读取全局设置时只返回 `hasApiKey`，不会回显 API Key。`/settings/ai/test` 和兼容保留的 `/ai/test` 默认只允许公网 HTTPS 地址；正式 AI 生成链路默认也拒绝本机、内网和特殊地址，确需接入内网模型服务时必须同时配置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和 `AI_ALLOWED_HOSTS`。AI 生成还受 `AI_TENANT_DAILY_LIMIT`、`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制，避免循环任务或滥用打穿模型费用。
 - 定时任务使用数据库锁避免重复执行，锁 TTL 由 `TASK_LOCK_TTL_SECONDS` 控制。
 - 批量队列认领会把 queued 项原子更新为 running，并写入 worker owner、lease token 和 lease 到期时间，降低多 worker 或多线程重复执行风险；running 项超过 `BATCH_RUNNING_ITEM_TIMEOUT_SECONDS` 后会回收，过期线程不能再覆盖新状态。
 - 数据库限流后端按 bucket 聚合计数，登录和注册同时按 IP 与账号维度限流，避免低速撞库绕过单 IP 限制。
 - `/metrics` 返回任务事件、批量任务、批量项、活动锁、HTTP 请求状态分布、延迟统计和最近请求 ID；`/metrics.prom` 返回 Prometheus 文本格式。生产环境默认不裸露 metrics，需要配置 `METRICS_AUTH_TOKEN` 并通过 `X-Metrics-Token` 或 Bearer token 访问。指标快照默认缓存 `METRICS_CACHE_TTL_SECONDS=5` 秒，并会在相关写入提交后失效，避免抓取端高频请求时每次重新扫业务库又不至于长期返回旧数据。HTTP 请求明细默认保留 14 天，并按小时节流清理；静态资源和健康检查默认不落库，避免指标表被无价值请求刷爆。
-- 通知 SMTP 和工学云补卡代理 Web 配置按租户隔离保存；默认租户继续使用历史 key，非默认租户使用租户前缀 key，避免多租户互相覆盖系统设置。
+- AI、通知 SMTP 和工学云补卡代理 Web 配置按默认全局配置保存；单用户推送配置保存在用户记录中，管理员可在用户编辑页维护，绑定用户也可在 `/u/settings` 自助维护；QQ 邮箱 SMTP 的发件账号仍由管理员统一配置。
 - 生产环境默认不在启动时自动下载验证码 ONNX 模型，避免外网下载失败影响 API 启动；需要自动拉取时配置 `CAPTCHA_MODEL_AUTO_DOWNLOAD=true`。
 - 数据库 schema 使用 Alembic 维护，生产环境默认不做运行时 schema 写操作，发布前执行 `python -m alembic upgrade head`；运行时迁移关闭时，后端启动会校验数据库 `alembic_version` 是否处于 head，不一致会直接拒绝启动。需要保留开发期自动初始化时设置 `ALLOW_RUNTIME_SCHEMA_MIGRATIONS=true`。
 - 数据库备份/恢复可使用 `python -m server.backup_cli export backup.json` 和 `python -m server.backup_cli import backup.json --replace-existing`，导出包包含 manifest、表行数和表校验和，导入前会校验篡改。生产环境导出默认要求 `BACKUP_ENCRYPTION_KEY` 或 `--encryption-key`，除非显式设置 `ALLOW_PLAINTEXT_BACKUP=true`。
-- CI 质量门禁会运行 `python scripts/quality_gate.py`，检查 UTC 时间、前端敏感登录态存储、服务器端 `print`、裸 `except/pass` 和不带租户上下文的用户读取回归；发布流程还会跑 `pip-audit`、`npm audit` 与 Trivy 扫描。
+- CI 质量门禁会运行 `python scripts/quality_gate.py` 和 `python scripts/verify_supply_chain_policy.py`，检查 UTC 时间、前端敏感登录态存储、服务器端 `print`、裸 `except/pass`、不带内部隔离上下文的用户读取回归、GitHub Actions 钉死和 Docker 基础镜像 digest 钉死；发布流程还会跑 `pip-audit`、`npm audit` 与 Trivy 扫描。
 
 ## 验证命令
 
@@ -257,4 +255,4 @@ npm run build
 git diff --check
 ```
 
-当前项目没有 `npm test` 和 `npm run lint` 脚本。
+当前前端已经提供 `npm run lint`、`npm test` 和 `npm run test:static`，其中 `npm test` 当前委托到静态质量门禁。

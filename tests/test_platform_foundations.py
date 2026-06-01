@@ -2,7 +2,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -59,6 +60,110 @@ class PlatformFoundationsTest(unittest.TestCase):
         inspector = inspect(legacy_engine)
         self.assertIn("tenant_id", {item["name"] for item in inspector.get_columns("user")})
         self.assertIn("tenant_id", {item["name"] for item in inspector.get_columns("auditlog")})
+
+    def test_ensure_user_runtime_columns_upgrades_mysql_deleted_by_to_varchar(self):
+        from server.database import ensure_user_runtime_columns
+        from sqlalchemy import Text
+
+        inspector = Mock()
+        inspector.get_table_names.return_value = ["user"]
+        inspector.get_columns.return_value = [
+            {"name": "userInfo", "type": Text()},
+            {"name": "planInfo", "type": Text()},
+            {"name": "deleted_at", "type": Text()},
+            {"name": "deleted_by", "type": Text()},
+            {"name": "delete_reason", "type": Text()},
+        ]
+
+        conn = Mock()
+        cm = Mock()
+        cm.__enter__ = Mock(return_value=conn)
+        cm.__exit__ = Mock(return_value=False)
+        fake_engine = SimpleNamespace(dialect=SimpleNamespace(name="mysql"), begin=Mock(return_value=cm))
+
+        with patch("server.database.inspect", return_value=inspector):
+            ensure_user_runtime_columns(fake_engine)
+
+        sql = " ".join(str(call.args[0]) for call in conn.execute.call_args_list)
+        self.assertIn("MODIFY COLUMN `deleted_by` VARCHAR(255) NULL", sql)
+
+    def test_ensure_batch_job_runtime_columns_adds_queue_lock_columns_to_legacy_tables(self):
+        from server.database import ensure_batch_job_runtime_columns
+
+        legacy_engine = create_engine("sqlite://")
+        with legacy_engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TABLE batchjob (id INTEGER PRIMARY KEY, status TEXT)")
+            conn.exec_driver_sql(
+                "CREATE TABLE batchjobitem ("
+                "id INTEGER PRIMARY KEY, "
+                "job_id INTEGER NOT NULL, "
+                "status TEXT NOT NULL"
+                ")"
+            )
+
+        ensure_batch_job_runtime_columns(legacy_engine)
+
+        inspector = inspect(legacy_engine)
+        batchjob_columns = {item["name"] for item in inspector.get_columns("batchjob")}
+        item_columns = {item["name"] for item in inspector.get_columns("batchjobitem")}
+
+        self.assertIn("cancel_requested", batchjob_columns)
+        self.assertIn("paused", batchjob_columns)
+        self.assertIn("attempts", item_columns)
+        self.assertIn("max_attempts", item_columns)
+        self.assertIn("next_run_at", item_columns)
+        self.assertIn("locked_by", item_columns)
+        self.assertIn("lock_token", item_columns)
+        self.assertIn("lease_until", item_columns)
+        self.assertIn("heartbeat_at", item_columns)
+
+    def test_runtime_schema_cleanup_removes_legacy_admin_mfa_columns(self):
+        from server.database import ensure_legacy_admin_mfa_removed
+
+        legacy_engine = create_engine("sqlite://")
+        with legacy_engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE adminuser ("
+                "id INTEGER PRIMARY KEY, "
+                "username TEXT NOT NULL, "
+                "password_hash TEXT NOT NULL, "
+                "mfa_enabled BOOLEAN NOT NULL DEFAULT 0, "
+                "mfa_totp_secret TEXT NULL, "
+                "mfa_confirmed_at DATETIME NULL"
+                ")"
+            )
+            conn.exec_driver_sql("CREATE INDEX ix_adminuser_mfa_enabled ON adminuser (mfa_enabled)")
+            conn.exec_driver_sql("CREATE INDEX ix_adminuser_mfa_confirmed_at ON adminuser (mfa_confirmed_at)")
+
+        ensure_legacy_admin_mfa_removed(legacy_engine)
+
+        inspector = inspect(legacy_engine)
+        columns = {item["name"] for item in inspector.get_columns("adminuser")}
+        indexes = {item["name"] for item in inspector.get_indexes("adminuser")}
+        self.assertNotIn("mfa_enabled", columns)
+        self.assertNotIn("mfa_totp_secret", columns)
+        self.assertNotIn("mfa_confirmed_at", columns)
+        self.assertNotIn("ix_adminuser_mfa_enabled", indexes)
+        self.assertNotIn("ix_adminuser_mfa_confirmed_at", indexes)
+
+    def test_runtime_indexes_skip_specs_when_legacy_table_is_missing_columns(self):
+        from server.database import ensure_runtime_indexes
+
+        legacy_engine = create_engine("sqlite://")
+        with legacy_engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE batchjobitem ("
+                "id INTEGER PRIMARY KEY, "
+                "job_id INTEGER NOT NULL, "
+                "status TEXT NOT NULL"
+                ")"
+            )
+
+        ensure_runtime_indexes(legacy_engine)
+
+        index_names = {item["name"] for item in inspect(legacy_engine).get_indexes("batchjobitem")}
+        self.assertIn("ix_batchjobitem_job_status_id", index_names)
+        self.assertNotIn("ix_batchjobitem_locked_by", index_names)
 
     def test_runtime_schema_mutation_is_disabled_by_default_in_production(self):
         from server.database import should_run_runtime_schema_migrations
@@ -391,6 +496,7 @@ class PlatformFoundationsTest(unittest.TestCase):
 
         self.assertGreaterEqual(versions["fastapi"], (0, 136, 3))
         self.assertGreaterEqual(versions["starlette"], (1, 0, 1))
+        self.assertGreaterEqual(versions["httpx"], (0, 28, 1))
         self.assertGreaterEqual(versions["python-dotenv"], (1, 2, 2))
         self.assertGreaterEqual(versions["requests"], (2, 33, 0))
         self.assertGreaterEqual(versions["pillow"], (12, 2, 0))
@@ -475,33 +581,33 @@ class PlatformFoundationsTest(unittest.TestCase):
         self.assertIn("logs: List[str] = Field(default_factory=list)", source)
         self.assertNotIn("logs: List[str] = []", source)
 
-    def test_tenant_management_creates_and_disables_tenant(self):
+    def test_tenant_management_routes_are_removed(self):
         from server import api
-        from server.models import AuditLog, Tenant
 
-        with Session(self.engine) as session:
-            created = api.create_tenant(
-                session=session,
-                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
-                req=api.TenantCreateRequest(id="acme", name="Acme Inc"),
-            )
-            self.assertEqual(created["id"], "acme")
-            page = api.read_tenants_page(
-                session=session,
-                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
-            )
-            self.assertEqual(page["total"], 1)
+        paths = {getattr(route, "path", "") for route in api.router.routes}
+        self.assertNotIn("/tenants/page", paths)
+        self.assertNotIn("/tenants", paths)
+        self.assertNotIn("/tenants/{tenant_id}", paths)
+        self.assertFalse(hasattr(api, "TenantCreateRequest"))
+        self.assertFalse(hasattr(api, "TenantUpdateRequest"))
+        self.assertFalse(hasattr(api, "TenantPageResponse"))
 
-            updated = api.update_tenant(
-                session=session,
-                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
-                tenant_id="acme",
-                req=api.TenantUpdateRequest(status="disabled"),
-            )
+    def test_public_auth_models_do_not_accept_tenant_id(self):
+        from server import api
 
-            self.assertEqual(updated["status"], "disabled")
-            self.assertEqual(session.get(Tenant, "acme").status, "disabled")
-            self.assertEqual(len(session.exec(select(AuditLog).where(AuditLog.action == "tenant.update")).all()), 1)
+        for model in [api.LoginRequest, api.AppLoginRequest, api.AppRegisterRequest, api.AppMeResponse]:
+            fields = model.model_fields if hasattr(model, "model_fields") else getattr(model, "__fields__", {})
+            self.assertNotIn("tenant_id", fields)
+
+        data = api.admin_me(payload={"sub": "admin", "role": "admin", "tenant_id": "default"})
+        self.assertNotIn("tenant_id", data)
+
+    def test_public_user_models_do_not_expose_tenant_id(self):
+        from server.models import UserCreate, UserListRead, UserRead
+
+        for model in [UserCreate, UserRead, UserListRead]:
+            fields = model.model_fields if hasattr(model, "model_fields") else getattr(model, "__fields__", {})
+            self.assertNotIn("tenant_id", fields)
 
     def test_admin_management_can_create_operator_and_viewer_accounts(self):
         from server import api

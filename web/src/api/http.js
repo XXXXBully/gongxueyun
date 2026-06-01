@@ -1,6 +1,7 @@
 import axios from 'axios'
 import router from '../router'
 import { useAuthStore } from '../stores/auth'
+import { resolveApiErrorMessage } from './errorMessage'
 
 export const http = axios.create({
   baseURL: '/api',
@@ -41,7 +42,7 @@ http.interceptors.response.use(
         router.replace('/login')
       }
     }
-    const message = error?.response?.data?.detail || error?.message || '请求失败'
+    const message = resolveApiErrorMessage(error)
     return Promise.reject({ ...error, friendlyMessage: message })
   }
 )

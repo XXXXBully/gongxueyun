@@ -49,10 +49,40 @@
         </el-form-item>
         <el-form-item label="打卡地址">
           <div class="address-row">
-            <el-input v-model="clockInAddress" placeholder="请输入详细地址" />
+            <el-input v-model="clockInAddress" placeholder="请输入详细地址或搜索关键词" @keyup.enter="searchPlace" />
+            <el-button type="primary" :loading="geocodeSearchLoading" @click="searchPlace">搜索位置</el-button>
             <el-button @click="autoFillAddress" :loading="addressLoading" type="success" plain>自动获取</el-button>
           </div>
         </el-form-item>
+        <el-row class="location-grid" :gutter="10">
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="纬度">
+              <el-input v-model="clockInLatitude" placeholder="例如：30.572800" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="经度">
+              <el-input v-model="clockInLongitude" placeholder="例如：104.066800" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row class="location-grid" :gutter="10">
+          <el-col :xs="24" :sm="8">
+            <el-form-item label="省份">
+              <el-input v-model="clockInProvince" placeholder="省份" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="8">
+            <el-form-item label="城市">
+              <el-input v-model="clockInCity" placeholder="城市" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="8">
+            <el-form-item label="区域">
+              <el-input v-model="clockInArea" placeholder="区县" />
+            </el-form-item>
+          </el-col>
+        </el-row>
         <el-form-item label="上班时间">
           <el-time-picker v-model="startTime" value-format="HH:mm" format="HH:mm" />
         </el-form-item>
@@ -212,6 +242,22 @@
           </div>
           <el-input v-model="reportPreview.monthly" class="report-preview-input" type="textarea" :rows="5" resize="none" placeholder="点击 AI生成月报，或手动填写后提交" />
         </el-form-item>
+
+        <el-divider>推送</el-divider>
+        <el-divider content-position="left">Server酱</el-divider>
+        <el-form-item label="启用 Server酱">
+          <el-switch v-model="pushNotifications[0].enabled" />
+        </el-form-item>
+        <el-form-item label="SendKey">
+          <el-input v-model="pushNotifications[0].sendKey" placeholder="请输入 Server酱 SendKey" clearable />
+        </el-form-item>
+        <el-divider content-position="left">QQ 邮箱 SMTP</el-divider>
+        <el-form-item label="启用 SMTP">
+          <el-switch v-model="pushNotifications[1].enabled" />
+        </el-form-item>
+        <el-form-item label="收件邮箱">
+          <el-input v-model="pushNotifications[1].to" placeholder="例如：demo@qq.com" />
+        </el-form-item>
       </el-form>
     </el-card>
   </div>
@@ -237,6 +283,12 @@ const password = ref('')
 const clockInEnabled = ref(true)
 const clockInAddress = ref('')
 const addressLoading = ref(false)
+const clockInLatitude = ref('')
+const clockInLongitude = ref('')
+const clockInProvince = ref('')
+const clockInCity = ref('')
+const clockInArea = ref('')
+const geocodeSearchLoading = ref(false)
 const startTime = ref('07:30')
 const endTime = ref('18:00')
 const clockInPeriodLoading = ref(false)
@@ -258,6 +310,10 @@ const reportPeriodOptions = reactive({ daily: [], weekly: [], monthly: [] })
 const reportMakeupAllLoading = ref('')
 const reportMakeupAllPercent = ref(0)
 const reportMakeupAllProgressKey = ref('')
+const pushNotifications = reactive([
+  { type: 'Server', enabled: false, sendKey: '' },
+  { type: 'SMTP', enabled: false, to: '' },
+])
 const CLOCKIN_MAKEUP_REQUEST_TIMEOUT = 0
 const REPORT_MAKEUP_REQUEST_TIMEOUT = 0
 const _today = new Date()
@@ -268,6 +324,7 @@ const reportTargets = reactive({ daily: _todayDate, weekly: _todayDate, monthly:
 const reportPreview = reactive({ daily: '', weekly: '', monthly: '' })
 let clockInMakeupAllTimer = null
 let reportMakeupAllTimer = null
+let geocodeSearchAbort = null
 
 const resetClockInMakeupAllProgress = () => {
   if (clockInMakeupAllTimer) {
@@ -334,6 +391,74 @@ const finishReportMakeupAllProgress = () => {
 }
 
 const _ensureObj = (v) => (v && typeof v === 'object' ? v : {})
+const _firstText = (...values) => {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return ''
+}
+const _addressObjectFromSearchResult = (result) => {
+  if (!result || typeof result !== 'object') return {}
+  const raw = result.raw && typeof result.raw === 'object' ? result.raw : {}
+  return _ensureObj(
+    result.address ||
+    raw.address ||
+    raw.address_components ||
+    raw.addressComponent ||
+    raw.result?.address_components ||
+    raw.regeocode?.addressComponent
+  )
+}
+const assignAddressParts = (address) => {
+  const addr = _ensureObj(address)
+  const province = _firstText(addr.province, addr.state)
+  const city = _firstText(addr.city, addr.town, addr.county)
+  const area = _firstText(addr.district, addr.county, addr.suburb)
+  if (province) clockInProvince.value = province
+  if (city) clockInCity.value = city
+  if (area) clockInArea.value = area
+}
+const applyGeocodeSearchResult = (result, fallbackLabel) => {
+  const lat = Number(result?.y)
+  const lon = Number(result?.x)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    notifyWarning('搜索结果经纬度无效，请换一个关键词')
+    return false
+  }
+  clockInLatitude.value = lat.toFixed(6)
+  clockInLongitude.value = lon.toFixed(6)
+  const address = _addressObjectFromSearchResult(result)
+  assignAddressParts(address)
+  const label = _firstText(result?.label, result?.raw?.formatted_address, result?.raw?.display_name, fallbackLabel)
+  if (label) clockInAddress.value = label
+  return true
+}
+const normalizePushNotifications = (items) => {
+  const list = Array.isArray(items) ? items : []
+  const map = new Map(
+    list
+      .filter((item) => item && typeof item === 'object' && item.type)
+      .map((item) => [item.type, { ...item }])
+  )
+  const server = map.get('Server') || {}
+  const smtp = map.get('SMTP') || {}
+  return [
+    {
+      type: 'Server',
+      enabled: !!server.enabled,
+      sendKey: typeof server.sendKey === 'string' ? server.sendKey : '',
+    },
+    {
+      type: 'SMTP',
+      enabled: !!smtp.enabled,
+      to: typeof smtp.to === 'string' ? smtp.to : '',
+    },
+  ]
+}
+const assignPushNotifications = (items) => {
+  const next = normalizePushNotifications(items)
+  pushNotifications.splice(0, pushNotifications.length, ...next)
+}
 
 const startRebind = () => {
   bound.value = false
@@ -375,6 +500,7 @@ const autoFillAddress = async () => {
     const res = await userHttp.get('/app/account-address')
     if (res.data?.address) {
       clockInAddress.value = res.data.address
+      await searchPlace({ silent: true })
       notifySuccess('已自动填充打卡地址')
     } else {
       notifyError('未获取到有效地址')
@@ -383,6 +509,38 @@ const autoFillAddress = async () => {
     notifyError(resolveErrorMessage(e, '获取地址失败'))
   } finally {
     addressLoading.value = false
+  }
+}
+
+const searchPlace = async (options = {}) => {
+  const q = String(clockInAddress.value || '').trim()
+  if (!q) {
+    notifyWarning('请输入要搜索的地点')
+    return false
+  }
+  if (geocodeSearchAbort) geocodeSearchAbort.abort()
+  geocodeSearchAbort = new AbortController()
+  geocodeSearchLoading.value = true
+  try {
+    const res = await userHttp.get('/geocode/search', {
+      params: { q },
+      signal: geocodeSearchAbort.signal,
+    })
+    const results = Array.isArray(res.data?.results) ? res.data.results : []
+    if (!results.length) {
+      if (!options.silent) notifyWarning('没有搜索到结果，请换一个关键词')
+      return false
+    }
+    const applied = applyGeocodeSearchResult(results[0], q)
+    if (applied && !options.silent) notifySuccess('已定位到搜索结果')
+    return applied
+  } catch (e) {
+    if (e?.code !== 'ERR_CANCELED' && !options.silent) {
+      notifyError(resolveErrorMessage(e, '搜索位置失败'))
+    }
+    return false
+  } finally {
+    geocodeSearchLoading.value = false
   }
 }
 
@@ -397,6 +555,11 @@ const load = async () => {
     const schedule = _ensureObj(ci.schedule)
     clockInEnabled.value = me.value.enable_clockin !== false
     clockInAddress.value = String(loc.address || '')
+    clockInLatitude.value = String(loc.latitude || '')
+    clockInLongitude.value = String(loc.longitude || '')
+    clockInProvince.value = String(loc.province || '')
+    clockInCity.value = String(loc.city || '')
+    clockInArea.value = String(loc.area || '')
     startTime.value = String(schedule.startTime || '07:30')
     endTime.value = String(schedule.endTime || '18:00')
     const rs = _ensureObj(me.value.reportSettings)
@@ -404,6 +567,7 @@ const load = async () => {
     dailySubmitTime.value = String(_ensureObj(rs.daily).submitTime || '12:00')
     weeklyEnabled.value = !!_ensureObj(rs.weekly).enabled
     monthlyEnabled.value = !!_ensureObj(rs.monthly).enabled
+    assignPushNotifications(me.value.pushNotifications)
     if (bound.value) {
       await Promise.all([loadClockInMissingDays(), loadAllReportPeriodOptions()])
     }
@@ -423,6 +587,11 @@ const save = async () => {
   const location = _ensureObj(clockIn.location)
   const schedule = _ensureObj(clockIn.schedule)
   location.address = String(clockInAddress.value || '').trim()
+  location.latitude = String(clockInLatitude.value || '').trim()
+  location.longitude = String(clockInLongitude.value || '').trim()
+  location.province = String(clockInProvince.value || '').trim()
+  location.city = String(clockInCity.value || '').trim()
+  location.area = String(clockInArea.value || '').trim()
   schedule.startTime = String(startTime.value || '07:30')
   schedule.endTime = String(endTime.value || '18:00')
   clockIn.location = location
@@ -444,6 +613,7 @@ const save = async () => {
       enable_clockin: !!clockInEnabled.value,
       clockIn,
       reportSettings,
+      pushNotifications: normalizePushNotifications(pushNotifications),
     })
     password.value = ''
     notifySuccess('已保存')
@@ -764,6 +934,7 @@ watch(
 onUnmounted(() => {
   resetClockInMakeupAllProgress()
   resetReportMakeupAllProgress()
+  if (geocodeSearchAbort) geocodeSearchAbort.abort()
 })
 
 load()
@@ -803,6 +974,13 @@ load()
   width: 100%;
   display: flex;
   gap: 10px;
+  flex-wrap: wrap;
+}
+.address-row :deep(.el-input) {
+  flex: 1 1 260px;
+}
+.location-grid {
+  width: 100%;
 }
 .clockin-backfill {
   width: 100%;

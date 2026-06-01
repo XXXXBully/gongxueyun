@@ -1,11 +1,16 @@
 import os
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
 from server import models  # noqa: F401
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=False, encoding="utf-8-sig")
 
 config = context.config
 

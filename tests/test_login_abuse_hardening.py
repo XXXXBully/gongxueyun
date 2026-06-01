@@ -7,8 +7,9 @@ from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from server import api
-from server.auth import hash_password
-from server.models import AdminUser, AppUser, AuditLog
+from server.auth import hash_password, verify_password
+from server.models import AdminUser, AppUser, AuditLog, User
+from server.secret_store import encrypt_secret
 from server.time_utils import utc_now
 
 
@@ -29,6 +30,7 @@ class LoginAbuseHardeningTest(unittest.TestCase):
                     "LOGIN_LOCKOUT_FAILURES": "2",
                     "LOGIN_LOCKOUT_SECONDS": "900",
                     "APP_SECRET": "test-secret-value-with-more-than-thirty-two-chars",
+                    "USER_PASSWORD_KEY": "test-user-password-key",
                 },
                 clear=False,
             ),
@@ -45,7 +47,7 @@ class LoginAbuseHardeningTest(unittest.TestCase):
                     api.admin_login(
                         request=self.request,
                         response=self.response,
-                        req=api.LoginRequest(username="admin", password="wrong-password", tenant_id="default"),
+                        req=api.LoginRequest(username="admin", password="wrong-password"),
                     )
 
         with Session(self.engine) as session:
@@ -62,7 +64,7 @@ class LoginAbuseHardeningTest(unittest.TestCase):
                 api.admin_login(
                     request=self.request,
                     response=self.response,
-                    req=api.LoginRequest(username="admin", password="correct-password-123", tenant_id="default"),
+                    req=api.LoginRequest(username="admin", password="correct-password-123"),
                 )
 
         self.assertEqual(ctx.exception.status_code, 423)
@@ -84,7 +86,7 @@ class LoginAbuseHardeningTest(unittest.TestCase):
             result = api.admin_login(
                 request=self.request,
                 response=self.response,
-                req=api.LoginRequest(username="admin", password="correct-password-123", tenant_id="default"),
+                req=api.LoginRequest(username="admin", password="correct-password-123"),
             )
 
         with Session(self.engine) as session:
@@ -105,7 +107,7 @@ class LoginAbuseHardeningTest(unittest.TestCase):
                     api.app_login(
                         request=self.request,
                         response=self.response,
-                        req=api.AppLoginRequest(phone="13800000000", password="wrong-password", tenant_id="default"),
+                        req=api.AppLoginRequest(phone="13800000000", password="wrong-password"),
                     )
 
         with Session(self.engine) as session:
@@ -115,6 +117,64 @@ class LoginAbuseHardeningTest(unittest.TestCase):
         self.assertEqual(user.failed_login_count, 2)
         self.assertIsNotNone(user.locked_until)
         self.assertEqual(len(logs), 2)
+
+    def test_app_login_accepts_admin_created_user_password(self):
+        patches = self._patch_runtime()
+        with patches[0], patches[1], patches[2]:
+            with Session(self.engine) as session:
+                user = User(
+                    phone="13900000000",
+                    password=encrypt_secret("correct-password-123"),
+                    app_enabled=True,
+                    enable_clockin=False,
+                )
+                session.add(user)
+                session.commit()
+                session.refresh(user)
+                user_id = user.id
+
+            result = api.app_login(
+                request=self.request,
+                response=self.response,
+                req=api.AppLoginRequest(phone="13900000000", password="correct-password-123"),
+            )
+
+        with Session(self.engine) as session:
+            app_user = session.exec(select(AppUser).where(AppUser.phone == "13900000000")).one()
+
+        self.assertEqual(result["phone"], "13900000000")
+        self.assertEqual(app_user.bound_user_id, user_id)
+        self.assertTrue(app_user.enabled)
+
+    def test_app_login_syncs_existing_app_user_from_legacy_user_password(self):
+        patches = self._patch_runtime()
+        with patches[0], patches[1], patches[2]:
+            with Session(self.engine) as session:
+                user = User(
+                    phone="13900000001",
+                    password=encrypt_secret("correct-password-123"),
+                    app_enabled=True,
+                    enable_clockin=False,
+                )
+                session.add(user)
+                session.add(AppUser(phone="13900000001", password_hash=hash_password("old-password"), enabled=True))
+                session.commit()
+                session.refresh(user)
+                user_id = user.id
+
+            result = api.app_login(
+                request=self.request,
+                response=self.response,
+                req=api.AppLoginRequest(phone="13900000001", password="correct-password-123"),
+            )
+
+        with Session(self.engine) as session:
+            app_user = session.exec(select(AppUser).where(AppUser.phone == "13900000001")).one()
+
+        self.assertEqual(result["user_id"], app_user.id)
+        self.assertEqual(app_user.bound_user_id, user_id)
+        self.assertTrue(app_user.enabled)
+        self.assertTrue(verify_password("correct-password-123", app_user.password_hash))
 
 
 if __name__ == "__main__":

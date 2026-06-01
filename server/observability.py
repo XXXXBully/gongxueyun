@@ -306,7 +306,7 @@ def _auth_failure_counts(
 
 
 def _auth_failure_metrics(session: Session, *, now: Optional[datetime.datetime] = None) -> dict[str, Any]:
-    actions = ("auth.login.failed", "app.login.failed", "auth.mfa.failed")
+    actions = ("auth.login.failed", "app.login.failed")
     recent_cutoff = (now or _now_utc()) - datetime.timedelta(seconds=_recent_metric_window_seconds())
     return {
         "by_action": _auth_failure_counts(session, actions=actions),

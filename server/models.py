@@ -18,7 +18,6 @@ class Tenant(SQLModel, table=True):
 
 
 class UserBase(SQLModel):
-    tenant_id: str = Field(default=DEFAULT_TENANT_ID, index=True)
     phone: str = Field(index=True)
     password: str
     remark: Optional[str] = Field(default=None, index=True)
@@ -27,7 +26,6 @@ class UserBase(SQLModel):
 
     clockIn: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     reportSettings: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    ai: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     pushNotifications: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     device: str = "{brand: TA J20, systemVersion: 17, Platform: Android, isPhysicalDevice: true, incremental: K23V10A}"
 
@@ -39,6 +37,7 @@ class User(UserBase, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(default=DEFAULT_TENANT_ID, index=True)
     deleted_at: Optional[datetime.datetime] = Field(default=None, index=True)
     deleted_by: Optional[str] = Field(default=None, index=True)
     delete_reason: Optional[str] = None
@@ -46,6 +45,7 @@ class User(UserBase, table=True):
     last_status: Optional[str] = None
     logs: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     last_execution_result: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    ai: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     userInfo: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     planInfo: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
@@ -78,7 +78,6 @@ class UserUpdate(SQLModel):
     app_enabled: Optional[bool] = None
     clockIn: Optional[Dict[str, Any]] = None
     reportSettings: Optional[Dict[str, Any]] = None
-    ai: Optional[Dict[str, Any]] = None
     pushNotifications: Optional[List[Dict[str, Any]]] = None
     device: Optional[str] = None
     enable_clockin: Optional[bool] = None
@@ -152,9 +151,6 @@ class AdminUser(SQLModel, table=True):
     token_version: int = Field(default=0, index=True)
     failed_login_count: int = Field(default=0, index=True)
     locked_until: Optional[datetime.datetime] = Field(default=None, index=True)
-    mfa_enabled: bool = Field(default=False, index=True)
-    mfa_totp_secret: Optional[str] = Field(default=None)
-    mfa_confirmed_at: Optional[datetime.datetime] = Field(default=None, index=True)
 
 class AppUser(SQLModel, table=True):
     __table_args__ = (

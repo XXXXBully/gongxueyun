@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from server import api
-from server.models import AuditLog, BatchJob, BatchJobItem, User
+from server.models import AppUser, AuditLog, BatchJob, BatchJobItem, SystemSetting, User
 
 
 class GovernanceHardeningTest(unittest.TestCase):
@@ -83,7 +83,7 @@ class GovernanceHardeningTest(unittest.TestCase):
 
         request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
         response = SimpleNamespace(headers={}, set_cookie=lambda *args, **kwargs: None)
-        req = api.AppRegisterRequest(phone="13800000000", password="strong-pass", tenant_id="default")
+        req = api.AppRegisterRequest(phone="13800000000", password="strong-pass")
 
         with patch.dict("os.environ", {"APP_REGISTRATION_ENABLED": "false"}, clear=False):
             with self.assertRaises(HTTPException) as ctx:
@@ -96,13 +96,196 @@ class GovernanceHardeningTest(unittest.TestCase):
 
         request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
         response = SimpleNamespace(headers={}, set_cookie=lambda *args, **kwargs: None)
-        req = api.AppRegisterRequest(phone="13800000001", password="short", tenant_id="default")
+        req = api.AppRegisterRequest(phone="13800000001", password="short")
 
         with patch.dict("os.environ", {"APP_REGISTRATION_ENABLED": "true"}, clear=False):
             with self.assertRaises(HTTPException) as ctx:
                 api.app_register(request=request, response=response, req=req)
 
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_ai_settings_are_global_and_api_key_is_not_echoed(self):
+        from server import api
+
+        with patch.dict("os.environ", {"USER_PASSWORD_KEY": "test-user-password-key"}, clear=False), Session(self.engine) as session:
+            saved = api.update_ai_settings(
+                session=session,
+                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
+                req=api.AiSettingsUpdateRequest(
+                    ai={
+                        "apiUrl": "https://api.example.com/v1",
+                        "apikey": "secret-key",
+                        "model": "global-model",
+                    }
+                ),
+            )
+            session.commit()
+
+            loaded = api.get_ai_settings(
+                session=session,
+                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
+            )
+            row = session.get(SystemSetting, "ai")
+
+        self.assertEqual(saved["ai"]["apiUrl"], "https://api.example.com/v1")
+        self.assertEqual(saved["ai"]["model"], "global-model")
+        self.assertEqual(saved["ai"]["apikey"], "")
+        self.assertTrue(saved["ai"]["hasApiKey"])
+        self.assertEqual(loaded["ai"]["apikey"], "")
+        self.assertTrue(loaded["ai"]["hasApiKey"])
+        self.assertNotIn("secret-key", str(row.value))
+
+    def test_ai_settings_test_keeps_existing_api_key_when_payload_is_blank(self):
+        from server import api
+
+        request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+        with patch.dict("os.environ", {"USER_PASSWORD_KEY": "test-user-password-key"}, clear=False), Session(self.engine) as session:
+            api.update_ai_settings(
+                session=session,
+                admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
+                req=api.AiSettingsUpdateRequest(
+                    ai={
+                        "apiUrl": "https://api.example.com/v1",
+                        "apikey": "secret-key",
+                        "model": "global-model",
+                    }
+                ),
+            )
+
+            with patch.object(api, "_run_ai_connectivity_test", return_value={"ok": True}) as runner:
+                result = api.test_ai_settings(
+                    request=request,
+                    session=session,
+                    admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
+                    req=api.AiSettingsTestRequest(
+                        ai={
+                            "apiUrl": "https://api.example.com/v2",
+                            "apikey": "",
+                            "model": "new-model",
+                        }
+                    ),
+                )
+
+        tested_settings = runner.call_args.args[1]
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(tested_settings["apiUrl"], "https://api.example.com/v2")
+        self.assertEqual(tested_settings["apikey"], "secret-key")
+        self.assertEqual(tested_settings["model"], "new-model")
+
+    def test_report_generation_uses_global_ai_settings_not_user_settings(self):
+        from server import api
+
+        with patch("server.api.engine", self.engine):
+            with Session(self.engine) as session:
+                api.update_ai_settings(
+                    session=session,
+                    admin={"sub": "admin", "role": "admin", "tenant_id": "default"},
+                    req=api.AiSettingsUpdateRequest(
+                        ai={
+                            "apiUrl": "https://api.example.com/v1",
+                            "apikey": "secret-key",
+                            "model": "global-model",
+                        }
+                    ),
+                )
+                user = User(
+                    phone="13800000000",
+                    password="encrypted-password",
+                    enable_clockin=False,
+                    ai={},
+                    planInfo={"planPaper": {"dayPaperNum": 300}},
+                    userInfo={"userId": "u-1"},
+                )
+                session.add(user)
+                session.commit()
+                session.refresh(user)
+
+                fake_client = SimpleNamespace(
+                    get_submitted_reports_info=lambda report_type: {"flag": 0, "data": []},
+                    get_job_info=lambda: {"practiceCompanyEntity": {}},
+                )
+                with (
+                    patch.object(api, "ApiClient", return_value=fake_client),
+                    patch.object(api, "_ensure_remote_runtime"),
+                    patch.object(api, "check_ai_generation_quota"),
+                    patch.object(api, "generate_article", return_value="generated") as generated,
+                ):
+                    result = api._generate_report_content_for_user(user, "daily", None, generate_content=True)
+
+        used_config = generated.call_args.args[0]
+        self.assertEqual(result["content"], "generated")
+        self.assertEqual(used_config.get_value("config.ai.model"), "global-model")
+        self.assertEqual(used_config.get_value("config.ai.apiUrl"), "https://api.example.com/v1")
+        self.assertEqual(used_config.get_value("config.ai.apikey"), "secret-key")
+
+    def test_report_generation_ignores_legacy_user_ai_without_global_settings(self):
+        from server import api
+
+        user = User(
+            id=42,
+            tenant_id="default",
+            phone="13800000000",
+            password="encrypted-password",
+            enable_clockin=False,
+            ai={
+                "apiUrl": "https://api.example.com/v1",
+                "apikey": "legacy-key",
+                "model": "legacy-model",
+            },
+            planInfo={"planPaper": {"dayPaperNum": 300}},
+            userInfo={"userId": "u-1"},
+        )
+        with (
+            patch("server.api.engine", self.engine),
+            patch.object(api, "ApiClient"),
+            patch.object(api, "generate_article") as generated,
+            self.assertRaises(HTTPException) as ctx,
+        ):
+            api._generate_report_content_for_user(user, "daily", None, generate_content=True)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("AI 设置", str(ctx.exception.detail))
+        generated.assert_not_called()
+
+    def test_app_user_can_update_own_push_notifications(self):
+        from server import api
+
+        with Session(self.engine) as session:
+            user = User(tenant_id="default", phone="13800000000", password="encrypted-password")
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            app_user = AppUser(
+                tenant_id="default",
+                phone="13800000000",
+                password_hash="hash",
+                enabled=True,
+                bound_user_id=user.id,
+            )
+            session.add(app_user)
+            session.commit()
+            session.refresh(app_user)
+
+            updated = api.app_update_me(
+                session=session,
+                payload={"sub": f"app:{app_user.id}", "role": "user", "tenant_id": "default"},
+                req=api.AppMeUpdateRequest(
+                    pushNotifications=[
+                        {"type": "Server", "enabled": True, "sendKey": "server-key"},
+                        {"type": "SMTP", "enabled": True, "to": "demo@qq.com"},
+                    ]
+                ),
+            )
+            saved = session.get(User, user.id)
+
+        self.assertEqual(
+            updated["pushNotifications"],
+            [
+                {"type": "Server", "enabled": True, "sendKey": "server-key"},
+                {"type": "SMTP", "enabled": True, "to": "demo@qq.com"},
+            ],
+        )
+        self.assertEqual(saved.pushNotifications, updated["pushNotifications"])
 
     def test_batch_run_rejects_duplicate_and_oversized_requests(self):
         from server import api

@@ -842,111 +842,6 @@
         "tags": []
       }
     },
-    "/api/auth/mfa/disable": {
-      "post": {
-        "operation_id": "admin_mfa_disable_api_auth_mfa_disable_post",
-        "parameters": [],
-        "request_body": {
-          "content": {
-            "application/json": {
-              "$ref": "#/components/schemas/MfaDisableRequest"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/auth/mfa/enable": {
-      "post": {
-        "operation_id": "admin_mfa_enable_api_auth_mfa_enable_post",
-        "parameters": [],
-        "request_body": {
-          "content": {
-            "application/json": {
-              "$ref": "#/components/schemas/MfaCodeRequest"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/auth/mfa/setup": {
-      "post": {
-        "operation_id": "admin_mfa_setup_api_auth_mfa_setup_post",
-        "parameters": [],
-        "request_body": {
-          "content": {
-            "application/json": {
-              "$ref": "#/components/schemas/MfaSetupRequest"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/auth/mfa/status": {
-      "get": {
-        "operation_id": "admin_mfa_status_api_auth_mfa_status_get",
-        "parameters": [],
-        "request_body": {
-          "content": {},
-          "required": false
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          }
-        },
-        "tags": []
-      }
-    },
     "/api/batch-jobs/{job_id}": {
       "get": {
         "operation_id": "read_batch_job_api_batch_jobs__job_id__get",
@@ -1193,6 +1088,80 @@
         "tags": []
       }
     },
+    "/api/settings/ai": {
+      "get": {
+        "operation_id": "get_ai_settings_api_settings_ai_get",
+        "parameters": [],
+        "request_body": {
+          "content": {},
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "tags": []
+      },
+      "patch": {
+        "operation_id": "update_ai_settings_api_settings_ai_patch",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/AiSettingsUpdateRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        },
+        "tags": []
+      }
+    },
+    "/api/settings/ai/test": {
+      "post": {
+        "operation_id": "test_ai_settings_api_settings_ai_test_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/AiSettingsTestRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        },
+        "tags": []
+      }
+    },
     "/api/settings/notifications": {
       "get": {
         "operation_id": "get_notification_settings_api_settings_notifications_get",
@@ -1291,132 +1260,6 @@
           "content": {
             "application/json": {
               "$ref": "#/components/schemas/ProxySettingsUpdateRequest"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/tenants": {
-      "post": {
-        "operation_id": "create_tenant_api_tenants_post",
-        "parameters": [],
-        "request_body": {
-          "content": {
-            "application/json": {
-              "$ref": "#/components/schemas/TenantCreateRequest"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {}
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/tenants/page": {
-      "get": {
-        "operation_id": "read_tenants_page_api_tenants_page_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "pageSize",
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "q",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          }
-        ],
-        "request_body": {
-          "content": {},
-          "required": false
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/TenantPageResponse"
-              }
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        },
-        "tags": []
-      }
-    },
-    "/api/tenants/{tenant_id}": {
-      "patch": {
-        "operation_id": "update_tenant_api_tenants__tenant_id__patch",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "tenant_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "request_body": {
-          "content": {
-            "application/json": {
-              "$ref": "#/components/schemas/TenantUpdateRequest"
             }
           },
           "required": true
@@ -2385,6 +2228,32 @@
       },
       "type": "object"
     },
+    "AiSettingsTestRequest": {
+      "properties": {
+        "ai": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AiSettingsUpdateRequest": {
+      "properties": {
+        "ai": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "ai"
+      ],
+      "type": "object"
+    },
     "AiTestRequest": {
       "properties": {
         "apiUrl": {
@@ -2426,16 +2295,6 @@
         },
         "phone": {
           "type": "string"
-        },
-        "tenant_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
@@ -2446,16 +2305,6 @@
     },
     "AppMeUpdateRequest": {
       "properties": {
-        "ai": {
-          "anyOf": [
-            {
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "clockIn": {
           "anyOf": [
             {
@@ -2486,6 +2335,19 @@
             }
           ]
         },
+        "pushNotifications": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "reportSettings": {
           "anyOf": [
             {
@@ -2506,16 +2368,6 @@
         },
         "phone": {
           "type": "string"
-        },
-        "tenant_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
@@ -2674,28 +2526,8 @@
     },
     "LoginRequest": {
       "properties": {
-        "mfa_code": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "password": {
           "type": "string"
-        },
-        "tenant_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "username": {
           "type": "string"
@@ -2704,49 +2536,6 @@
       "required": [
         "password",
         "username"
-      ],
-      "type": "object"
-    },
-    "MfaCodeRequest": {
-      "properties": {
-        "code": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "code"
-      ],
-      "type": "object"
-    },
-    "MfaDisableRequest": {
-      "properties": {
-        "code": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "password": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "password"
-      ],
-      "type": "object"
-    },
-    "MfaSetupRequest": {
-      "properties": {
-        "password": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "password"
       ],
       "type": "object"
     },
@@ -2804,90 +2593,8 @@
       ],
       "type": "object"
     },
-    "TenantCreateRequest": {
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "settings": {
-          "type": "object"
-        }
-      },
-      "required": [
-        "id",
-        "name"
-      ],
-      "type": "object"
-    },
-    "TenantPageResponse": {
-      "properties": {
-        "items": {
-          "items": {
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "page": {
-          "type": "integer"
-        },
-        "pageSize": {
-          "type": "integer"
-        },
-        "total": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "items",
-        "page",
-        "pageSize",
-        "total"
-      ],
-      "type": "object"
-    },
-    "TenantUpdateRequest": {
-      "properties": {
-        "name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "settings": {
-          "anyOf": [
-            {
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "status": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
-    },
     "UserCreate": {
       "properties": {
-        "ai": {
-          "type": "object"
-        },
         "app_enabled": {
           "type": "boolean"
         },
@@ -2934,9 +2641,6 @@
         },
         "reportSettings": {
           "type": "object"
-        },
-        "tenant_id": {
-          "type": "string"
         }
       },
       "required": [
@@ -3051,9 +2755,6 @@
     },
     "UserRead": {
       "properties": {
-        "ai": {
-          "type": "object"
-        },
         "app_enabled": {
           "type": "boolean"
         },
@@ -3146,9 +2847,6 @@
         },
         "reportSettings": {
           "type": "object"
-        },
-        "tenant_id": {
-          "type": "string"
         }
       },
       "required": [
@@ -3164,16 +2862,6 @@
     },
     "UserUpdate": {
       "properties": {
-        "ai": {
-          "anyOf": [
-            {
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "app_enabled": {
           "anyOf": [
             {

@@ -104,7 +104,7 @@ class AuthCookieFlowTest(unittest.TestCase):
 
         self.assertTrue(has_permission({"role": "admin"}, "audit:purge"))
         self.assertTrue(has_permission({"role": "admin"}, "settings:read"))
-        self.assertTrue(has_permission({"role": "admin", "tenant_id": "default"}, "tenants:manage"))
+        self.assertFalse(has_permission({"role": "admin", "tenant_id": "default"}, "tenants:manage"))
         self.assertFalse(has_permission({"role": "admin", "tenant_id": "acme"}, "tenants:manage"))
         self.assertFalse(has_permission({"role": "operator"}, "audit:purge"))
         self.assertIn("users:read", permissions_for_role("viewer"))
@@ -121,7 +121,7 @@ class AuthCookieFlowTest(unittest.TestCase):
             self.assertTrue(has_permission({"role": "operator"}, "tasks:run"))
             self.assertFalse(has_permission({"role": "operator"}, "batch:manage"))
 
-    def test_admin_me_returns_tenant_and_permissions(self):
+    def test_admin_me_returns_identity_and_permissions_without_tenant(self):
         from server.api import admin_me
 
         payload = {"sub": "alice", "role": "operator", "tenant_id": "acme"}
@@ -129,19 +129,19 @@ class AuthCookieFlowTest(unittest.TestCase):
         data = admin_me(payload=payload)
 
         self.assertEqual(data["username"], "alice")
-        self.assertEqual(data["tenant_id"], "acme")
+        self.assertNotIn("tenant_id", data)
         self.assertEqual(data["role"], "operator")
         self.assertIn("users:read", data["permissions"])
         self.assertNotIn("tenants:manage", data["permissions"])
 
-    def test_non_default_admin_me_does_not_expose_tenant_management(self):
+    def test_admin_me_does_not_expose_tenant_management(self):
         from server.api import admin_me
 
         payload = {"sub": "alice", "role": "admin", "tenant_id": "acme"}
 
         data = admin_me(payload=payload)
 
-        self.assertEqual(data["tenant_id"], "acme")
+        self.assertNotIn("tenant_id", data)
         self.assertIn("users:read", data["permissions"])
         self.assertNotIn("tenants:read", data["permissions"])
         self.assertNotIn("tenants:manage", data["permissions"])

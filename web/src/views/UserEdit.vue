@@ -312,29 +312,6 @@
             </div>
           </el-form-item>
         </el-tab-pane>
-        
-        <el-tab-pane label="AI 设置" name="ai">
-             <el-form-item label="Model">
-                <el-input v-model="form.ai.model" placeholder="gpt-4o-mini" />
-             </el-form-item>
-             <el-form-item label="API Key">
-                <el-input v-model="form.ai.apikey" :placeholder="secretPlaceholder" />
-             </el-form-item>
-              <el-form-item label="API URL">
-                <el-input v-model="form.ai.apiUrl" placeholder="https://api.openai.com/ 或 https://api-inference.modelscope.cn/v1" />
-             </el-form-item>
-             <el-form-item label="测试">
-                <div class="ai-test-row">
-                  <el-button type="primary" :loading="aiTestLoading" @click="testAi">测试 AI</el-button>
-                  <el-button @click="applyModelScopePreset">魔搭预设</el-button>
-                  <el-tag v-if="aiTestStatus" size="small" :type="aiTestStatus === 'ok' ? 'success' : 'danger'">
-                    {{ aiTestStatus === 'ok' ? '可用' : '不可用' }}
-                  </el-tag>
-                  <span v-if="aiTestLatencyMs !== null" class="ai-test-meta">延迟：{{ aiTestLatencyMs }}ms</span>
-                </div>
-             </el-form-item>
-        </el-tab-pane>
-
         <el-tab-pane label="推送设置" name="push">
           <el-alert title="仅保留 Server酱 和 QQ 邮箱 SMTP 推送；QQ 邮箱 SMTP 的发件账号由管理员统一配置，这里只设置开关和收件邮箱。" type="info" :closable="false" style="margin-bottom: 15px;" />
 
@@ -386,16 +363,12 @@ const route = useRoute()
 const router = useRouter()
 const isEdit = computed(() => !!route.params.id)
 const passwordPlaceholder = computed(() => '请输入工学云密码')
-const secretPlaceholder = computed(() => '请输入')
 const pushSecretPlaceholder = computed(() => '请输入')
 const loading = ref(false)
 const activeTab = ref('basic')
 const DEFAULT_MAP_DISPLAY_URL = 'https://www.mapchaxun.cn/jingweidu'
 const mapDisplayUrl = String(import.meta.env.VITE_MAP_DISPLAY_URL || DEFAULT_MAP_DISPLAY_URL).trim() || DEFAULT_MAP_DISPLAY_URL
 const isMobile = ref(false)
-const aiTestLoading = ref(false)
-const aiTestStatus = ref('')
-const aiTestLatencyMs = ref(null)
 const addrFillLoading = ref(false)
 const clockInPeriodLoading = ref(false)
 const clockInMakeupLoading = ref(false)
@@ -565,11 +538,6 @@ const form = reactive({
     daily: { enabled: false, imageCount: 0, submitTime: '12:00', submitDays: [1, 2, 3, 4, 5, 6, 7] },
     weekly: { enabled: true, imageCount: 0, submitTime: 5, submitAt: '18:30' },
     monthly: { enabled: false, imageCount: 0, submitTime: 29, submitAt: '12:00' }
-  },
-  ai: {
-      model: "gpt-4o-mini",
-      apikey: "",
-      apiUrl: "https://api.openai.com/"
   },
   pushNotifications: buildDefaultPushNotifications(),
   device: "{brand: TA J20, systemVersion: 17, Platform: Android, isPhysicalDevice: true, incremental: K23V10A}"
@@ -748,6 +716,7 @@ const fetchUser = async () => {
   try {
     const res = await http.get(`/users/${route.params.id}`)
     Object.assign(form, res.data)
+    delete form.ai
     const last = res.data?.last_execution_result || []
     if (Array.isArray(last)) {
       reportPreview.daily = (last.find(i => i?.task_type === '日报提交' && i?.report_content)?.report_content) || ''
@@ -826,6 +795,7 @@ const save = async () => {
     form.clockIn.mode = 'custom'
     form.clockIn.customDays = form.clockIn.schedule.weekdays
     const payload = JSON.parse(JSON.stringify(form))
+    delete payload.ai
     payload.pushNotifications = normalizePushNotifications(payload.pushNotifications)
     if (isEdit.value) {
       await http.patch(`/users/${route.params.id}`, payload)
@@ -851,32 +821,6 @@ const cancelEdit = () => {
   }
   resetToDefaultForm()
   notifyInfo('已清空未保存的内容')
-}
-
-const testAi = async () => {
-  const apiUrl = (form.ai.apiUrl || '').trim()
-  const apikey = (form.ai.apikey || '').trim()
-  const model = (form.ai.model || '').trim()
-  if (!apiUrl || !apikey || !model) {
-    notifyWarning('请先填写 API URL、API Key 和 Model')
-    return
-  }
-  aiTestLoading.value = true
-  aiTestStatus.value = ''
-  aiTestLatencyMs.value = null
-  try {
-    notifyInfo('正在测试 AI')
-    await flushUiMessage()
-    const res = await http.post('/ai/test', { apiUrl, apikey, model })
-    aiTestStatus.value = res.data?.ok ? 'ok' : 'fail'
-    aiTestLatencyMs.value = typeof res.data?.latency_ms === 'number' ? res.data.latency_ms : null
-    notifySuccess('AI 可用')
-  } catch (e) {
-    aiTestStatus.value = 'fail'
-    notifyError(resolveErrorMessage(e, 'AI 测试失败'))
-  } finally {
-    aiTestLoading.value = false
-  }
 }
 
 const reportLabelMap = { daily: '日报', weekly: '周报', monthly: '月报' }
@@ -1180,14 +1124,6 @@ const runReportNow = async (taskType) => {
   }
 }
 
-const applyModelScopePreset = () => {
-  form.ai.apiUrl = 'https://api-inference.modelscope.cn/v1'
-  form.ai.model = 'Qwen/Qwen3-Next-80B-A3B-Instruct'
-  aiTestStatus.value = ''
-  aiTestLatencyMs.value = null
-  notifySuccess('已填入魔搭预设，请粘贴 Token 后点击“测试 AI”')
-}
-
 const _pickBestAddress = (...values) => {
   const list = []
   for (const v of values.flat(2)) {
@@ -1392,16 +1328,6 @@ onUnmounted(() => {
   margin: 0 auto;
   display: flex;
   gap: 12px;
-}
-.ai-test-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.ai-test-meta {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
 }
 .report-preview {
   width: 100%;

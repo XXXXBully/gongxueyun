@@ -7,7 +7,6 @@ import time
 import secrets
 import logging
 from functools import lru_cache
-from urllib.parse import quote
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from server.models import DEFAULT_TENANT_ID
@@ -29,8 +28,6 @@ ROLE_PERMISSIONS = {
         "audit:read",
         "audit:purge",
         "admin_users:manage",
-        "tenants:read",
-        "tenants:manage",
         "settings:read",
         "settings:manage",
         "users:read",
@@ -136,50 +133,6 @@ def verify_password(password: str, password_hash: str) -> bool:
         return hmac.compare_digest(got, expected)
     except Exception:
         return False
-
-
-def generate_totp_secret() -> str:
-    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
-
-
-def _totp_secret_bytes(secret: str) -> bytes:
-    normalized = "".join(str(secret or "").upper().split())
-    if not normalized:
-        raise ValueError("TOTP secret is required")
-    normalized += "=" * (-len(normalized) % 8)
-    return base64.b32decode(normalized, casefold=True)
-
-
-def totp_code(secret: str, *, at_time: int | None = None, interval: int = 30, digits: int = 6) -> str:
-    key = _totp_secret_bytes(secret)
-    counter = int((int(at_time or time.time())) // int(interval or 30))
-    msg = counter.to_bytes(8, "big")
-    digest = hmac.new(key, msg, hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    code_int = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
-    return str(code_int % (10 ** int(digits or 6))).zfill(int(digits or 6))
-
-
-def verify_totp_code(secret: str, code: str, *, at_time: int | None = None, window: int = 1) -> bool:
-    candidate = "".join(ch for ch in str(code or "") if ch.isdigit())
-    if len(candidate) != 6:
-        return False
-    now = int(at_time or time.time())
-    for step in range(-int(window or 0), int(window or 0) + 1):
-        expected = totp_code(secret, at_time=now + step * 30)
-        if hmac.compare_digest(expected, candidate):
-            return True
-    return False
-
-
-def totp_uri(secret: str, *, issuer: str, account_name: str) -> str:
-    issuer_name = str(issuer or "AutoMoGuDing")
-    account = str(account_name or "admin")
-    label = f"{issuer_name}:{account}"
-    return (
-        "otpauth://totp/"
-        f"{quote(label)}?secret={quote(secret)}&issuer={quote(issuer_name)}&algorithm=SHA1&digits=6&period=30"
-    )
 
 def issue_token(
     subject: str,
@@ -345,9 +298,8 @@ def permissions_for_role(role: str) -> set[str]:
 
 def permissions_for_payload(payload: dict | None) -> set[str]:
     permissions = permissions_for_role(str((payload or {}).get("role") or ""))
-    if tenant_id_from_payload(payload) != DEFAULT_TENANT_ID:
-        permissions.discard("tenants:read")
-        permissions.discard("tenants:manage")
+    permissions.discard("tenants:read")
+    permissions.discard("tenants:manage")
     return permissions
 
 

@@ -16,20 +16,20 @@
 
 ### 管理端
 
-- `/login`：后台登录页，默认租户为 `default`，也可手动切换租户 ID
-- `/`：管理端首页
-- 用户编辑页：维护账号、打卡、补卡、报告、AI、通知等配置
+- `/login`：后台登录页
+- `/`：已登录管理员的管理端首页；未登录直接访问根地址会进入用户端登录页
+- 用户编辑页：维护账号、打卡、补卡、报告和单用户推送等配置
 - 用户列表页：批量执行任务、查看用户状态和执行结果
-- 租户管理页：创建、查看和停用租户，仅默认租户管理员可见
 - 审计日志页：查看和清空管理端、用户端关键操作记录
-- 系统设置页：配置全局 QQ 邮箱 SMTP 和工学云补卡代理
+- 系统设置页：配置全局 AI、QQ 邮箱 SMTP 发件账号和工学云补卡代理
 
 ### 用户端
 
-- `/u/login`：用户登录页，默认租户为 `default`，也可手动切换租户 ID
-- `/u/register`：用户注册页，默认租户为 `default`，也可手动切换租户 ID
+- `/`：未登录默认入口，会跳转到 `/u/login`
+- `/u/login`：用户登录页
+- `/u/register`：用户注册页
 - `/u`：用户工作台
-- `/u/settings`：用户设置页
+- `/u/settings`：用户设置页，可维护个人打卡、报告和推送配置
 
 用户端使用独立认证状态，不与管理端登录态混用。
 
@@ -39,6 +39,8 @@
 cd web
 npm install
 npm run dev
+npm run lint
+npm test
 npm run build
 npm run preview
 ```
@@ -46,8 +48,9 @@ npm run preview
 说明：
 
 - `npm run dev` 默认监听 `0.0.0.0:5173`，并开启 strict port。
-- Vite 会把 `/api` 代理到 `http://127.0.0.1:8147`。
-- 当前没有前端测试脚本，也没有 `npm run lint`。
+- Vite 会把 `/api` 代理到 `http://127.0.0.1:8147`；如需指向其他后端地址，可在启动前设置 `VITE_API_PROXY_TARGET`。
+- `npm run preview` 也会复用同一份 `/api` 代理配置，便于预览构建产物时继续联调后端。
+- `npm run lint` 和 `npm test` 已可用，前者走静态质量门禁，后者当前委托到 `npm run test:static`。
 - 管理端用户编辑页默认内嵌 `https://www.mapchaxun.cn/jingweidu` 作为经纬度核对页；本地构建前可通过 `VITE_MAP_DISPLAY_URL` 覆盖。地址搜索走后端 `/geocode/search`，仍会自动回填经纬度、省市区和地址。
 
 ## 目录结构

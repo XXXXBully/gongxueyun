@@ -9,9 +9,6 @@
           </div>
         </template>
         <el-form :model="form" @keyup.enter="submit">
-          <el-form-item label="租户">
-            <el-input v-model="form.tenant_id" autocomplete="organization" />
-          </el-form-item>
           <el-form-item label="手机号/账号">
             <el-input v-model="form.phone" autocomplete="username" />
           </el-form-item>
@@ -46,7 +43,6 @@ const route = useRoute()
 const auth = useUserAuthStore()
 const loading = ref(false)
 const form = reactive({
-  tenant_id: 'default',
   phone: '',
   password: '',
   confirmPassword: '',
@@ -75,10 +71,9 @@ const submit = async () => {
     const res = await userHttp.post('/app/auth/register', {
       phone: form.phone,
       password: form.password,
-      tenant_id: form.tenant_id,
     })
     if (!res.data?.phone) throw new Error('register response missing phone')
-    auth.setAuth(res.data?.token || 'cookie', res.data?.phone, res.data?.user_id, res.data?.tenant_id || form.tenant_id)
+    auth.setAuth(res.data?.token || 'cookie', res.data?.phone, res.data?.user_id)
     router.replace(resolveUserRedirect())
   } catch (e) {
     notifyError(resolveErrorMessage(e, '注册失败'))

@@ -4,8 +4,33 @@
 
 ## Unreleased
 
-- 文档：补充 Demo 截图、部署说明、Release 流程、Roadmap 和贡献入口。
-- 文档：新增后端说明、前端说明和当前功能速查。
+- AI 设置从用户编辑页迁移到全局系统设置，新增 `/settings/ai` 与 `/settings/ai/test`；用户创建、编辑、用户端设置和任务运行不再使用旧用户级 AI 字段，读取全局配置时不回显 API Key。
+- 用户端设置页新增个人推送配置，绑定用户可自助维护 Server酱 和 QQ 邮箱 SMTP 收件设置；管理员仍可在用户编辑页代为维护，SMTP 发件账号继续走全局配置。
+- 调整根地址路由：未登录访问 `/` 默认进入用户端登录页，管理员仍通过 `/login` 进入后台，已登录管理员访问 `/` 保持进入用户列表。
+- 移除前端租户产品面：登录 / 注册页不再展示租户输入，后台导航和路由删除租户管理页，前端会话状态不再保存租户信息。
+
+## 2026-05-30
+
+### 新增
+
+- 文档：补齐前端 `npm run lint`、`npm test` 和 `npm run test:static` 的说明，避免 README 与仓库脚本脱节。
+- 文档：补齐 `python scripts/verify_supply_chain_policy.py` 的使用说明，用于检查 GitHub Actions 钉死和 Docker 基础镜像 digest 钉死。
+- 文档：重写贡献指南、运行手册和路线图，统一成可读的简体中文版本。
+
+### 变更
+
+- 后端依赖升级到当前审计通过版本，修复 `pip-audit` 报出的 `python-dotenv`、`requests`、`pillow` 和 `starlette` 告警。
+- CI：显式钉死 `httpx==0.28.1`，避免 `fastapi.testclient` 在干净 GitHub Actions 环境里缺测试依赖。
+- CI：把 `actions/checkout`、`actions/setup-python` 和 `actions/setup-node` 升到 Node 24 兼容的固定 commit，消掉 runner 侧的 Node 20 退役告警。
+- 删除管理端 MFA 产品面和 `/api/auth/mfa/*` 接口；新增迁移会清理历史 MFA 数据库列，临时残留列也不再参与登录校验。
+- README、后端说明、前端说明和功能速查已同步到当前验证命令与供应链门禁。
+
+### 验证
+
+- `python -m unittest discover -s tests -p test_platform_foundations.py`
+- `python -m unittest discover -s tests`
+- `python scripts/verify_supply_chain_policy.py`
+- `git diff --check`
 
 ## 2026-05-23
 

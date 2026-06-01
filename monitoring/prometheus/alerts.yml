@@ -2,13 +2,13 @@ groups:
   - name: automoguding
     rules:
       - alert: AutoMoGuDingHighLoginFailureRate
-        expr: sum(automoguding_auth_failures_recent_total{action=~"auth\\.login\\.failed|app\\.login\\.failed|auth\\.mfa\\.failed"}) > 20
+        expr: sum(automoguding_auth_failures_recent_total{action=~"auth\\.login\\.failed|app\\.login\\.failed"}) > 20
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "AutoMoGuDing authentication failures are elevated"
-          description: "More than 20 authentication or MFA failures were recorded in the recent metric window."
+          description: "More than 20 authentication failures were recorded in the recent metric window."
 
       - alert: AutoMoGuDingBatchQueueBacklog
         expr: sum(automoguding_batch_jobs_total{status=~"queued|running|paused"}) > 20 or sum(automoguding_batch_items_total{status=~"queued|running"}) > 200
