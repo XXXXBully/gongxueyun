@@ -24,11 +24,11 @@ def process_image(image_path: str) -> bytes:
     """
     # 打开原始图片
     with Image.open(image_path) as img:
-        # 如果图片格式不是JPEG，则转换为RGB模式
+        # 如果图片格式不是 JPEG，则转换为 RGB 模式
         if (img.format is None) or (str(img.format).upper() != "JPEG"):
             img = img.convert("RGB")
 
-        # 定义文件大小上限（1MB）
+        # 定义文件大小上限（1 MB）
         max_size = 1 * 1024 * 1024
 
         # 初始化质量参数
@@ -37,7 +37,7 @@ def process_image(image_path: str) -> bytes:
         max_quality = 95
 
         # 使用二分查找方法优化质量压缩
-        # 预先定义BytesIO对象，避免循环中重复创建（虽然差异不大，但更清晰）
+        # 预先定义 BytesIO 对象，避免循环中重复创建（虽然差异不大，但更清晰）
         img_byte_arr = io.BytesIO()
 
         while max_quality - min_quality > 5:
@@ -85,7 +85,7 @@ def upload_img(token: str, snowFlakeId: str, userId: str, count: int) -> str:
         return ""
 
     # 获取图片文件夹路径
-    # 使用abspath确保路径正确
+    # 使用绝对路径确保路径正确
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     images_dir = os.path.join(base_dir, "images")
 

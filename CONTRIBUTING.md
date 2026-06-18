@@ -1,113 +1,74 @@
 # 贡献指南
 
-感谢你愿意改进 AutoMoGuDing SaaS。提交 Issue 或 PR 前，请先阅读本文件，确保变更可复现、可验证。
+感谢你愿意改进 AutoMoGuDing SaaS。提交 Issue 或 PR 前，请先确认问题可复现、变更可验证、文档可同步。
 
 ## 提交 Issue
 
 ### Bug 反馈
 
-请尽量提供：
-
-- 部署方式：Docker Compose 或本地开发
-- 操作系统、Python、Node.js、MySQL 版本
-- 后端版本或 Git commit
-- 复现步骤
-- 实际结果与预期结果
-- 后端日志、浏览器控制台报错或接口响应
-- 是否涉及特定账号配置、打卡类型或报告类型
+| 信息 | 说明 |
+|------|------|
+| 部署方式 | Docker Compose 或本地开发 |
+| 环境版本 | 操作系统、Python、Node.js、MySQL |
+| 后端版本 | Git commit 或发布版本 |
+| 复现步骤 | 从入口到报错的完整操作路径 |
+| 实际结果 | 页面报错、接口响应、后端日志 |
+| 预期结果 | 你认为应该发生什么 |
+| 影响范围 | 管理端 / 用户端、单账号 / 多账号、打卡 / 补卡 / 报告 |
+| 相关配置 | 脱敏后的关键环境变量、用户配置或代理 / AI 设置 |
 
 ### 功能建议
 
-请说明：
-
-- 想解决什么问题
-- 当前流程哪里不顺
-- 期望的用户操作路径
-- 是否愿意提交 PR
+| 问题 | 请说明 |
+|------|--------|
+| 要解决什么 | 当前流程的痛点或缺口 |
+| 影响谁 | 管理员、用户、运维还是二次开发者 |
+| 期望路径 | 用户应该如何进入、操作和退出 |
+| 边界 | 不希望功能做什么 |
+| PR 意愿 | 是否愿意提交实现 |
 
 ## 本地开发
 
-后端：
-
-```bash
-pip install -r server/requirements.txt
-python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147
-```
-
-前端：
-
-```bash
-cd web
-npm install
-npm run dev
-```
-
-## 提交 PR 前的验证
-
-后端测试：
-
-```bash
-python -m unittest discover -s tests
-```
-
-后端编译检查：
-
-```bash
-python -m compileall server
-```
-
-后端质量和供应链检查：
-
-```bash
-python scripts/quality_gate.py
-python scripts/verify_supply_chain_policy.py
-```
-
-前端验证：
-
-```bash
-cd web
-npm run lint
-npm test
-npm run build
-```
-
-空白字符检查：
-
-```bash
-git diff --check
-```
+| 目标 | 命令 |
+|------|------|
+| 安装后端依赖 | `pip install -r server/requirements.txt` |
+| 升级数据库 | `python -m alembic upgrade head` |
+| 启动后端 | `python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147` |
+| 安装前端依赖 | `cd web && npm install` |
+| 启动前端 | `cd web && npm run dev` |
 
 ## 代码风格
 
-- 后端优先沿用现有 FastAPI、SQLModel 和工具函数风格
-- 前端优先沿用现有 Vue 3、Element Plus 和消息提示封装
-- 不要在同一个 PR 里混入无关重构
-- 涉及行为变更时，优先补充或更新后端单元测试
-- 文档使用简体中文，命令、路径、接口和代码标识保持原文
+| 范围 | 要求 |
+|------|------|
+| 后端 | 优先沿用现有 FastAPI、SQLModel 和工具函数风格 |
+| 前端 | 优先沿用 Vue 3、Element Plus、Pinia 和现有消息提示封装 |
+| 数据库 | schema 变更必须补 Alembic 迁移，不依赖生产运行时自动补列 |
+| 权限 | 后端权限点是边界，前端隐藏菜单不是安全控制 |
+| 安全 | 不回显敏感信息，不绕开 Cookie / CSRF / CORS / Host 校验 |
+| PR 范围 | 不在同一个 PR 混入无关重构 |
+| 测试 | 行为变更优先补充或更新对应测试 |
+| 文档 | 使用简体中文；命令、路径、接口和代码标识保持原文 |
 
-## 补卡相关改动注意事项
+## 补卡相关改动
 
-补卡一次只补一种类型：
-
-- `START`：上班
-- `END`：下班
-
-修改补卡逻辑时，必须确认不会在用户只选择一种类型时自动补另一种类型。相关测试主要包括：
-
-- `tests/test_clockin_backfill.py`
-- `tests/test_main_logic_api.py`
-- `tests/test_task_runner_clockin.py`
-- `tests/test_api_clockin_makeup.py`
+| 规则 | 要求 |
+|------|------|
+| 类型边界 | `START` 只补上班，`END` 只补下班 |
+| 自动补卡 | 普通定时打卡不能自动触发补卡 |
+| 多日期 | 一次请求可以补多个日期，但仍只补一种类型 |
+| 频繁请求 | 必须重试当前日期，不能直接跳过继续打下一天 |
+| 代理 | 代理只用于手动补卡，不影响登录、缺卡查询、定时打卡和报告提交 |
 
 ## 文档维护
 
-功能变更时，请同步更新：
+| 变更类型 | 同步文档 |
+|----------|----------|
+| 用户可见功能 | `README.md`、`docs/current-features.md` |
+| 后端启动 / 配置 / API | `server/README.md`、`docs/current-features.md` |
+| 前端入口 / 页面 / 联调 | `web/README.md`、截图 |
+| 运维 / CI / 安全策略 | `docs/ops/runbook.md`、`README.md` |
+| 发布记录 | `CHANGELOG.md` |
+| 后续计划 | `ROADMAP.md` |
 
-- `README.md`
-- `docs/current-features.md`
-- `server/README.md`
-- `web/README.md`
-- `CHANGELOG.md`
-
-如果涉及界面变更，请同步更新 `img/` 下的截图，并检查 README 中的 Demo 区域是否仍然准确。
+涉及界面变更时，请同步更新 `img/` 下的截图，并检查 README 中的 Demo 区域是否仍然准确。

@@ -644,7 +644,7 @@ def _submit_report_common(
 ) -> Dict[str, Any]:
     """通用日报/周报/月报提交逻辑"""
 
-    # 映射 report_type 到 config key
+    # 将 report_type 映射到配置键
     config_key_map = {"day": "daily", "week": "weekly", "month": "monthly"}
     config_key = config_key_map.get(report_type)
 
@@ -979,7 +979,7 @@ def run_task_by_config(
         results = []
         for t_type, t_func in all_tasks:
             # 如果指定了任务类型，则只执行匹配的任务
-            # report 匹配所有报告
+            # report 表示所有报告任务
             if specific_task_type:
                 if specific_task_type == "report":
                     if "report" not in t_type:

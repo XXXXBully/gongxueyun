@@ -556,7 +556,7 @@ class ApiClient:
                         _mark_ip_restricted(msg)
                     raise ValueError(msg)
 
-                # Token失效处理
+                # Token 失效处理
                 if self._is_token_expired_response(code, msg):
                     if attempt < self.max_retries - 1:
                         wait_time = 1 * (2 ** attempt)
@@ -564,7 +564,7 @@ class ApiClient:
                         time.sleep(wait_time)
                         
                         self.login()
-                        # 更新headers中的authorization
+                        # 更新请求头中的 authorization
                         headers["authorization"] = self.config.get_value("userInfo.token")
                         continue
                     else:
@@ -726,8 +726,8 @@ class ApiClient:
             "t": aes_encrypt(str(int(time.time() * 1000))),
         }
         headers = self._get_authenticated_headers()
-        # 这里重试已经在 _post_request 中处理了，但保留这里的特殊处理（如果需要的话）
-        # 原代码 retry_count=3 是针对 _post_request 的递归，现在 _post_request 内部处理重试
+        # 重试已经在 _post_request 中处理，这里只保留必要的特殊处理
+        # 原来的 retry_count=3 针对 _post_request 递归，现在由 _post_request 内部统一重试
         rsp = self._post_request(url, headers, data)
         data = rsp.get("data", {})
         return {} if data is None else data
@@ -782,7 +782,7 @@ class ApiClient:
             report_info.get("title"),
         ])
         
-        # 使用 dict.fromkeys 初始化所有字段为 None
+        # 使用 dict.fromkeys 将所有字段初始化为 None
         keys = [
             "address", "applyId", "applyName", "attachmentList", "commentNum",
             "commentContent", "content", "createBy", "createTime", "depName",
@@ -844,7 +844,7 @@ class ApiClient:
             
         logger.info("检测到问卷，已自动填写")
         for item in formFieldDtoList:
-            item["value"] = "b" # 默认选择B
+            item["value"] = "b" # 默认选择 B
             
         return formFieldDtoList
 
@@ -937,7 +937,7 @@ class ApiClient:
 
         logger.info(f'打卡类型：{checkin_info.get("type")}')
         
-        # 初始化所有可能的字段为None
+        # 将所有可能的字段初始化为 None
         keys = [
             "distance", "content", "lastAddress", "lastDetailAddress", "attendanceId", 
             "country", "createBy", "createTime", "description", "device", "images", 

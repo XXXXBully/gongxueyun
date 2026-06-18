@@ -7,7 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine
 class SchedulerHardeningTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
-        import server.models  # noqa: F401
+        import server.models  # noqa: F401 - 加载 SQLModel 元数据
 
         SQLModel.metadata.create_all(self.engine)
 

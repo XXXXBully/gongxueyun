@@ -113,7 +113,7 @@ class ConfigManager:
                     value = value[sub_key]
             return value
         except (KeyError, TypeError):
-            # TypeError 处理 value 为 None 还要继续取值得情况
+            # 处理 value 为 None 时仍继续取值导致的 TypeError
             logger.warning(f"配置键不存在: {'->'.join(keys)}")
             return None
 

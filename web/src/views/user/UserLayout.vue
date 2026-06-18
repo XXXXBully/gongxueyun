@@ -31,7 +31,7 @@ const logout = async () => {
   try {
     await userHttp.post('/app/auth/logout')
   } catch {
-    // Cookie may already be expired; local state still needs to be cleared.
+    // Cookie 可能已经过期，本地状态仍然需要清理。
   }
   auth.logout()
   router.replace('/u/login')

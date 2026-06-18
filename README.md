@@ -1,725 +1,189 @@
-﻿# AutoMoGuDing SaaS（工学云打卡管理平台）
+# AutoMoGuDing SaaS（工学云自动化打卡平台）
 
-AutoMoGuDing SaaS 是一个面向多用户托管的工学云自动化平台，提供管理端与用户端两套 Web 界面，支持自动打卡、缺卡记录筛选、按类型补卡、日报 / 周报 / 月报提交、批量执行，以及 AI 生成报告内容。
+AutoMoGuDing SaaS 是一个自托管的工学云自动化平台，提供管理端和用户端两套 Web 界面，覆盖自动打卡、缺卡筛选、手动补卡、日报 / 周报 / 月报提交、批量执行、AI 报告生成和运行观测。
+适合个人、班级和小团队统一托管工学云打卡与报告任务。
 
-Self-hosted internship attendance automation platform for MoGuDing / 工学云，适合个人、班级、小团队集中托管打卡和报告任务。
+## 项目速览
 
-**English keywords:** MoGuDing automation, internship attendance, self-hosted SaaS, FastAPI, Vue 3, Docker Compose, report automation, attendance replacement.
+| 维度 | 当前状态 |
+|------|----------|
+| 产品形态 | 自托管 Web 平台 |
+| 后端 | FastAPI + SQLModel + MySQL + Alembic + APScheduler |
+| 前端 | Vue 3 + Vite + Pinia + Vue Router + Element Plus |
+| 入口 | 管理端 `/login`；用户端 `/u/login`、`/u/register`、`/u`、`/u/settings` |
+| 数据库 | 仅支持 MySQL，连接串必须使用 `mysql+pymysql://` |
+| 调度模型 | `app` 提供 Web / API，`worker` 运行定时任务和批量队列 |
+| 安全基线 | HttpOnly Cookie、CSRF、CSP、HSTS、权限点、限流、审计、敏感字段加密 |
 
-### 界面截图
+## 界面截图
 
-| 用户列表与批量任务 | 打卡设置 |
-|------------------|----------|
+### 管理端
+
+| 用户列表与首页 | 打卡设置 |
+|---|---|
 | ![首页 - 用户列表](./img/首页-用户列表.png) | ![打卡设置页](./img/打卡设置页.png) |
 
 | 补卡详情 | 日报 / 周报 / 月报补交 |
-|----------|------------------------|
+|---|---|
 | ![补卡详细](./img/补卡详细.png) | ![补日 - 周 - 月报详细](./img/补日-周-月报详细.png) |
 
 | 报告设置 | 推送设置 | 全局邮箱通知 |
-|----------|----------|--------------|
+|---|---|---|
 | ![报告设置](./img/报告设置.png) | ![推送设置](./img/推送设置.png) | ![全局邮箱通知](./img/全局邮箱通知.png) |
 
-## 适合谁使用
+### 用户端
 
-- 需要集中管理多个工学云账号的个人或小团队。
-- 需要定时打卡、手动补卡、补交日报 / 周报 / 月报的实习用户。
-- 需要通过自托管方式掌控账号、密码、通知和执行记录的管理员。
-- 想要用 Docker 快速部署一个工学云自动化后台的运维人员。
+| 用户工作台 | 打卡配置 |
+|---|---|
+| ![用户端-首页](./img/用户端-首页.png) | ![用户端-打卡配置](./img/用户端-打卡配置.png) |
 
-## 项目亮点
+| 报告配置 | 推送配置 |
+|---|---|
+| ![用户端-报告配置](./img/用户端=报告配置.png) | ![用户端-推送配置](./img/用户端-推送配置.png) |
 
-- **从用户视角出发：** 用户只需要绑定账号、配置地址、时间和个人推送渠道，就可以在工作台查看执行结果、生成报告、处理缺卡。
-- **从管理员视角出发：** 管理员可以批量维护用户、集中查看执行状态、统一配置通知基础能力，并为用户处理补卡、补交报告和单用户推送配置。
-- **从部署视角出发：** 项目提供 Docker Compose、`.env.example`、GHCR 镜像发布流程和清晰的本地开发命令。
-- **从维护视角出发：** 后端有明确的任务执行链路、运行时回写逻辑和补卡单元测试。
+## 适用场景
 
-## 功能概览
+| 使用者 | 适合做什么 | 不适合做什么 |
+|--------|------------|--------------|
+| 个人用户 | 托管自己的工学云打卡、报告和补卡 | 当作公开在线 Demo 给陌生人共用 |
+| 班级 / 小团队 | 集中管理多个账号、统一查看执行结果 | 无限制堆用户，不做队列和数据库容量规划 |
+| 管理员 | 批量执行、处理缺卡、配置 AI / SMTP / 代理 | 让用户端登录态和管理端登录态混用 |
+| 运维人员 | Docker Compose 部署、备份恢复 | 生产环境依赖运行时自动改表 |
+| 二次开发者 | 扩展接口、报告模板、推送渠道和前端页面 | 绕开现有权限、审计和测试 |
 
-- **管理端：** 管理用户、查看审计日志、配置通知、批量执行任务、配置和测试 AI 与地理编码能力，支持为指定用户刷新缺卡记录、手动补卡和补交报告。
-- **系统设置：** 管理员可在 Web 中统一配置 AI URL / API Key / Model、QQ 邮箱 SMTP 发件账号和工学云补卡代理；工学云补卡代理支持动态取 IP 接口和静态代理池。
-- **用户端：** 通过 `/u` 入口注册 / 登录、绑定工学云账号、修改个人打卡、报告和推送配置、手动执行任务，支持自助查看待补卡日期、手动补卡和补交日报 / 周报 / 月报。管理端创建的用户默认可直接用工学云账号密码进入用户端；若单独配置了用户端登录密码，则以独立用户端密码为准。
-- **自动调度：** 基于 APScheduler 为每个用户注册上下班打卡和报告任务。
-- **补卡能力：** 自动拉取已打卡记录，过滤已完成日期；补卡时先选择上班或下班类型，再选择待补日期，可补选中日期，也可一键补当前类型下全部待补日期，批量补卡在遇到频繁请求时会自动延迟重试并进入冷却降速。
-- **报告补交：** 日报、周报、月报分别支持按周期补交，并提供当前类型下一键补全部待补周期的入口。
-- **批量执行：** 通过队列 worker 并发处理批量任务，支持暂停、取消与失败重试。
-- **运行时同步：** 将工学云登录态、计划信息、执行结果等运行时数据回写到数据库 JSON 字段。
+## 能力矩阵
 
-## 更新日志
+| 模块 | 管理端 | 用户端 | 关键后端模块 |
+|------|--------|--------|--------------|
+| 登录认证 | 管理员登录、角色权限、权限点校验 | 注册 / 登录、绑定工学云账号 | `server/auth.py`、`server/api.py` |
+| 用户管理 | 新增、编辑、软删除、重置状态 | 读取和保存自身配置 | `server/models.py`、`server/user_runtime.py` |
+| 自动打卡 | 为用户配置打卡时间、地点、周期 | 自助维护个人打卡配置 | `server/scheduler.py`、`server/task_runner.py` |
+| 缺卡筛选 | 查询指定用户缺卡日期 | 查询当前用户缺卡日期 | `server/clockin_backfill.py` |
+| 手动补卡 | 为指定用户补选中或补全部 | 自助补选中或补全部 | `server/task_runner.py`、`server/coreApi/MainLogicApi.py` |
+| 报告补交 | 日报 / 周报 / 月报生成与补交 | 日报 / 周报 / 月报生成与补交 | `server/task_runner.py`、`server/coreApi/AiServiceClient.py` |
+| 批量任务 | 创建、暂停、恢复、取消、失败重试 | 不开放批量管理 | `server/queue_worker.py` |
+| AI 设置 | 全局 API URL / API Key / Model 和测试 | 使用全局 AI 配置生成报告 | `server/settings` 相关 API、AI 客户端 |
+| 推送设置 | 全局 SMTP；代维护单用户推送 | 自助维护个人推送配置 | `server/util/notifier.py` |
+| 地理编码 | 地址搜索、经纬度回填、地图核对页 | 地址搜索、经纬度回填 | `/geocode/search`、`/geocode/reverse` |
+| 观测审计 | 审计日志、任务事件、`/metrics` | 查看自身执行记录 | `server/observability.py` |
+| 备份恢复 | 通过 CLI 导入 / 导出数据库 JSON | 不开放 | `server/backup_cli.py` |
 
-### 当前版本（2026-05-30）
+## 入口速查
 
-- **依赖安全修复完成：** 后端依赖已按 `pip-audit` 报告升级到修复版本，覆盖 `python-dotenv`、`requests`、`pillow` 和 `starlette` 相关告警；配套补充回归测试，避免后续回退。
-- **供应链门禁补齐：** CI 继续执行 `pip-audit`、`npm audit` 和 Trivy 扫描，并通过 `scripts/verify_supply_chain_policy.py` 检查 GitHub Actions 与 Docker 基础镜像钉死策略。
-- **前端质量门禁同步：** `web/package.json` 已提供 `npm run lint`、`npm test` 和 `npm run test:static`，文档中的开发与 PR 验证命令已同步到当前脚本。
-- **缺卡与补卡能力完成：** 新增打卡记录归一化与缺卡日期筛选；管理端和用户端均支持刷新缺卡、选择补卡类型、选择多个待补日期补卡，以及一键补当前类型下全部待补日期；批量补卡遇到频繁请求时会自动延迟重试并进入冷却降速。
-- **报告补交能力完成：** 日报、周报、月报分别支持按周期筛选未提交记录，并可对当前类型一键补全部待补周期。
-- **定时任务边界修正：** 普通定时打卡只执行正常打卡，不会自动触发补卡；补卡只通过管理端或用户端手动接口触发。
-- **补卡接口对齐：** 学生补卡请求使用 `attendence/attendanceReplace/v4/save`，请求体包含 `attendanceType=REPLACE`，并按补卡类型只提交一条上班或下班记录，不再自动同时补上下班。
-- **测试补齐：** 新增打卡记录筛选、补卡请求构造、按类型补卡和批量补卡请求解析的单元测试；后端可通过 `python -m unittest discover -s tests` 执行当前测试集合。
-- **管理端能力完成：** 支持后台登录、角色权限、用户管理、用户执行日志、审计日志查询与清空、通知配置、SMTP 测试、AI 测试、地理编码搜索与逆地理解析。
-- **用户端能力完成：** 恢复 `/u/login`、`/u/register`、`/u`、`/u/settings` 四个入口，用户端拥有独立认证状态和请求入口，不再与后台管理端登录态混用。
-- **用户自助流程完成：** 支持用户注册 / 登录、绑定工学云账号、读取自身配置、自动获取打卡地址、保存打卡与报告配置、手动执行任务、查看执行记录、生成日报和提交日报。
-- **自动化任务完成：** 基于 APScheduler 为单个用户注册上班打卡、下班打卡、日报、周报和月报任务，并在配置变更后重建对应 job。
-- **批量任务完成：** 管理端可发起批量运行，后端队列 worker 支持并发执行、失败重试、暂停、恢复、取消和进度查询。
-- **运行时回写完成：** 抽取统一的执行结果回写逻辑，将执行状态、日志、最近运行时间、远端登录态和实习计划信息同步回用户数据。
-- **安全与配置完成：** 支持 MySQL 数据库、JWT 登录态、角色校验、基础限流、敏感字段加密存储，并通过 `.env` 管理生产配置。
-- **前端一致性完成：** 统一前端消息提示入口，修正 `createWebHistory()` 模式下的 `401` 未登录跳转，并清理 Vue 模板残留文件。
-- **部署与工程维护完成：** 支持本地前后端分离开发、Docker Compose 一体化部署、FastAPI 托管 `web/dist` 静态资源，并补齐 `.gitignore` 以忽略环境变量、运行数据、模型文件、依赖目录和本地工具缓存。
-- **镜像发布流程完成：** 新增 GitHub Actions 工作流 `.github/workflows/docker-publish.yml`，支持推送 `main` / `master`、发布 `v*` 标签或手动触发时自动构建 Docker 镜像，并发布到 GitHub Container Registry (GHCR)；配置 Docker Hub 密钥后可同步推送到 Docker Hub。
+| 场景 | 地址 / 命令 | 说明 |
+|------|-------------|------|
+| 管理端登录 | `/login` | 后台管理员入口 |
+| 用户端登录 | `/u/login` | 用户独立登录态，不复用管理端登录态 |
+| 用户端注册 | `/u/register` | 受 `APP_REGISTRATION_ENABLED` 控制，生产默认关闭 |
+| 用户工作台 | `/u` | 手动执行、执行记录、日报快捷入口 |
+| 用户设置 | `/u/settings` | 打卡、报告、补卡、推送配置 |
+| API 文档 | `/docs` | 生产默认关闭，需 `EXPOSE_API_DOCS=true` |
+| OpenAPI | `/openapi.json` | 生产默认关闭，契约快照见 `docs/api/openapi-contract.json` |
+| Prometheus 指标 | `/metrics.prom` | 生产需要 `METRICS_AUTH_TOKEN` |
 
-完整版本记录见 [CHANGELOG.md](./CHANGELOG.md)。
+## 核心流程
 
-## 技术栈
+### 打卡与补卡
 
-- **后端：** FastAPI + SQLModel + MySQL
-- **前端：** Vue 3 + Vite + Pinia + Vue Router + Element Plus
-- **任务调度：** APScheduler
-- **部署方式：** 本地前后端分离开发，或 Docker Compose 一体化部署
+| 阶段 | 行为 | 关键规则 |
+|------|------|----------|
+| 自动打卡 | 根据用户配置的上下班时间、周期、地址和图片执行 | 定时任务只做正常打卡，不自动补卡 |
+| 缺卡查询 | 拉取工学云记录并归一化为 `START` / `END` | 同一天只缺一种类型时，只展示该类型 |
+| 选择补卡 | 先选 `上班` 或 `下班`，再选日期 | 一次只补一种类型 |
+| 补选中 | 对 `target_dates` 中的日期逐个补卡 | 支持多日期 |
+| 全部待补 | 重新查询当前类型仍缺的日期后执行 | 不跨类型补卡 |
+| 频繁请求 | 命中 `429`、`rate limit` 或 IP 限制时等待重试 | 当前日期成功后进入冷却降速；持续失败则停止剩余日期 |
+| 代理 | 只在手动补卡执行阶段启用 | 登录、缺卡查询、定时打卡、报告提交不使用补卡代理 |
 
-## 架构说明
+### 报告补交
 
-### 1. 后端启动流程
+| 类型 | 待补周期 | 操作 | 限制 |
+|------|----------|------|------|
+| 日报 | 日期 | 生成、提交、补全部日报 | 未开启日报时接口直接返回空列表 |
+| 周报 | 自然周 | 生成、提交、补全部周报 | 不会混入日报或月报 |
+| 月报 | 月份 | 生成、提交、补全部月报 | 不会混入日报或周报 |
 
-`server/main.py` 是后端入口。应用启动时不只会拉起 API，还会执行以下初始化动作：
-
-- 建表并补齐运行时列
-- 初始化管理员种子账号
-- 按 `CAPTCHA_MODEL_AUTO_DOWNLOAD` 配置检查并下载验证码识别所需的 ONNX 模型
-- 当 `APP_ROLE=worker` 或 `all` 时启动 APScheduler 定时调度器
-- 当 `APP_ROLE=worker` 或 `all` 时启动批量任务 queue worker
-- 在 `web/dist` 存在时直接托管前端静态资源，并处理 SPA fallback
-
-### 2. 双 API 面
-
-`server/api.py` 同时承载两套接口：
-
-- **管理端 API：** 面向 `admin`、`operator`、`viewer` 等角色
-- **用户端 API：** 统一挂在 `/app/*`，面向终端用户
-
-用户端当前已接回以下典型能力：
-
-- `/app/auth/register`
-- `/app/auth/login`
-- `/app/me`：读取和保存当前用户的打卡、报告与个人推送配置
-- `/app/bind`
-- `/app/run`
-- `/app/execution`
-- `/app/clock-in/missing-days`
-- `/app/clock-in/makeup`
-- `/app/clock-in/makeup-all`
-- `/app/reports/daily/generate`
-- `/app/reports/daily/submit`
-
-管理端对应提供以下补卡接口：
-
-- `GET /users/{user_id}/clock-in/missing-days`
-- `POST /users/{user_id}/clock-in/makeup`
-- `POST /users/{user_id}/clock-in/makeup-all`
-
-### 3. 任务执行链路
-
-项目的执行链路集中在以下几个模块：
-
-- `server/user_runtime.py`：负责在数据库模型和任务运行配置之间做桥接
-- `server/scheduler.py`：为单用户注册定时打卡 / 报告任务
-- `server/queue_worker.py`：执行批量任务队列
-- `server/task_runner.py`：真正协调工学云接口、AI 报告生成、图片上传和消息推送
-- `server/clockin_backfill.py`：归一化打卡记录，按日期和 `START` / `END` 类型生成待补卡选项
-
-无论是**定时执行**、**批量执行**还是**用户手动执行**，最终都会汇总到 `server/task_runner.py`。
-
-### 4. 前端结构
-
-前端位于 `web/`，主要由两套入口构成：
-
-- **管理端：** `/login` 进入后台，使用 `web/src/stores/auth.js` 和 `web/src/api/http.js`
-- **用户端：** `/u/login`、`/u/register`、`/u`、`/u/settings`，使用 `web/src/stores/userAuth.js` 和 `web/src/api/userHttp.js`
-
-`web/src/router/index.js` 负责两套认证流和路由守卫的分流。
+报告类“立即执行”不触发普通 `/run` 接口的 429 限流；打卡和默认手动运行仍保留内部限流。
 
 ## 快速开始
 
 ### 环境要求
 
-- Python 3.10+
-- Node.js 20+（建议）
-- MySQL 8+
+| 组件 | 版本建议 | 说明 |
+|------|----------|------|
+| Python | 3.10+ | 后端运行和测试 |
+| Node.js | 20+ | 前端开发和构建 |
+| MySQL | 8+ | 唯一支持的数据库 |
+| Docker Compose | v2+ | 一体化部署 |
 
-## 一键部署
+### 本地开发
 
-适合直接在服务器或本机启动完整应用。当前 `docker-compose.yml` 默认连接外部 MySQL，因此需要先准备一个可访问的 MySQL 数据库。Compose 会启动 `app` 和 `worker` 两个服务：`app` 只提供 Web / API，`worker` 负责定时任务和批量队列，避免 API 横向扩容时重复执行任务。
-
-### Linux / macOS
-
-```bash
-cp .env.example .env
-
-# 修改 .env 中的 DATABASE_URL、APP_SECRET 和管理员密码后启动
-docker compose up -d --build
-```
-
-### Windows PowerShell
-
-```powershell
-Copy-Item .env.example .env
-
-# 修改 .env 中的 DATABASE_URL、APP_SECRET 和管理员密码后启动
-docker compose up -d --build
-```
-
-启动后访问：
-
-- 应用首页：`http://localhost:8147`
-- API 文档：生产环境默认关闭；需要时设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/docs`
-- 后台账号：由 `.env` 中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 决定
-
-注意：在 Docker 容器内，`127.0.0.1` 指向容器自身。如果 MySQL 运行在宿主机上，`DATABASE_URL` 中的主机名通常应改为宿主机 IP 或 Docker Desktop 的 `host.docker.internal`。
-
-### 真正的一条命令部署
-
-如果你已经有可用的 MySQL，可以直接用环境变量启动：
-
-```bash
-DATABASE_URL='mysql+pymysql://user:password@mysql-host:3306/automoguding?charset=utf8mb4' \
-APP_SECRET="$(openssl rand -hex 32)" \
-USER_PASSWORD_KEY="$(openssl rand -hex 32)" \
-ADMIN_USERNAME='admin' \
-ADMIN_PASSWORD='use-a-strong-admin-password' \
-docker compose up -d --build
-```
-
-Windows PowerShell：
-
-```powershell
-$env:DATABASE_URL = 'mysql+pymysql://user:password@mysql-host:3306/automoguding?charset=utf8mb4'
-$env:APP_SECRET = 'replace-with-output-of-openssl-rand-hex-32'
-$env:USER_PASSWORD_KEY = 'replace-with-output-of-openssl-rand-hex-32'
-$env:ADMIN_USERNAME = 'admin'
-$env:ADMIN_PASSWORD = 'use-a-strong-admin-password'
-docker compose up -d --build
-```
-
-生产环境会拒绝示例 `APP_SECRET`、过短密钥和默认管理员密码。
-
-## 本地开发
-
-### 1. 准备 `.env`
-
-后端默认从项目根目录读取 `.env`。当前数据库**只支持 MySQL**，必须配置 `DATABASE_URL`。可以从示例文件复制：
-
-```bash
-cp .env.example .env
-```
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 安装后端依赖 | `pip install -r server/requirements.txt` | 建议使用虚拟环境 |
+| 升级数据库 | `python -m alembic upgrade head` | 生产和联调优先使用迁移 |
+| 启动后端 | `python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147` | API 默认在 `8147` |
+| 安装前端依赖 | `cd web && npm install` | 首次开发执行 |
+| 启动前端 | `cd web && npm run dev` | Vite 默认 `5173`，`/api` 代理到后端 |
+| 修改代理目标 | `VITE_API_PROXY_TARGET=http://127.0.0.1:8147 npm run dev` | 后端不在默认地址时使用 |
 
 Windows PowerShell：
 
 ```powershell
 Copy-Item .env.example .env
-```
-
-最小示例：
-
-```env
-DATABASE_URL=mysql+pymysql://automoguding:automoguding123@127.0.0.1:3306/automoguding?charset=utf8mb4
-APP_ENV=development
-APP_SECRET=dev-only-random-secret-at-least-32-characters
-USER_PASSWORD_KEY=dev-only-secret-encryption-key
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=dev-only-admin-password
-SCHEDULER_TIMEZONE=Asia/Shanghai
-GEOCODE_SEARCH_PROVIDER=mapchaxun
-GEOCODE_PROVIDER=osm
-```
-
-可选配置：
-
-```env
-RATE_LIMIT_BACKEND=memory
-ALLOW_RUNTIME_SCHEMA_MIGRATIONS=true
-APP_REGISTRATION_ENABLED=false
-USER_PASSWORD_MIN_LENGTH=10
-EXPOSE_API_DOCS=false
-AUTH_COOKIE_SECURE=false
-RETURN_AUTH_TOKEN=false
-ALLOW_LEGACY_TOKENS=false
-ROLE_PERMISSIONS_JSON=
-FRONTEND_ORIGINS=
-ALLOW_WILDCARD_CORS=false
-TRUSTED_HOSTS=
-ALLOW_MISSING_TRUSTED_HOSTS=false
-MAX_REQUEST_BODY_BYTES=8388608
-ENABLE_HSTS=false
-DISABLE_CSP=false
-CONTENT_SECURITY_POLICY=
-ALLOW_AUDIT_LOG_PURGE=false
-TASK_LOCK_TTL_SECONDS=1800
-AI_ALLOWED_HOSTS=
-AI_ALLOWED_MODELS=
-ALLOW_PRIVATE_AI_ENDPOINTS=false
-AI_REQUEST_MAX_TIMEOUT_SECONDS=60
-AI_REQUEST_MAX_RETRIES=2
-AI_MAX_OUTPUT_TOKENS=1200
-AI_SUBMITTED_REPORT_HISTORY_LIMIT=8
-AI_SUBMITTED_REPORT_HISTORY_CHARS=4000
-AI_PROMPT_VERSION=2026-05-29.1
-AI_TENANT_DAILY_LIMIT=1000
-AI_USER_DAILY_LIMIT=50
-AI_RATE_LIMIT_WINDOW_SECONDS=86400
-METRICS_AUTH_TOKEN=
-METRICS_CACHE_TTL_SECONDS=5
-HTTP_METRIC_RETENTION_DAYS=14
-HTTP_METRIC_PURGE_INTERVAL_SECONDS=3600
-HTTP_METRIC_SAMPLE_RATE=1
-HTTP_METRIC_EXCLUDE_PATH_PREFIXES=
-RECENT_METRIC_WINDOW_SECONDS=300
-CAPTCHA_MODEL_AUTO_DOWNLOAD=false
-CAPTCHA_MODEL_REQUIRE_CHECKSUM=true
-CAPTCHA_MODEL_SHA256_OCR_ONNX=
-CAPTCHA_MODEL_SHA256_YOLOV5N_ONNX=
-TRUST_PROXY_HEADERS=false
-TRUSTED_PROXY_IPS=
-DATABASE_POOL_SIZE=10
-DATABASE_MAX_OVERFLOW=20
-DATABASE_POOL_RECYCLE_SECONDS=1800
-DATABASE_POOL_TIMEOUT_SECONDS=30
-SCHEDULER_LOAD_PAGE_SIZE=500
-SCHEDULER_JITTER_SECONDS=600
-SCHEDULER_REPORT_JITTER_SECONDS=0
-CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS=2
-CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES=3
-CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS=10
-CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS=60
-MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS=600
-BATCH_RUNNING_ITEM_TIMEOUT_SECONDS=1800
-BATCH_JOB_MAX_USERS=200
-BATCH_TENANT_MAX_ACTIVE_JOBS=5
-IDEMPOTENCY_TTL_SECONDS=604800
-MOGUDING_PROXY_API_URL=
-MOGUDING_PROXY_ALLOWED_HOSTS=
-ALLOW_PRIVATE_MOGUDING_PROXY_ENDPOINTS=false
-MOGUDING_PROXY_TTL_SECONDS=55
-MOGUDING_PROXY_API_TIMEOUT_SECONDS=10
-MOGUDING_PROXY_URLS=
-REPORT_MAKEUP_BATCH_DELAY_SECONDS=2
-BAIDU_MAP_AK=your-baidu-map-ak
-BAIDU_MAP_COORD_TYPE=gcj02ll
-BAIDU_MAP_INPUT_COORD_TYPE=
-BAIDU_MAP_OUTPUT_COORD_TYPE=
-AMAP_KEY=your-amap-key
-```
-
-说明：
-
-- `DATABASE_URL` 必填，且必须以 `mysql+pymysql://` 开头。
-- 生产环境必须显式配置安全的 `APP_SECRET` 和管理员密码；示例值、默认值和过短值会导致启动失败。
-- 生产环境必须配置 `USER_PASSWORD_KEY` 或 `FERNET_KEY`，否则后端会拒绝保存新的工学云密码、SMTP 授权码和代理接口密钥；本地开发未配置时仍兼容历史明文数据。
-- `APP_ROLE` 控制进程角色：`api` 只提供 Web / API，`worker` 启动定时任务和批量队列，未配置时为本地开发兼容模式 `all`。
-- `RATE_LIMIT_BACKEND` 支持 `memory` 和 `database`；生产 Compose 默认使用 `database`，避免多 API 副本各自限流。数据库后端按 bucket 聚合计数，不再为每次请求插入一行限流事件。
-- `ALLOW_RUNTIME_SCHEMA_MIGRATIONS` 控制启动时是否允许应用进程自动建表、补列和建索引。生产环境默认关闭，发布前必须执行 `python -m alembic upgrade head`；运行时迁移关闭时，后端启动会校验数据库 `alembic_version` 是否处于 head，不一致会直接拒绝启动。本地开发可设为 `true` 保留自动初始化体验。
-- 登录态默认写入 HttpOnly Cookie，前端不再把 token 存到 `localStorage`。生产环境默认启用 Secure Cookie，并通过非 HttpOnly 的 `csrf_token` Cookie + `X-CSRF-Token` 请求头做双提交 CSRF 校验；浏览器直连 HTTP 开发时才设置 `AUTH_COOKIE_SECURE=false`。跨域部署前端时必须配置 `FRONTEND_ORIGINS` 或 `CORS_ORIGINS`。生产环境默认拒绝 `*` 通配 CORS，除非显式设置 `ALLOW_WILDCARD_CORS=true`。只有兼容外部脚本客户端时才打开 `RETURN_AUTH_TOKEN=true`。`ALLOW_LEGACY_TOKENS=true` 只用于短迁移窗口兼容旧版无版本 token，生产默认拒绝。
-- 生产环境必须配置 `TRUSTED_HOSTS`，或通过 `FRONTEND_ORIGINS` / `CORS_ORIGINS` 自动推导 Host 白名单；如果三者都为空，后端会拒绝启动。只有明确接受 Host 校验缺失风险时才设置 `ALLOW_MISSING_TRUSTED_HOSTS=true`。`MAX_REQUEST_BODY_BYTES` 控制非 GET 请求体上限，生产默认 8 MiB，最高 10 MiB，包含无 `Content-Length` 的分块请求，避免大包把 API worker 当文件垃圾桶用。
-- 系统按单租户产品使用，前端不再展示租户输入、租户菜单和租户管理页。数据库中的 `tenant_id` 保留为历史兼容字段，默认值固定为 `default`，旧数据迁移时会自动回填。
-- `APP_REGISTRATION_ENABLED` 控制用户端自助注册，生产默认关闭。这里没有做用户邀请功能。
-- `USER_PASSWORD_MIN_LENGTH` 控制用户端密码最小长度，默认 10；管理端重置管理员密码按更高标准校验。
-- 管理端接口逐步改为权限点校验，角色只负责映射权限；审计、设置、用户、任务和批量任务接口不再只依赖粗粒度角色判断。需要临时做权限灰度时，可用 `ROLE_PERMISSIONS_JSON` 覆盖角色权限映射，但默认还是内置策略。
-- 默认启用基础安全响应头和 CSP，内置 `frame-src 'self' https://www.mapchaxun.cn` 以兼容经纬度核对页；生产环境默认启用 HSTS，只有明确设置 `ENABLE_HSTS=false` 才关闭。只有前端资源策略确实冲突时才临时设置 `DISABLE_CSP=true` 或自定义 `CONTENT_SECURITY_POLICY`。
-- `EXPOSE_API_DOCS` 控制 `/docs`、`/redoc` 和 `/openapi.json`，生产默认关闭，本地开发默认开启。接口契约快照放在 `docs/api/openapi-contract.json`，变更 API 路径、请求体或响应模型后必须运行 `python scripts/openapi_contract.py --write` 并让 `python scripts/openapi_contract.py` 通过。
-- 审计日志默认不可清空。只有明确设置 `ALLOW_AUDIT_LOG_PURGE=true` 时清空接口才可用，并会留下 `audit.purge` 记录。
-- 管理端删除用户改为软删除：停用打卡、停用用户端绑定账号、保留历史审计和执行记录，不再物理删除业务主体。
-- `TASK_LOCK_TTL_SECONDS` 控制定时任务分布式锁过期时间，避免多个 worker 或误扩容时重复执行同一个用户任务。
-- `BATCH_RUNNING_ITEM_TIMEOUT_SECONDS` 控制批量队列 running 项 lease 超时回收时间，默认 1800 秒。队列认领会写入 worker owner 和 lease token；超时后仍有重试次数的项目会重新排队，次数耗尽的项目会标记失败并推进批量任务进度，过期线程不能再覆盖新状态。
-- AI URL / API Key / Model 通过管理端“系统设置 -> AI 设置”统一保存到全局系统配置，不再放在用户编辑页；读取接口只返回 `hasApiKey`，不会回显密钥。`AI_ALLOWED_HOSTS` 可选限制 AI 生成链路允许访问的 host。默认只允许解析到公网地址的 HTTPS 端点；本机、内网、链路本地和特殊地址会被拒绝，并会把已校验的 DNS 解析结果固定到本次请求，避免校验后解析漂移。确需接入内网模型服务时，必须同时设置 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 和明确的 `AI_ALLOWED_HOSTS` 白名单。`AI_ALLOWED_MODELS` 可再加一层模型白名单，`AI_MAX_OUTPUT_TOKENS` 控制输出长度上限，`AI_PROMPT_VERSION` 记录提示词版本，方便回放和审计。`AI_TENANT_DAILY_LIMIT`、`AI_USER_DAILY_LIMIT` 和 `AI_RATE_LIMIT_WINDOW_SECONDS` 控制 AI 生成的全局和用户级配额，避免循环任务或滥用把外部模型费用打穿。`AI_REQUEST_MAX_TIMEOUT_SECONDS`、`AI_REQUEST_MAX_RETRIES`、`AI_SUBMITTED_REPORT_HISTORY_LIMIT` 和 `AI_SUBMITTED_REPORT_HISTORY_CHARS` 控制 AI 请求超时、重试和历史报告注入规模，避免一次生成把线程长期挂死。`/settings/ai/test` 和兼容保留的 `/ai/test` 仍默认执行公网 HTTPS 安全检查。
-- `/metrics` 和 `/metrics.prom` 包含认证失败、任务事件、批量任务、活动锁、HTTP 请求状态/延迟统计，以及最近请求 ID 和任务追踪链路。生产环境默认要求配置 `METRICS_AUTH_TOKEN` 后用 `X-Metrics-Token` 或 Bearer token 访问；指标快照默认缓存 `METRICS_CACHE_TTL_SECONDS=5` 秒，并会在相关写入提交后失效，避免 Prometheus 高频抓取时每次重新扫业务库又不至于长期返回旧数据；HTTP 请求明细默认保留 `HTTP_METRIC_RETENTION_DAYS=14` 天，并按 `HTTP_METRIC_PURGE_INTERVAL_SECONDS=3600` 秒节流清理；静态资源和健康检查默认不写入 HTTP 明细，可用 `HTTP_METRIC_SAMPLE_RATE` 与 `HTTP_METRIC_EXCLUDE_PATH_PREFIXES` 控制采样和排除前缀；`RECENT_METRIC_WINDOW_SECONDS=300` 控制最近窗口。Prometheus 告警规则放在 `monitoring/prometheus/alerts.yml`，排障步骤见 `docs/ops/runbook.md`。
-- `CAPTCHA_MODEL_AUTO_DOWNLOAD` 控制启动时是否自动下载验证码 ONNX 模型。生产环境默认关闭，避免启动依赖外网；需要自动拉取时显式设置为 `true`。
-- `CAPTCHA_MODEL_REQUIRE_CHECKSUM` 控制模型自动下载时是否强制校验 SHA256，生产默认要求。需要下载 `ocr.onnx` 和 `yolov5n.onnx` 时分别配置 `CAPTCHA_MODEL_SHA256_OCR_ONNX`、`CAPTCHA_MODEL_SHA256_YOLOV5N_ONNX`，否则就是把启动链路交给一个裸下载链接。
-- 数据库可用 `python -m server.backup_cli export backup.json` 导出 JSON 备份，用 `python -m server.backup_cli import backup.json --replace-existing` 恢复到目标库，导出文件包含完整性 manifest 和表校验和。生产环境导出默认要求 `--encryption-key` 或 `BACKUP_ENCRYPTION_KEY`，只有显式设置 `ALLOW_PLAINTEXT_BACKUP=true` 才允许明文备份。
-- `BATCH_JOB_MAX_USERS` 限制单个批量任务的用户数量，`BATCH_TENANT_MAX_ACTIVE_JOBS` 保留为兼容配置并按默认租户统计活动批量任务，避免一个请求把队列打爆。批量运行接口支持 `Idempotency-Key` / `X-Idempotency-Key`，相同操作者、用户列表和并发参数会回放同一 `job_id`；一键补卡、批量补卡、手动运行和批量补报告也会按同样的幂等键逻辑去重；批量任务详情支持失败项重试；`IDEMPOTENCY_TTL_SECONDS=604800` 控制记录保留窗口。
-- CI 会执行 `python scripts/quality_gate.py`，阻止重新引入 `utcnow()`、前端 token localStorage 存储、服务器端 `print`、裸 `except/pass`、不带内部隔离上下文的用户读取，以及用户邀请入口。
-- 默认不信任 `X-Forwarded-For`。生产环境会忽略单独的 `TRUST_PROXY_HEADERS=true`，必须设置 `TRUSTED_PROXY_IPS` 为代理 IP 或 CIDR；只有可信代理传来的转发头才会用于限流和审计。
-- `DATABASE_POOL_SIZE`、`DATABASE_MAX_OVERFLOW`、`DATABASE_POOL_RECYCLE_SECONDS`、`DATABASE_POOL_TIMEOUT_SECONDS` 控制 MySQL 连接池，避免峰值请求或 MySQL 空闲断连时把应用拖死。
-- `SCHEDULER_LOAD_PAGE_SIZE` 控制定时任务启动时分页加载用户的页大小；启动时只为开启打卡或报告任务的用户注册调度，避免用户表一大就全量扫进内存。
-- 默认使用 `mapchaxun` 内部接口做地址搜索，无需地图 Key。接口返回经纬度和省市区后，前端会自动回填打卡位置。
-- `GEOCODE_SEARCH_PROVIDER` 只控制搜索框，默认 `mapchaxun`；`GEOCODE_PROVIDER` 控制搜索结果需要反查时的逆地理解析，默认 `osm`，也可切换 `baidu` / `amap`。
-- 如果逆地理解析或搜索切换到百度 Web 服务，请提供 `BAIDU_MAP_AK`；缺少 AK 时会返回明确错误。`BAIDU_MAP_COORD_TYPE` 默认 `gcj02ll`，也可用 `BAIDU_MAP_INPUT_COORD_TYPE`、`BAIDU_MAP_OUTPUT_COORD_TYPE` 分别控制百度逆地理输入坐标和返回坐标。
-- 管理端打卡设置默认内嵌 `https://www.mapchaxun.cn/jingweidu` 作为经纬度核对页；搜索地址仍会通过后端自动回填经纬度、省市区和地址。如需自定义核对页，需要在前端构建前设置 `VITE_MAP_DISPLAY_URL`。
-- `CLOCKIN_MAKEUP_BATCH_DELAY_SECONDS` 控制一键补卡的默认间隔。
-- `CLOCKIN_MAKEUP_RATE_LIMIT_RETRIES` 和 `CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS` 控制遇到频繁请求时的重试次数与初始等待时间。
-- `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS` 控制触发 IP 频繁后的批量冷却间隔。当前日期重试成功后，后续日期会按该间隔降速；如果当前日期重试耗尽仍然频繁，会停止剩余日期，避免继续触发远端风控。
-- `MOGUDING_IP_RESTRICT_COOLDOWN_SECONDS` 控制普通网络被工学云返回“IP非法请求过多，已限制访问”后的非代理请求暂停时间，默认 `600` 秒。暂停期间不会继续向工学云发普通网络请求；手动补卡启用代理后仍可获取/切换代理 IP 重试。
-- `MOGUDING_PROXY_API_URL` 控制动态代理获取接口。接口返回内容需要包含 `ip:端口`，例如 `1.2.3.4:8080`。代理获取接口默认拒绝本机、内网和特殊地址；确需内网代理服务时，必须同时设置 `ALLOW_PRIVATE_MOGUDING_PROXY_ENDPOINTS=true` 和 `MOGUDING_PROXY_ALLOWED_HOSTS` 白名单。如果接口 URL 中包含 `accessName` 和 `accessPassword`，后端会自动拼成 `http://accessName:accessPassword@ip:端口` 使用。
-- `MOGUDING_PROXY_TTL_SECONDS` 控制动态代理缓存时长，默认 `55` 秒，适配常见 1 分钟代理有效期。
-- `MOGUDING_PROXY_API_TIMEOUT_SECONDS` 控制动态代理接口请求超时。
-- `MOGUDING_PROXY_URLS` 控制静态工学云补卡代理池，多个代理用逗号、分号或换行分隔，例如 `http://user:pass@1.2.3.4:8080,http://5.6.7.8:8080`。如果同时配置动态代理接口，会优先使用动态代理接口。代理只在手动补卡执行阶段启用；正常登录、定时打卡、报告提交、缺卡查询、AI、地理编码和通知请求都不使用该代理。
-- 工学云补卡代理也可以在管理端 Web 的「系统设置」中配置。环境变量中的 `MOGUDING_PROXY_API_URL` / `MOGUDING_PROXY_URLS` 优先级高于 Web 配置。
-- `REPORT_MAKEUP_BATCH_DELAY_SECONDS` 控制日报 / 周报 / 月报一键补交的批量间隔，未配置时会回退到补卡间隔。
-
-### 2. 启动后端
-
-```bash
-pip install -r server/requirements.txt
+python -m alembic upgrade head
 python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147
-```
 
-启动后可访问：
-
-- API 文档：本地开发默认开启，生产需设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/docs`
-- OpenAPI：本地开发默认开启，生产需设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/openapi.json`
-- API 契约快照：`python scripts/openapi_contract.py` 检查，`python scripts/openapi_contract.py --write` 更新 `docs/api/openapi-contract.json`
-
-### 3. 启动前端
-
-```bash
 cd web
 npm install
 npm run dev
 ```
 
-启动后访问：
+### Docker Compose
 
-- 前端页面：`http://localhost:5173`
+| 方式 | 命令 | 适用场景 |
+|------|------|----------|
+| 源码构建 | `docker compose up -d --build` | 本机或服务器直接从源码构建 |
 
-Vite 开发服务器会将 `/api` 代理到本地后端 `http://127.0.0.1:8147`。如果后端不在默认地址，可在启动前设置 `VITE_API_PROXY_TARGET`：
+`docker-compose.yml` 默认启动两个服务：
 
-```bash
-VITE_API_PROXY_TARGET=http://127.0.0.1:8147 npm run dev
-```
-
-### 4. 构建前端
-
-```bash
-cd web
-npm run build
-npm run preview
-```
-
-`npm run preview` 也会复用 `VITE_API_PROXY_TARGET`，用于预览构建产物时继续联调后端。
-
-## Docker 部署
-
-项目支持通过 Docker Compose 一体化启动。默认 `docker-compose.yml` 用于本地构建：
-
-```bash
-docker compose up -d --build
-```
-
-当前 `docker-compose.yml` 会：
-
-- 构建应用镜像
-- 启动 `app` API 服务并暴露 `8147` 端口
-- 启动 `worker` 后台服务运行 APScheduler 和批量队列
-- 将 `./data/images` 挂载到容器内图片目录
-- 通过环境变量把 `DATABASE_URL`、调度时区、管理员账号、运行角色和限流后端等配置注入应用
-
-访问入口：
-
-- 应用首页：`http://localhost:8147`
-- API 文档：生产环境默认关闭；需要时设置 `EXPOSE_API_DOCS=true` 后访问 `http://localhost:8147/docs`
-
-如果要使用 GitHub Actions 已发布的远端镜像，请使用 `docker-compose.image.yml`。这种方式会从镜像仓库拉取新镜像，而不是用服务器本地源码重新构建。建议在 `.env` 中指定镜像和数据库配置：
-
-```env
-APP_IMAGE=ghcr.io/<owner>/<repo>:20260522
-DATABASE_URL=mysql+pymysql://user:password@mysql-host:3306/automoguding?charset=utf8mb4
-APP_SECRET=replace-with-output-of-openssl-rand-hex-32
-USER_PASSWORD_KEY=replace-with-output-of-openssl-rand-hex-32
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=use-a-strong-admin-password
-```
-
-启动或更新：
-
-```bash
-docker compose -f docker-compose.image.yml up -d
-```
-
-`docker-compose.image.yml` 已配置 `pull_policy: always`，使用 `20260522` 这类日期标签时，重新执行 `up -d` 会主动检查并拉取远端同标签的新镜像。也可以把 `APP_IMAGE` 指定为 `20260522-153045` 或 `sha-abcdef0` 来锁定某一次构建。
-
-Docker 本地已经拉取的镜像不会主动显示远端同名标签是否更新；如果镜像仓库里的 `20260522` 被新构建覆盖，本地仍需要重新执行 `up -d` 或 `docker compose -f docker-compose.image.yml pull` 才会对比远端 digest。想在镜像列表中直接看到新增版本，请使用 `YYYYMMDD-HHMMSS` 标签。
-
-Windows PowerShell 可以用仓库内脚本检查并拉取同标签更新：
-
-```powershell
-.\scripts\check-image-update.ps1 -Image ghcr.io/<owner>/<repo>:20260522
-```
-
-### GitHub 自动构建镜像
-
-仓库已提供 `.github/workflows/docker-publish.yml`，用于在 GitHub Actions 中自动构建并发布镜像到 GHCR，也可以同步推送到 Docker Hub。
-
-触发方式：
-
-- 推送到 `main` 或 `master` 分支：构建并推送分支镜像，同时默认分支会更新 `latest` 标签。
-- 推送 `v*` 标签：构建并推送对应版本镜像，例如 `v1.0.0`。
-- 每次非 PR 构建都会额外推送日期标签，例如 `20260522` 和 `20260522-153045`。`YYYYMMDD` 表示当天最新构建，`YYYYMMDD-HHMMSS` 表示一次唯一构建，便于在镜像仓库页面直接看到更新时间和新增版本。
-- 每次构建都会推送 `sha-<commit>` 标签，便于精确回滚到某次提交。
-- Pull Request：只执行构建验证，不推送镜像。
-- 手动触发：可在 GitHub Actions 页面运行 `Docker Publish` 工作流。
-
-镜像地址格式：
-
-```text
-ghcr.io/<owner>/<repo>:latest
-ghcr.io/<owner>/<repo>:20260522
-ghcr.io/<owner>/<repo>:20260522-153045
-ghcr.io/<owner>/<repo>:sha-abcdef0
-```
-
-注意：`latest`、分支标签和纯日期标签会被后续构建覆盖，已运行的容器不会自动更新。服务器需要重新执行 `docker compose -f docker-compose.image.yml up -d`，或者直接指定新的 `YYYYMMDD-HHMMSS` / `sha-*` 标签。
-
-Docker Hub 同步发布需要在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中配置以下 Secrets：
-
-```text
-DOCKERHUB_USERNAME=你的 Docker Hub 用户名
-DOCKERHUB_TOKEN=你的 Docker Hub Access Token
-DOCKERHUB_REPOSITORY=你的 Docker Hub 镜像名，可选，例如 username/automoguding-saas
-```
-
-如果不配置 `DOCKERHUB_REPOSITORY`，工作流会默认使用 `DOCKERHUB_USERNAME/<repo>` 作为 Docker Hub 镜像名。
-
-如果仓库是私有仓库，需要在 GitHub 的 Package 设置中确认 GHCR 镜像可见性和拉取权限。GHCR 发布默认使用 GitHub 自动注入的 `GITHUB_TOKEN`。
-
-## Release
-
-当前推荐发布方式：
-
-- 使用 Git tag 管理版本，例如 `v0.1.0`。
-- 推送 `v*` 标签后，GitHub Actions 会构建并发布 Docker 镜像。
-- 版本说明维护在 [CHANGELOG.md](./CHANGELOG.md)。
-
-示例：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-发布前建议至少运行：
-
-```bash
-python -m unittest discover -s tests
-python -m compileall server
-cd web
-npm run build
-```
-
-## 文档索引
-
-- [当前功能与接口速查](./docs/current-features.md)：当前实现中的功能范围、补卡规则、补卡 API 和验证命令。
-- [后端说明](./server/README.md)：后端启动流程、模块职责、API 面、补卡执行链路和验证命令。
-- [前端说明](./web/README.md)：前端入口、目录结构、补卡界面和构建说明。
-- [Roadmap](./ROADMAP.md)：后续计划和优先级。
-- [贡献指南](./CONTRIBUTING.md)：提交 Issue、PR 和本地验证方式。
-- [更新日志](./CHANGELOG.md)：版本发布记录。
-- `docs/superpowers/`：历史规格和实现计划，用于追溯设计过程，不一定代表最新实现。
-
-## 常用入口
-
-### 管理端
-
-- 登录页：`/login`
-- 已登录后台首页：`/`
-
-### 用户端
-
-- 未登录访问根地址 `/` 默认进入用户端登录页
-- 登录页：`/u/login`
-- 注册页：`/u/register`
-- 用户工作台：`/u`
-- 用户设置页：`/u/settings`，可维护个人打卡、报告和推送配置
-
-## 打卡与补卡
-
-### 自动打卡
-
-用户的自动打卡配置位于管理端用户编辑页或用户端设置页。核心配置包括：
-
-- 上班时间和下班时间
-- 打卡周期
-- 打卡天数
-- 打卡地址、经纬度、省市区
-- 打卡图片数量和备注
-
-保存配置后，后端会重建该用户的调度任务。定时任务、管理端批量执行和用户端手动执行都会复用 `server/task_runner.py` 中的同一套打卡逻辑。
-
-### 缺卡记录
-
-系统通过工学云打卡记录接口读取指定周期内的打卡数据，并在本地做归一化处理：
-
-- `START` 表示上班打卡。
-- `END` 表示下班打卡。
-- 同一天如果上班和下班都存在，则不会出现在待补列表中。
-- 同一天如果只缺一种类型，则只会在对应类型的待补列表中出现。
-- 待补日期会按当前配置的打卡周期过滤，避免展示非打卡日。
-
-管理端和用户端都会展示「已获取记录数」「当前类型待补天数」「已选择天数」。
-
-### 手动补卡
-
-补卡流程分为两步：
-
-1. 选择补卡类型：`上班` 或 `下班`。
-2. 选择一个或多个待补日期，点击「补选中」；或点击「全部待补」补当前类型下所有待补日期。
-
-补卡只提交用户当前选择的类型。例如选择「上班」时，即使某天同时缺上班和下班，也只补上班，不会自动补下班。
-
-批量补卡在遇到远端“请求过于频繁”、`429`、`rate limit` 或“IP非法请求过多，已限制访问”时，会等待后重试当前日期。当前日期重试成功后，后续日期会进入冷却间隔；如果当前日期重试耗尽仍然频繁，系统会停止剩余日期并把它们标记为跳过，避免继续触发远端风控。
-
-手动补卡时，如果配置了 `MOGUDING_PROXY_API_URL`，补卡请求会先调用该接口获取代理。接口返回 `ip:端口` 后，后端会读取接口 URL 查询参数中的 `accessName` 和 `accessPassword`，并拼成 `http://accessName:accessPassword@ip:端口` 使用。例如：
-
-```env
-MOGUDING_PROXY_API_URL=http://capi.51daili.com/traffic/getip?linePoolIndex=1&packid=12&time=2&qty=1&port=1&format=txt&dt=2&ct=1&dtc=5&usertype=17&uid=54638&accessName=your-name&accessPassword=your-pass
-MOGUDING_PROXY_TTL_SECONDS=55
-```
-
-动态代理默认缓存 `55` 秒。补卡请求遇到 IP 频繁、IP 被限制访问或当前代理连接失败时，后端会重新调用代理接口获取新 IP 再重试；补卡结果会记录 `代理切换次数`，便于判断是否确实发生了代理切换。也可以继续使用 `MOGUDING_PROXY_URLS` 配置静态代理池。该代理不会用于正常定时打卡、报告提交、缺卡查询或登录。
-
-普通登录、定时打卡、报告提交、缺卡查询等非补卡请求如果命中“IP非法请求过多，已限制访问”，会进入普通网络熔断窗口并停止后续工学云请求，避免在已封 IP 的情况下继续扩大限制。
-
-管理员也可以在管理端进入「系统设置」→「工学云代理」保存全局补卡代理配置。环境变量里显式配置的代理优先于 Web 全局配置。
-
-学生补卡请求会走工学云补卡接口：
-
-```text
-attendence/attendanceReplace/v4/save
-```
-
-补卡请求的关键字段：
-
-| 字段 | 说明 |
-|------|------|
-| `type` | 补卡类型，`START` 或 `END` |
-| `createTime` | 目标补卡日期和对应上班 / 下班时间 |
-| `attendanceType` | 固定为 `REPLACE` |
-| `attendenceTime` | 补卡时保持为空 |
-| `isReplace` | 补卡时保持为空 |
-| `planId` | 当前实习计划 ID |
-| `userId` | 当前工学云用户 ID |
-
-### 补卡 API
-
-用户端接口：
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/app/clock-in/missing-days` | 获取当前用户缺卡日期和缺卡类型 |
-| `POST` | `/app/clock-in/makeup` | 补选中的日期 |
-| `POST` | `/app/clock-in/makeup-all` | 补当前类型下全部待补日期 |
-
-管理端接口：
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/users/{user_id}/clock-in/missing-days` | 获取指定用户缺卡日期和缺卡类型 |
-| `POST` | `/users/{user_id}/clock-in/makeup` | 为指定用户补选中的日期 |
-| `POST` | `/users/{user_id}/clock-in/makeup-all` | 为指定用户补当前类型下全部待补日期 |
-
-`/makeup` 请求示例：
-
-```json
-{
-  "target_dates": ["2026-05-06", "2026-05-07"],
-  "target_type": "START"
-}
-```
-
-`target_type` 只能是：
-
-- `START`：上班
-- `END`：下班
-
-为了兼容旧调用，`/makeup` 仍支持单日期字段：
-
-```json
-{
-  "target_date": "2026-05-06",
-  "target_type": "END"
-}
-```
+| 服务 | `APP_ROLE` | 职责 |
+|------|------------|------|
+| `app` | `api` | Web / API，不运行定时任务和批量队列 |
+| `worker` | `worker` | APScheduler 定时任务和批量任务队列 |
 
 ## 目录结构
 
-```text
-automoguding-saas/
-├─ server/                  # FastAPI 后端、调度器、任务执行与数据模型
-│  ├─ clockin_backfill.py   # 打卡记录归一化与缺卡日期筛选
-│  ├─ task_runner.py        # 打卡、补卡、报告提交等任务执行入口
-│  └─ coreApi/              # 工学云接口客户端
-├─ web/                     # Vue 3 前端
-├─ docs/                    # 当前功能说明、历史设计和实现计划
-├─ tests/                   # 后端 unittest 测试
-├─ docker-compose.yml       # 容器编排配置
-├─ Dockerfile               # 前端构建 + 后端运行镜像
-└─ CLAUDE.md                # 面向 Claude Code 的仓库工作说明
-```
+| 路径 | 说明 |
+|------|------|
+| `server/` | FastAPI 后端、调度器、任务执行、数据模型和迁移 |
+| `web/` | Vue 3 前端 |
+| `docs/current-features.md` | 当前功能、接口和运行行为速查 |
+| `docs/ops/runbook.md` | 线上排障、CI 失败和批量任务处理手册 |
+| `monitoring/prometheus/alerts.yml` | Prometheus 告警规则 |
+| `tests/` | 后端 unittest 测试 |
+| `docker-compose.yml` | 本地源码构建部署 |
+| `img/` | README 和文档截图 |
 
-## 关键配置与运行行为
+## 文档索引
 
-- 应用启动时会自动建表、补列、种子管理员、检查模型、启动调度器和队列线程，因此排查启动问题时要把这些副作用一起考虑。
-- 用户配置变更后，接口层通常会先移除旧 job，再按新配置重新注册 job。
-- 容器部署时由 FastAPI 直接提供构建后的 `web/dist`；本地开发则通常使用 `5173` 前端 + `8147` 后端。
-- 工学云账号密码、SMTP 密码等敏感信息为加密存储。
-- AI 连接参数由系统设置统一管理，用户编辑页不再保存用户级 AI 配置；`/settings/ai/test`、兼容保留的 `/ai/test` 和正式 AI 生成链路默认都拒绝本机、内网、链路本地和特殊地址；正式链路如需访问内网模型服务，必须同时打开 `ALLOW_PRIVATE_AI_ENDPOINTS=true` 并配置 `AI_ALLOWED_HOSTS`。
+| 文档 | 适合读者 | 内容 |
+|------|----------|------|
+| [当前功能与接口速查](./docs/current-features.md) | 产品、测试、二次开发 | 功能范围、页面入口、接口、补卡和报告规则 |
+| [后端说明](./server/README.md) | 后端开发、运维 | 启动、环境变量、API、任务链路和备份 |
+| [前端说明](./web/README.md) | 前端开发、联调 | 页面入口、路由、截图、接口约定、用户端页面 |
+| [运行手册](./docs/ops/runbook.md) | 运维、值班 | 供应链、认证、5xx、批量任务、AI、权限排障 |
+| [Roadmap](./ROADMAP.md) | 产品、维护者 | 后续计划和优先级 |
+| [贡献指南](./CONTRIBUTING.md) | 贡献者 | Issue / PR 要求、代码风格 |
+| [更新日志](./CHANGELOG.md) | 所有人 | 版本发布记录 |
+| `docs/superpowers/` | 维护者 | 历史规格和实现计划，不一定代表最新实现 |
 
-## 社区与反馈
+## 反馈信息模板
 
-如果你在使用中遇到问题，优先提供以下信息，便于复现：
-
-- 部署方式：Docker Compose 或本地开发。
-- 后端版本或 Git commit。
-- Python、Node.js、MySQL 版本。
-- 相关接口路径、错误提示和后端日志。
-- 是否可以稳定复现，以及复现步骤。
-
-建议入口：
-
-- Bug 反馈：使用 GitHub Issue 的 Bug 模板。
-- 功能建议：使用 Feature Request 模板。
-- 后续计划：查看 [ROADMAP.md](./ROADMAP.md)。
-- 参与开发：阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。
-
-## 开发说明
-
-### 当前可用命令
-
-后端：
-
-```bash
-pip install -r server/requirements.txt
-python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8147
-```
-
-前端：
-
-```bash
-cd web
-npm install
-npm run dev
-npm run lint
-npm test
-npm run build
-npm run preview
-```
-
-### 关于 lint / test
-
-当前仓库已经有后端单元测试、后端质量门禁、供应链策略检查和前端静态质量门禁。常用验证命令如下：
-
-```bash
-python -m unittest discover -s tests
-python -m alembic upgrade head
-python -m compileall server
-python scripts/quality_gate.py
-python scripts/verify_supply_chain_policy.py
-
-cd web
-npm run lint
-npm test
-npm run build
-```
-
-说明：
-
-- `web/package.json` 提供 `dev`、`lint`、`test`、`test:static`、`build`、`preview` 脚本；`npm test` 当前委托到静态质量门禁。
-- CI 还会执行 `pip-audit`、`npm audit --audit-level=high` 和 Trivy 文件系统扫描；本地网络受限时，优先用上述离线命令做提交前检查。
-- `git diff --check` 可用于检查空白字符问题；在 Windows 环境下可能出现 LF / CRLF 换行提示，通常不是语法错误。
+| 问题类型 | 请提供 |
+|----------|--------|
+| 登录失败 | 登录入口、账号类型、接口响应、后端日志、是否触发限流 |
+| 前后端联调失败 | 前端地址、后端地址、`VITE_API_PROXY_TARGET`、请求路径、状态码 |
+| 数据库错误 | `DATABASE_URL` 脱敏后主机信息、Alembic 版本、完整 SQL 错误 |
+| 补卡失败 | 用户配置、目标日期、`target_type`、工学云返回、代理切换次数 |
+| 报告失败 | 报告类型、周期、AI 设置、`AI_ALLOWED_HOSTS`、后端任务日志 |

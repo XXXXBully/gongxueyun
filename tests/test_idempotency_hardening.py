@@ -7,7 +7,7 @@ from sqlmodel import SQLModel, create_engine
 class IdempotencyHardeningTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
-        import server.models  # noqa: F401 - load SQLModel metadata before create_all
+        import server.models  # noqa: F401 - 在 create_all 前加载 SQLModel 元数据
         SQLModel.metadata.create_all(self.engine)
 
     def test_idempotency_claim_blocks_duplicates_and_replays_completed_response(self):

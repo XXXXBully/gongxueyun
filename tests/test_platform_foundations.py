@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class PlatformFoundationsTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
-        import server.models  # noqa: F401 - load SQLModel metadata before create_all
+        import server.models  # noqa: F401 - 在 create_all 前加载 SQLModel 元数据
 
         SQLModel.metadata.create_all(self.engine)
 

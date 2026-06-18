@@ -1,4 +1,4 @@
-# Stage 1: Build Frontend
+# 阶段 1：构建前端
 FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS frontend-build
 WORKDIR /app
 
@@ -8,7 +8,7 @@ RUN cd web && npm ci
 COPY web/ ./web/
 RUN cd web && npm run build
 
-# Stage 2: Backend
+# 阶段 2：构建后端运行环境
 FROM python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10
 WORKDIR /app
 

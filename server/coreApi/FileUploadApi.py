@@ -113,7 +113,7 @@ def upload(
 
     with requests.Session() as session:
         for image_data in images:
-            # 确保每个文件的key唯一，稍微延迟一下或者用计数器
+            # 确保每个文件的键唯一，稍微延迟一下或者使用计数器
             # 原代码用微秒级时间戳，基本安全
             key = build_upload_key(snowFlakeId, userId)
 
@@ -122,7 +122,7 @@ def upload(
             if uploaded_key:
                 successful_keys.append(uploaded_key)
             
-            # 稍微暂停，避免key冲突概率（虽然极低）
+            # 稍微暂停，降低键冲突概率（虽然极低）
             time.sleep(0.01)
 
     return ",".join(successful_keys)

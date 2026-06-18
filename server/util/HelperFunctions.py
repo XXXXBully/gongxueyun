@@ -133,7 +133,7 @@ def strip_markdown(text: str) -> str:
     # 3. 移除行内代码标记
     text = re.sub(r"`([^`]+)`", r"\1", text)
 
-    # 4. 移除图片标记 (保留alt文本)
+    # 4. 移除图片标记（保留替代文本）
     text = re.sub(r"!\[(.*?)\]\(.*?\)", r"\1", text)
 
     # 5. 移除超链接标记 (保留链接文本)
@@ -142,7 +142,7 @@ def strip_markdown(text: str) -> str:
     # 6. 移除脚注引用 例如 [^1]
     text = re.sub(r"\[\^([^\]]+)\]", "", text)
 
-    # 7. 移除脚注定义 例如 [^1]: some text
+    # 7. 移除脚注定义，例如 [^1]: 示例文本
     text = re.sub(r"^\[\^.+?\]:.*$", "", text, flags=re.MULTILINE)
 
     # 8. 移除表格分隔
@@ -174,7 +174,7 @@ def strip_markdown(text: str) -> str:
     # 14. 移除引用标记
     text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
 
-    # 15. 移除行内HTML标签
+    # 15. 移除行内 HTML 标签
     text = re.sub(r"</?[^>]+>", "", text)
 
     # 16. 多空白行合并

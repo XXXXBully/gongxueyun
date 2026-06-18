@@ -32,7 +32,7 @@ def create_sign(*args) -> str:
             args2.append(a)
         # 将所有输入参数连接成一个长字符串，并在末尾添加盐值
         sign_str = "".join(args2) + "3478cbbc33f84bd00d75d7dfa69e0daa"
-        # 使用MD5对最终字符串进行加密，并返回加密后的十六进制签名
+        # 使用 MD5 对最终字符串进行加密，并返回加密后的十六进制签名
         return md5(sign_str.encode("utf-8")).hexdigest()
 
     except Exception as e:
@@ -60,9 +60,9 @@ def aes_encrypt(plaintext: str,
         ValueError: 如果加密失败，抛出包含详细错误信息的异常。
     """
     try:
-        # 使用指定的密钥和输出格式初始化AES加密器
+        # 使用指定的密钥和输出格式初始化 AES 加密器
         cipher = AESECBPKCS5Padding(key, out_format)
-        # 对明文进行AES加密
+        # 对明文进行 AES 加密
         ciphertext = cipher.encrypt(plaintext)
         return ciphertext
 
@@ -91,9 +91,9 @@ def aes_decrypt(ciphertext: str,
         ValueError: 如果解密失败，抛出包含详细错误信息的异常。
     """
     try:
-        # 使用指定的密钥和输出格式初始化AES解密器
+        # 使用指定的密钥和输出格式初始化 AES 解密器
         cipher = AESECBPKCS5Padding(key, out_format)
-        # 对密文进行AES解密
+        # 对密文进行 AES 解密
         plaintext = cipher.decrypt(ciphertext)
         return plaintext
 

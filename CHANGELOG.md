@@ -4,17 +4,15 @@
 
 ## Unreleased
 
+- 文档全面表格化整理：重写 README、后端说明、前端说明、当前功能速查、运行手册、贡献指南和 Roadmap，减少长段散文，聚焦入口、配置、接口和排障速查表。
 - AI 设置从用户编辑页迁移到全局系统设置，新增 `/settings/ai` 与 `/settings/ai/test`；用户创建、编辑、用户端设置和任务运行不再使用旧用户级 AI 字段，读取全局配置时不回显 API Key。
 - 用户端设置页新增个人推送配置，绑定用户可自助维护 Server酱 和 QQ 邮箱 SMTP 收件设置；管理员仍可在用户编辑页代为维护，SMTP 发件账号继续走全局配置。
 - 调整根地址路由：未登录访问 `/` 默认进入用户端登录页，管理员仍通过 `/login` 进入后台，已登录管理员访问 `/` 保持进入用户列表。
-- 移除前端租户产品面：登录 / 注册页不再展示租户输入，后台导航和路由删除租户管理页，前端会话状态不再保存租户信息。
 
 ## 2026-05-30
 
 ### 新增
 
-- 文档：补齐前端 `npm run lint`、`npm test` 和 `npm run test:static` 的说明，避免 README 与仓库脚本脱节。
-- 文档：补齐 `python scripts/verify_supply_chain_policy.py` 的使用说明，用于检查 GitHub Actions 钉死和 Docker 基础镜像 digest 钉死。
 - 文档：重写贡献指南、运行手册和路线图，统一成可读的简体中文版本。
 
 ### 变更
@@ -23,14 +21,7 @@
 - CI：显式钉死 `httpx==0.28.1`，避免 `fastapi.testclient` 在干净 GitHub Actions 环境里缺测试依赖。
 - CI：把 `actions/checkout`、`actions/setup-python` 和 `actions/setup-node` 升到 Node 24 兼容的固定 commit，消掉 runner 侧的 Node 20 退役告警。
 - 删除管理端 MFA 产品面和 `/api/auth/mfa/*` 接口；新增迁移会清理历史 MFA 数据库列，临时残留列也不再参与登录校验。
-- README、后端说明、前端说明和功能速查已同步到当前验证命令与供应链门禁。
-
-### 验证
-
-- `python -m unittest discover -s tests -p test_platform_foundations.py`
-- `python -m unittest discover -s tests`
-- `python scripts/verify_supply_chain_policy.py`
-- `git diff --check`
+- README、后端说明、前端说明和功能速查已同步到当前功能范围。
 
 ## 2026-05-23
 
@@ -50,7 +41,6 @@
   - `CLOCKIN_MAKEUP_RATE_LIMIT_RETRY_SECONDS`
   - `CLOCKIN_MAKEUP_RATE_LIMIT_COOLDOWN_SECONDS`
   - `REPORT_MAKEUP_BATCH_DELAY_SECONDS`
-- 新增镜像日期标签说明，默认构建会同时推送 `latest`、分支标签、`YYYYMMDD`、`YYYYMMDD-HHMMSS` 和 `sha-*` 标签。
 
 ### 变更
 
@@ -58,13 +48,6 @@
 - 一键补卡保留日期间隔，并在限流后对当前日期重试；当前日期恢复后会降低后续日期请求速度，持续限流时会停止剩余日期，避免继续触发远端风控。
 - 一键补交报告按 `daily`、`weekly`、`monthly` 分别处理，不会跨类型混在一起补交。
 - 优化 `docker-compose.yml` 和 `docker-compose.image.yml`，透传补卡 / 补交报告的批量间隔和限流重试配置。
-- 更新文档中关于 `latest` 的说明：远端 `latest` 被覆盖后，本地已拉取镜像不会自动显示可用更新，需要重新 `pull` 或指定新的日期 / sha 标签。
-
-### 验证
-
-- `python -m unittest discover -s tests`
-- `python -m compileall server`
-- `git diff --check`
 
 ## 2026-05-22
 
@@ -85,17 +68,9 @@
 
 ### 变更
 
-- 学生补卡请求改为调用 `attendence/attendanceReplace/v4/save`。
-- 补卡请求体使用 `attendanceType=REPLACE`，`attendenceTime=null`，`isReplace=null`。
+- 补卡链路对齐当前远端能力。
 - 管理端用户编辑页和用户端设置页的补卡日期改为多选，并按当前补卡类型过滤。
-- README 更新到当前实现，补充补卡规则和验证命令。
-
-### 验证
-
-- `python -m unittest discover -s tests`
-- `python -m compileall server`
-- `npm run build`（在 `web/` 目录）
-- `git diff --check`
+- README 更新到当前实现，补充补卡规则。
 
 ## 2026-05-15
 
@@ -106,7 +81,6 @@
 - 用户自助流程：注册 / 登录、绑定工学云账号、读取自身配置、自动获取打卡地址、保存打卡与报告配置、手动执行任务、查看执行记录、生成日报和提交日报。
 - 自动化任务：基于 APScheduler 注册上班打卡、下班打卡、日报、周报和月报任务。
 - 批量任务：支持并发执行、失败重试、暂停、恢复、取消和进度查询。
-- GitHub Actions 镜像构建流程：支持发布到 GHCR，可选同步到 Docker Hub。
 
 ### 变更
 
